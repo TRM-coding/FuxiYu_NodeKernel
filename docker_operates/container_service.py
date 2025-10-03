@@ -1,10 +1,10 @@
 #TODO:完成实现
 
-from ..repositories import containers_repo
 from ..constant import *
 from typing import TypedDict
 from config import KeyConfig
 from ..utils.load_keys import load_keys
+from ..utils.Container import Container
 import requests
 from cryptography.hazmat.primitives.asymmetric import padding
 from cryptography.hazmat.primitives import hashes
@@ -59,8 +59,8 @@ class container_detail_information(TypedDict):
 #Function Implementation
 ####################################################
 
-# 将user_id作为admin，创建新容器
-def create_container(user_name:str,machine_ip:str)->bool:
+# 将user_name作为admin，创建port新容器
+def create_container(config:Container.Config_info)->int:
     
     raise NotImplementedError
 
