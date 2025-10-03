@@ -3,12 +3,15 @@
 from ..constant import *
 from typing import TypedDict
 from config import KeyConfig
-from ..utils.load_keys import load_keys
+from ..utils.CheckKeys import load_keys
 from ..utils.Container import Container
 import requests
 from cryptography.hazmat.primitives.asymmetric import padding
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric.rsa import RSAPrivateKey, RSAPublicKey
+from ..extensions import docker_client
+import docker
+from typing import NamedTuple
 
 
 #Load Public And Private Keys
@@ -38,20 +41,11 @@ def signature(message:str)->bytes:
 
 
 
-#Type Definition
+#Return API Definition
 ####################################################
-class container_bref_information(TypedDict):
+class CreateContainerReturn(NamedTuple):
+    container_id:str
     container_name:str
-    container_image:str
-    machine_ip:str
-    container_status:str
-
-class container_detail_information(TypedDict):
-    container_name:str
-    container_image:str
-    user_id: int
-    user_name: str
-    role: str
 ####################################################
 
 
@@ -60,36 +54,102 @@ class container_detail_information(TypedDict):
 ####################################################
 
 # 将user_name作为admin，创建port新容器
-def create_container(config:Container.Config_info)->int:
+def create_container(config:Container.Config_info)->NamedTuple:
+    cpu_quota = config.cpu_number * 100000
+    mem_limit = f"{config.memory}g"
+    device_requests = None
+    if config.gpu_list:
+        device_requests = [
+            docker.types.DeviceRequest(
+                count=len(config.gpu_list),
+                device_ids=[str(x) for x in config.gpu_list],
+                capabilities=[["gpu"]]
+            )
+        ]
     
-    raise NotImplementedError
+    container = docker_client.containers.run(
+        config.image,
+        "tail -f /dev/null",   # 保证容器一直运行
+        detach=True,
+        tty=True,
+        ports={"22/tcp": config.port},   # ssh端口映射
+        mem_limit=mem_limit,
+        cpu_quota=cpu_quota,
+        device_requests=device_requests
+    )
+    name = f"{config.user_name}_{container.short_id}"
+    container.rename(name)
+    container.exec_run("apt-get update && apt-get install -y openssh-server", user="root")
+    container.exec_run("service ssh start", user="root")
+    # 设置 root 密码为 root123
+    container.exec_run("echo 'root:root123' | chpasswd", user="root")
+    # 修改 sshd_config，允许 root 密码登录
+    container.exec_run("sed -i 's/^#*PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config", user="root")
+    container.exec_run("sed -i 's/^#*PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config", user="root")
+
+    # 重启 ssh 服务
+    container.exec_run("service ssh restart", user="root")
+    return CreateContainerReturn(container.id,container.name)
 
 #删除容器并删除其所有者记录
-def remove_container(container_id)->bool:
-    raise NotImplementedError
+def remove_container(container_id: str) -> bool:
+    try:
+        container = docker_client.containers.get(container_id)
+        container.remove(force=True)  # force=True 避免容器在运行时报错
+        return True
+    except docker.errors.NotFound:
+        print(f"Container {container_id} not found.")
+        return False
+    except Exception as e:
+        print(f"Failed to remove container {container_id}: {e}")
+        return False
 
 #将container_id对应的容器新增user_id作为collaborator,其权限为role
-def add_collaborator(container_id:int,user_id:int,role:ROLE)->bool:
-    raise NotImplementedError
+def add_collaborator(container_id:int,user_name:str,role:ROLE)->bool:
+    try:
+        container=docker_client.containers.get(container_id)
+        cmd = f"useradd -m -s /bin/bash {user_name} && echo '{user_name}:{user_name}' | chpasswd"
+        if role == ROLE.ADMIN:
+            cmd += f" && usermod -aG sudo {user_name}"
+        result = container.exec_run(cmd, user="root")
+        return result.exit_code == 0
+    except Exception as e:
+        print(f"failed to add collaborator:{e}")
+        return False
+
 
 #从container_id中移除user_id对应的用户访问权
-def remove_collaborator(container_id:int,user_id:int)->bool:
-    raise NotImplementedError
+def remove_collaborator(container_id: str, user_name: str) -> bool:
+    try:
+        container = docker_client.containers.get(container_id)
 
-#修改user_id对container_id的访问权
-def update_role(container_id:int,user_id:int,updated_role:ROLE)->bool:
-    raise NotImplementedError
+        # 删除用户，并且一并删除家目录 (-r)
+        cmd = f"userdel -r {user_name}"
 
-#返回user_id用户在container_id容器中的权限
-def show_user_container_role(container_id:int,user_id:int)->ROLE:
-    raise NotImplementedError
+        result = container.exec_run(cmd, user="root")
+        return result.exit_code == 0
 
-#返回容器的细节信息
-def get_container_detail_information(container_id:int)->container_detail_information:
-    raise NotImplementedError
+    except Exception as e:
+        print(f"Failed to remove collaborator: {e}")
+        return False
 
-#返回一页容器的概要信息
-def list_all_container_bref_information(page_number:int,page_size:int)->list[container_bref_information]:
-    raise NotImplementedError
+def update_role(container_id: str, user_name: str, updated_role: str) -> bool:
+    try:
+        container = docker_client.containers.get(container_id)
+
+        if updated_role == ROLE.ADMIN:
+            cmd = f"usermod -aG sudo {user_name}"
+        elif updated_role == ROLE.COLLABORATOR:
+            cmd = f"deluser {user_name} sudo"
+        else:
+            raise ValueError(f"Unknown role: {updated_role}")
+
+        result = container.exec_run(cmd, user="root")
+        return result.exit_code == 0
+
+    except Exception as e:
+        print(f"Failed to update role: {e}")
+        return False
+
 
 ####################################################

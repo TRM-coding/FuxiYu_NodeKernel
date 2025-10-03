@@ -12,6 +12,7 @@ class SqlConfig:
 class KeyConfig:
     PUBLIC_KEY_PATH='public_A.pem'
     PRIVATE_KEY_PATH='private_A.pem'
+    PUBLIC_KEY_CONTROL='public_control.pem'
 
 
 

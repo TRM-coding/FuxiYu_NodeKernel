@@ -1,6 +1,6 @@
 # yourapp/__init__.py
 from flask import Flask
-from .extensions import db, migrate, cache, login_manager
+from .extensions import db, migrate, cache, login_manager ,init_docker
 from .config import get_config
 from .blueprints import register_blueprints
 
@@ -12,6 +12,7 @@ def create_app(config: str | None = None):
     migrate.init_app(app, db)
     cache.init_app(app)
     login_manager.init_app(app)
+    init_docker()
 
     register_blueprints(app)
     return app
