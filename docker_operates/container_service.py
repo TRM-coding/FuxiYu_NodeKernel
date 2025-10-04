@@ -14,29 +14,6 @@ import docker
 from typing import NamedTuple
 
 
-#Load Public And Private Keys
-####################################################
-PRIVATE_KEY_A,PUBLIC_KEY_A=load_keys(KeyConfig.PRIVATE_KEY_PATH,KeyConfig.PUBLIC_KEY_PATH)
-
-def encryption(message:str,public_key_B:RSAPublicKey)->bytes:
-    ciphertext = public_key_B.encrypt(
-        message,
-        padding.OAEP(mgf=padding.MGF1(algorithm=hashes.SHA256()),
-                    algorithm=hashes.SHA256(),
-                    label=None)
-    )
-    return ciphertext
-
-def signature(message:str)->bytes:
-    signature = PRIVATE_KEY_A.sign(
-        message,
-        padding.PSS(mgf=padding.MGF1(hashes.SHA256()),
-                    salt_length=padding.PSS.MAX_LENGTH),
-        hashes.SHA256()
-    )
-    return signature
-
-####################################################
 
 
 
@@ -46,6 +23,11 @@ def signature(message:str)->bytes:
 class CreateContainerReturn(NamedTuple):
     container_id:str
     container_name:str
+
+class RemoveContinaerReturn:
+    SUCCESS=0
+    NOTFOUND=1
+    FAILED=2
 ####################################################
 
 
@@ -54,7 +36,7 @@ class CreateContainerReturn(NamedTuple):
 ####################################################
 
 # 将user_name作为admin，创建port新容器
-def create_container(config:Container.Config_info)->NamedTuple:
+def create_container(config:Container.Config_info)->CreateContainerReturn:
     cpu_quota = config.cpu_number * 100000
     mem_limit = f"{config.memory}g"
     device_requests = None
@@ -92,17 +74,17 @@ def create_container(config:Container.Config_info)->NamedTuple:
     return CreateContainerReturn(container.id,container.name)
 
 #删除容器并删除其所有者记录
-def remove_container(container_id: str) -> bool:
+def remove_container(container_id: str) -> int:
     try:
         container = docker_client.containers.get(container_id)
         container.remove(force=True)  # force=True 避免容器在运行时报错
-        return True
+        return RemoveContinaerReturn.SUCCESS
     except docker.errors.NotFound:
         print(f"Container {container_id} not found.")
-        return False
+        return RemoveContinaerReturn.NOTFOUND
     except Exception as e:
         print(f"Failed to remove container {container_id}: {e}")
-        return False
+        return RemoveContinaerReturn.FAILED
 
 #将container_id对应的容器新增user_id作为collaborator,其权限为role
 def add_collaborator(container_id:int,user_name:str,role:ROLE)->bool:

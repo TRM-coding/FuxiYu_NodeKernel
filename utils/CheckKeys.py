@@ -4,6 +4,7 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 from config import KeyConfig
 from cryptography.hazmat.primitives.asymmetric import padding
 from cryptography.hazmat.primitives import hashes
+import json
 # 加载公钥和私钥，返回公钥和私钥对象
 def load_keys(private_key_path:str,pub_key_path:str,pub_key_control_path)->tuple[RSAPrivateKey,RSAPublicKey,RSAPublicKey]:
     with open(private_key_path, "rb") as f:
@@ -91,3 +92,38 @@ def verify_signature(message:bytes, signature:bytes)->bool:
         return True
     except Exception:
         return False
+    
+def get_verified_msg(recived_message:dict)->dict:
+    """
+    解密并验证签名的消息
+    :param recived_message: 包含加密消息和签名的字典 {"message": bytes/str, "signature": bytes/str}
+    :return: 验证成功返回解密后的字典，失败返回空字典
+    """
+    try:
+        # 提取加密消息和签名
+        encrypted_msg = recived_message.get("message")
+        signature_data = recived_message.get("signature")
+        
+        if not encrypted_msg or not signature_data:
+            return {}
+        
+        # 确保是 bytes 类型
+        if isinstance(encrypted_msg, str):
+            encrypted_msg = encrypted_msg.encode()
+        if isinstance(signature_data, str):
+            signature_data = signature_data.encode()
+        
+        # 解密消息
+        decrypted_msg = decryption(encrypted_msg)
+        
+        # 验证签名
+        if not verify_signature(decrypted_msg, signature_data):
+            return {}
+        
+        # 将解密后的消息转换为字典
+        message_dict = json.loads(decrypted_msg.decode('utf-8'))
+        
+        return message_dict
+    except Exception as e:
+        # 任何异常都返回空字典
+        return {}
