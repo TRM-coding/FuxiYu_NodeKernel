@@ -1,15 +1,12 @@
 from flask import Blueprint, jsonify, request
-from ..services import user_service
-from ..schemas.user_schema import user_schema, users_schema
-from ..utils.CheckKeys import *
-from cryptography.hazmat.primitives.asymmetric.rsa import RSAPrivateKey, RSAPublicKey
-from ..config import KeyConfig
-from cryptography.hazmat.primitives.asymmetric import padding
-from cryptography.hazmat.primitives import hashes
-import requests
-import json
-from ..services.container_service import *
-
+from ..utils.CheckKeys import get_verified_msg
+from ..services.container_service import (
+    create_container,
+    remove_container,
+    add_collaborator,
+    remove_collaborator,
+    update_role
+)
 
 api_bp = Blueprint("api", __name__, url_prefix="/api")
 
@@ -18,7 +15,6 @@ api_bp = Blueprint("api", __name__, url_prefix="/api")
 发送格式：
 {
 	"message":{
-		"type":'create',
 		"config":
 		{
 			"gpu_list":[0,1,2,...],
@@ -49,12 +45,8 @@ def Create_container():
 	if not verified_msg:
 		return jsonify({"error": "invalid_signature or decryption failed"}), 401
 	
-	# 提取消息类型和配置
-	msg_type = verified_msg.get("type")
+	# 提取消息配置
 	config = verified_msg.get("config")
-	
-	if msg_type != "create" or not config:
-		return jsonify({"error": "invalid message type or config"}), 400
 	
 	container_id, container_name = create_container(**config)
 	
@@ -68,7 +60,6 @@ def Create_container():
 发送格式：
 {
 	"message":{
-		"type":'remove',
 		"config":
 		{
 			"container_id":"xxxx"
@@ -95,11 +86,9 @@ def Remove_container():
 		return jsonify({"error": "invalid_signature or decryption failed"}), 401
 	
 	# 提取消息类型和配置
-	msg_type = verified_msg.get("type")
 	config = verified_msg.get("config")
 	
-	if msg_type != "remove" or not config:
-		return jsonify({"error": "invalid message type or config"}), 400
+	
 	
 	success = remove_container(**config)
 	
@@ -112,7 +101,6 @@ def Remove_container():
 发送格式：
 {
 	"message":{
-		"type":'update',
 		"config":
 		{
 			"container_id":"xxxx",
@@ -140,11 +128,9 @@ def Add_collaborator():
 		return jsonify({"error": "invalid_signature or decryption failed"}), 401
 	
 	# 提取消息类型和配置
-	msg_type = verified_msg.get("type")
 	config = verified_msg.get("config")
 	
-	if msg_type != "update" or not config:
-		return jsonify({"error": "invalid message type or config"}), 400
+	
 	
 	success = add_collaborator(**config)
 	
@@ -158,7 +144,6 @@ def Add_collaborator():
 发送格式：
 {
 	"message":{
-		"type":'update',
 		"config":
 		{
 			"container_id":"xxxx",
@@ -185,11 +170,8 @@ def Remove_collaborator():
 		return jsonify({"error": "invalid_signature or decryption failed"}), 401
 	
 	# 提取消息类型和配置
-	msg_type = verified_msg.get("type")
 	config = verified_msg.get("config")
 	
-	if msg_type != "update" or not config:
-		return jsonify({"error": "invalid message type or config"}), 400
 	
 	success = remove_collaborator(**config)
 	
@@ -203,7 +185,6 @@ def Remove_collaborator():
 发送格式：
 {
 	"message":{
-		"type":'update',
 		"config":
 		{
 			"container_id":"xxxx",
@@ -231,11 +212,8 @@ def Update_role():
 		return jsonify({"error": "invalid_signature or decryption failed"}), 401
 	
 	# 提取消息类型和配置
-	msg_type = verified_msg.get("type")
 	config = verified_msg.get("config")
 	
-	if msg_type != "update" or not config:
-		return jsonify({"error": "invalid message type or config"}), 400
 	
 	success = update_role(**config)
 	

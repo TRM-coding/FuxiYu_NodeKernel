@@ -2,7 +2,7 @@
 
 from ..constant import *
 from typing import TypedDict
-from config import KeyConfig
+from ..config import KeyConfig
 from ..utils.CheckKeys import load_keys
 from ..utils.Container import Container
 import requests
