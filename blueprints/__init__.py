@@ -36,7 +36,7 @@ api_bp = Blueprint("api", __name__, url_prefix="/api")
 	"container_name": container_name
 }
 '''
-@api_bp.get("/create_container")
+@api_bp.post("/create_container")
 def Create_container():
 	print("Create_container Called")
 	recived_data = request.get_json(silent=True)
