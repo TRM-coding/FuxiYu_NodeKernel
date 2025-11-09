@@ -11,7 +11,7 @@ def create_app(config: str | None = None):
     migrate.init_app(app, db)
     cache.init_app(app)
     login_manager.init_app(app)
-    init_docker()
+    # init_docker()
 
     register_blueprints(app)
     return app

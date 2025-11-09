@@ -5,6 +5,7 @@ from ..config import KeyConfig
 from cryptography.hazmat.primitives.asymmetric import padding
 from cryptography.hazmat.primitives import hashes
 import json
+import base64
 # 加载公钥和私钥，返回公钥和私钥对象
 def load_keys(private_key_path:str,pub_key_path:str,pub_key_control_path)->tuple[RSAPrivateKey,RSAPublicKey,RSAPublicKey]:
     with open(private_key_path, "rb") as f:
@@ -47,8 +48,11 @@ def write_keys(path:str,key):
             )
 
 #加密信息
-def encryption(message:str,public_key_B:RSAPublicKey)->bytes:
-    ciphertext = public_key_B.encrypt(
+def encryption(message:str)->bytes:
+    _,_,PUBLIC_KEY_B=load_keys(KeyConfig.PRIVATE_KEY_PATH,KeyConfig.PUBLIC_KEY_PATH,KeyConfig.PUBLIC_KEY_PATH)
+    if isinstance(message, str):
+        message = message.encode('utf-8')
+    ciphertext = PUBLIC_KEY_B.encrypt(
         message,
         padding.OAEP(mgf=padding.MGF1(algorithm=hashes.SHA256()),
                     algorithm=hashes.SHA256(),
@@ -58,7 +62,7 @@ def encryption(message:str,public_key_B:RSAPublicKey)->bytes:
 
 #签名信息
 def signature(message:str)->bytes:
-    PRIVATE_KEY_A,PUBLIC_KEY_A,_=load_keys(KeyConfig.PRIVATE_KEY_PATH,KeyConfig.PUBLIC_KEY_PATH,KeyConfig.PUBLIC_KEY_CONTROL)
+    PRIVATE_KEY_A,_,_=load_keys(KeyConfig.PRIVATE_KEY_PATH,KeyConfig.PUBLIC_KEY_PATH,KeyConfig.PUBLIC_KEY_PATH)
     signature = PRIVATE_KEY_A.sign(
         message,
         padding.PSS(mgf=padding.MGF1(hashes.SHA256()),
@@ -69,7 +73,7 @@ def signature(message:str)->bytes:
 
 #解密信息
 def decryption(ciphertext:bytes)->bytes:
-    PRIVATE_KEY_A,PUBLIC_KEY_A,_=load_keys(KeyConfig.PRIVATE_KEY_PATH,KeyConfig.PUBLIC_KEY_PATH,KeyConfig.PUBLIC_KEY_CONTROL)
+    PRIVATE_KEY_A,_,_=load_keys(KeyConfig.PRIVATE_KEY_PATH,KeyConfig.PUBLIC_KEY_PATH,KeyConfig.PUBLIC_KEY_PATH)
     plaintext = PRIVATE_KEY_A.decrypt(
         ciphertext,
         padding.OAEP(mgf=padding.MGF1(algorithm=hashes.SHA256()),
@@ -80,7 +84,7 @@ def decryption(ciphertext:bytes)->bytes:
 
 #验证签名
 def verify_signature(message:bytes, signature:bytes)->bool:
-    _,_,public_key_B=load_keys(KeyConfig.PRIVATE_KEY_PATH,KeyConfig.PUBLIC_KEY_PATH,KeyConfig.PUBLIC_KEY_CONTROL)
+    _,_,public_key_B=load_keys(KeyConfig.PRIVATE_KEY_PATH,KeyConfig.PUBLIC_KEY_PATH,KeyConfig.PUBLIC_KEY_PATH)
     try:
         public_key_B.verify(
             signature,
@@ -103,6 +107,11 @@ def get_verified_msg(recived_message:dict)->dict:
         # 提取加密消息和签名
         encrypted_msg = recived_message.get("message")
         signature_data = recived_message.get("signature")
+
+        if isinstance(encrypted_msg, str):
+            encrypted_msg = base64.b64decode(encrypted_msg)
+        if isinstance(signature_data, str):
+            signature_data = base64.b64decode(signature_data)
         
         if not encrypted_msg or not signature_data:
             return {}
@@ -114,16 +123,26 @@ def get_verified_msg(recived_message:dict)->dict:
             signature_data = signature_data.encode()
         
         # 解密消息
-        decrypted_msg = decryption(encrypted_msg)
+        try:
+            decrypted_msg = decryption(encrypted_msg)
+        except Exception as e:
+            print("[Decryption Failed]", e)
+            return {}
         
         # 验证签名
         if not verify_signature(decrypted_msg, signature_data):
+            print("[Signature Verification Failed]")
             return {}
         
         # 将解密后的消息转换为字典
-        message_dict = json.loads(decrypted_msg.decode('utf-8'))
+        try:
+            message_dict = json.loads(decrypted_msg.decode('utf-8'))
+        except Exception as e:
+            print("[JSON Decode Error]", e)
+            return {}
         
         return message_dict
     except Exception as e:
         # 任何异常都返回空字典
+        print("[Unexpected Error in get_verified_msg]", e)
         return {}

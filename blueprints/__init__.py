@@ -8,6 +8,9 @@ from ..services.container_service import (
     update_role
 )
 
+# debug
+success = 1
+
 api_bp = Blueprint("api", __name__, url_prefix="/api")
 
 '''
@@ -33,8 +36,9 @@ api_bp = Blueprint("api", __name__, url_prefix="/api")
 	"container_name": container_name
 }
 '''
-@api_bp.get("/create_container")
+@api_bp.post("/create_container")
 def Create_container():
+	print("Create_container Called")
 	recived_data = request.get_json(silent=True)
 	if not recived_data:
 		return jsonify({"error":"invalid json"}), 400
@@ -48,11 +52,16 @@ def Create_container():
 	# 提取消息配置
 	config = verified_msg.get("config")
 	
-	container_id, container_name = create_container(**config)
+	# container_id, container_name = create_container(**config)
+	container_id = "test_id"
+	container_name = "test_name"
+
+	print("SUCCESS")
 	
 	return jsonify({
 		"container_id": container_id,
-		"container_name": container_name
+		"container_name": container_name, 
+		"decrypted_message": verified_msg
 	}), 200
 
 '''
@@ -90,10 +99,11 @@ def Remove_container():
 	
 	
 	
-	success = remove_container(**config)
+	# success = remove_container(**config)
 	
 	return jsonify({
 		"success": success,
+		"decrypted_message": verified_msg
 	}), 200
 	
 '''
@@ -132,10 +142,11 @@ def Add_collaborator():
 	
 	
 	
-	success = add_collaborator(**config)
+	# success = add_collaborator(**config)
 	
 	return jsonify({
 		"success": success,
+		"decrypted_message": verified_msg
 	}), 200
 
 
@@ -173,10 +184,11 @@ def Remove_collaborator():
 	config = verified_msg.get("config")
 	
 	
-	success = remove_collaborator(**config)
+	# success = remove_collaborator(**config)
 	
 	return jsonify({
 		"success": success,
+		"decrypted_message": verified_msg
 	}), 200
 
 
@@ -215,10 +227,11 @@ def Update_role():
 	config = verified_msg.get("config")
 	
 	
-	success = update_role(**config)
+	# success = update_role(**config)
 	
 	return jsonify({
 		"success": success,
+		"decrypted_message": verified_msg
 	}), 200
 
 
