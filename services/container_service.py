@@ -1,15 +1,20 @@
 #TODO:完成实现
 
-from ..constant import *
+from FuxiYu_NodeKernel.constant import *
+from FuxiYu_NodeKernel.config import KeyConfig
+from FuxiYu_NodeKernel.utils.Container import Container
+from FuxiYu_NodeKernel import extensions
+from FuxiYu_NodeKernel.utils.CheckKeys import load_keys
+# from ..constant import *
 from typing import TypedDict
-from ..config import KeyConfig
-from ..utils.CheckKeys import load_keys
-from ..utils.Container import Container
+# from ..config import KeyConfig
+# from ..utils.CheckKeys import load_keys
+# from ..utils.Container import Container
 import requests
 from cryptography.hazmat.primitives.asymmetric import padding
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric.rsa import RSAPrivateKey, RSAPublicKey
-from ..extensions import docker_client
+# from ..extensions import docker_client
 import docker
 from typing import NamedTuple
 
@@ -37,6 +42,9 @@ class RemoveContinaerReturn:
 
 # 将user_name作为admin，创建port新容器
 def create_container(config:Container.Config_info)->CreateContainerReturn:
+    if extensions.docker_client is None:
+        extensions.init_docker()
+
     cpu_quota = config.cpu_number * 100000
     mem_limit = f"{config.memory}g"
     device_requests = None
@@ -49,7 +57,7 @@ def create_container(config:Container.Config_info)->CreateContainerReturn:
             )
         ]
     
-    container = docker_client.containers.run(
+    container = extensions.docker_client.containers.run(
         config.image,
         "tail -f /dev/null",   # 保证容器一直运行
         detach=True,
@@ -61,22 +69,41 @@ def create_container(config:Container.Config_info)->CreateContainerReturn:
     )
     name = f"{config.user_name}_{container.short_id}"
     container.rename(name)
-    container.exec_run("apt-get update && apt-get install -y openssh-server", user="root")
-    container.exec_run("service ssh start", user="root")
-    # 设置 root 密码为 root123
-    container.exec_run("echo 'root:root123' | chpasswd", user="root")
-    # 修改 sshd_config，允许 root 密码登录
-    container.exec_run("sed -i 's/^#*PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config", user="root")
-    container.exec_run("sed -i 's/^#*PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config", user="root")
+    container.reload()
+    # container.exec_run("apt-get update && apt-get install -y openssh-server", user="root")
+    # container.exec_run("service ssh start", user="root")
+    # # 设置 root 密码为 root123
+    # container.exec_run("echo 'root:root123' | chpasswd", user="root")
+    # # 修改 sshd_config，允许 root 密码登录
+    # container.exec_run("sed -i 's/^#*PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config", user="root")
+    # container.exec_run("sed -i 's/^#*PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config", user="root")
 
-    # 重启 ssh 服务
-    container.exec_run("service ssh restart", user="root")
+    # # 重启 ssh 服务
+    # container.exec_run("service ssh restart", user="root")
+    def _run(container, cmd: str):
+        r = container.exec_run(["/bin/sh", "-c", cmd], user="root")
+        if r.exit_code != 0:
+            raise RuntimeError(f"cmd failed: {cmd}\nexit={r.exit_code}\noutput={r.output!r}")
+        return r
+
+    _run(container, "apt-get update")
+    _run(container, "DEBIAN_FRONTEND=noninteractive apt-get install -y openssh-server")
+    _run(container, "mkdir -p /run/sshd")
+    _run(container, "ssh-keygen -A")
+
+    _run(container, "echo 'root:root123' | chpasswd")
+    _run(container, "sed -i 's/^#*PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config")
+    _run(container, "sed -i 's/^#*PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config")
+
+    # 不用 service（容器里不一定有 init），直接启动 sshd（会后台守护）
+    _run(container, "/usr/sbin/sshd")
+
     return CreateContainerReturn(container.id,container.name)
 
 #删除容器并删除其所有者记录
 def remove_container(container_id: str) -> int:
     try:
-        container = docker_client.containers.get(container_id)
+        container = extensions.docker_client.containers.get(container_id)
         container.remove(force=True)  # force=True 避免容器在运行时报错
         return RemoveContinaerReturn.SUCCESS
     except docker.errors.NotFound:
@@ -89,11 +116,14 @@ def remove_container(container_id: str) -> int:
 #将container_id对应的容器新增user_id作为collaborator,其权限为role
 def add_collaborator(container_id:int,user_name:str,role:ROLE)->bool:
     try:
-        container=docker_client.containers.get(container_id)
+        if extensions.docker_client is None:
+            extensions.init_docker()
+        
+        container=extensions.docker_client.containers.get(container_id)
         cmd = f"useradd -m -s /bin/bash {user_name} && echo '{user_name}:{user_name}' | chpasswd"
         if role == ROLE.ADMIN:
             cmd += f" && usermod -aG sudo {user_name}"
-        result = container.exec_run(cmd, user="root")
+        result = container.exec_run(["/bin/sh", "-c", cmd], user="root")
         return result.exit_code == 0
     except Exception as e:
         print(f"failed to add collaborator:{e}")
@@ -103,7 +133,7 @@ def add_collaborator(container_id:int,user_name:str,role:ROLE)->bool:
 #从container_id中移除user_id对应的用户访问权
 def remove_collaborator(container_id: str, user_name: str) -> bool:
     try:
-        container = docker_client.containers.get(container_id)
+        container = extensions.docker_client.containers.get(container_id)
 
         # 删除用户，并且一并删除家目录 (-r)
         cmd = f"userdel -r {user_name}"
@@ -117,7 +147,7 @@ def remove_collaborator(container_id: str, user_name: str) -> bool:
 
 def update_role(container_id: str, user_name: str, updated_role: str) -> bool:
     try:
-        container = docker_client.containers.get(container_id)
+        container = extensions.docker_client.containers.get(container_id)
 
         if updated_role == ROLE.ADMIN:
             cmd = f"usermod -aG sudo {user_name}"
