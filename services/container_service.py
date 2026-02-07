@@ -1,5 +1,3 @@
-#TODO:完成实现
-
 from FuxiYu_NodeKernel.constant import *
 from FuxiYu_NodeKernel.config import KeyConfig
 from FuxiYu_NodeKernel.utils.Container import Container
@@ -40,8 +38,8 @@ class RemoveContinaerReturn:
 #Function Implementation
 ####################################################
 
-# 将user_name作为admin，创建port新容器
-def create_container(config:Container.Config_info)->CreateContainerReturn:
+# 将owner_name作为root，创建port新容器
+def create_container(owner_name: str, config:Container.Config_info)->CreateContainerReturn:
     if extensions.docker_client is None:
         extensions.init_docker()
 
@@ -67,7 +65,7 @@ def create_container(config:Container.Config_info)->CreateContainerReturn:
         cpu_quota=cpu_quota,
         device_requests=device_requests
     )
-    name = f"{config.user_name}_{container.short_id}"
+    name = f"{config.name}" # 名字自定义
     container.rename(name)
     container.reload()
     # container.exec_run("apt-get update && apt-get install -y openssh-server", user="root")
@@ -91,7 +89,7 @@ def create_container(config:Container.Config_info)->CreateContainerReturn:
     _run(container, "mkdir -p /run/sshd")
     _run(container, "ssh-keygen -A")
 
-    _run(container, "echo 'root:root123' | chpasswd")
+    _run(container, f"echo 'root:{owner_name}123' | chpasswd")
     _run(container, "sed -i 's/^#*PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config")
     _run(container, "sed -i 's/^#*PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config")
 
