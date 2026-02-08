@@ -184,7 +184,7 @@ def Container_status():
 	"message":{
 		"config":
 		{
-			"container_id":"xxxx"
+			"container_name":"xxxx"
 		}
 	},
 	"signature":"xxxxxx"
@@ -207,20 +207,31 @@ def Remove_container():
 	if not verified_msg:
 		return jsonify({"error": "invalid_signature or decryption failed"}), 401
 	
-	# 提取消息类型和配置
-	config = verified_msg.get("config")
-	
-	
+	# 提取消息类型和配置（防御性处理：可能没有 config）
+	config = verified_msg.get("config") or {}
+	container_name = config.get("container_name") or config.get("name")
+	if not container_name:
+		return jsonify({"error": "missing container_name"}), 400
 	
 	try:
-		success = remove_container(**config)
+		success = remove_container(container_name)
 	except Exception as e:
 		print(e)
-		return jsonify({"error": str(e)}), 500
-	
-	return jsonify({
-		"success": success
-	}), 200
+		return jsonify({"success": 0, "error": str(e)}), 500
+	if success == 0:
+		return jsonify({
+		"success": 1
+		}), 200
+	elif success == 1:
+		return jsonify({
+		"success": 0,
+		"error": "container not found"
+		}), 404
+	else:
+		return jsonify({
+		"success": 0,
+		"error": "failed to remove container"
+		}), 500
 	
 '''
 通信数据格式：

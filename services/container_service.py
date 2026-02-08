@@ -146,16 +146,23 @@ def create_container(owner_name: str, config:Container.Config_info, public_key: 
     return CreateContainerReturn(container.id,container.name)
 
 #删除容器并删除其所有者记录
-def remove_container(container_id: str) -> int:
+def remove_container(container_name: str) -> int:
     try:
-        container = extensions.docker_client.containers.get(container_id)
+        if extensions.docker_client is None:
+            try:
+                extensions.init_docker()
+            except Exception as e:
+                print(f"Failed to init docker client: {e}")
+                raise RuntimeError(f"docker init failed: {e}")
+
+        container = extensions.docker_client.containers.get(container_name)
         container.remove(force=True)  # force=True 避免容器在运行时报错
         return RemoveContinaerReturn.SUCCESS
     except docker.errors.NotFound:
-        print(f"Container {container_id} not found.")
+        print(f"Container {container_name} not found.")
         return RemoveContinaerReturn.NOTFOUND
     except Exception as e:
-        print(f"Failed to remove container {container_id}: {e}")
+        print(f"Failed to remove container {container_name}: {e}")
         return RemoveContinaerReturn.FAILED
 
 #将container_id对应的容器新增user_id作为collaborator,其权限为role
