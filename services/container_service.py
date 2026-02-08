@@ -12,6 +12,7 @@ import requests
 from cryptography.hazmat.primitives.asymmetric import padding
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric.rsa import RSAPrivateKey, RSAPublicKey
+import base64
 # from ..extensions import docker_client
 import docker
 from typing import NamedTuple
@@ -39,10 +40,11 @@ class RemoveContinaerReturn:
 ####################################################
 
 # 将owner_name作为root，创建port新容器
-def create_container(owner_name: str, config:Container.Config_info)->CreateContainerReturn:
+def create_container(owner_name: str, config:Container.Config_info, public_key: str | None = None)->CreateContainerReturn:
     if extensions.docker_client is None:
         extensions.init_docker()
 
+    print(f"Creating container for owner={owner_name} with config={config} and public_key={public_key}")
     cpu_quota = config.cpu_number * 100000
     mem_limit = f"{config.memory}g"
     device_requests = None
@@ -55,19 +57,31 @@ def create_container(owner_name: str, config:Container.Config_info)->CreateConta
             )
         ]
     
+    print(f"DEBUG: cpu_quota={cpu_quota}, mem_limit={mem_limit}, device_requests={device_requests}")
+    name = f"{config.name}" # 名字自定义
+    # avoid creating a random-name container: check if a container with the desired name already exists
+    try:
+        existing = extensions.docker_client.containers.get(name)
+        print(f"Container with name {name} already exists: id={existing.id} status={existing.status}")
+        raise RuntimeError(f"container {name} already exists on this host")
+    except docker.errors.NotFound:
+        # good, proceed to create with explicit name
+        pass
+
     container = extensions.docker_client.containers.run(
         config.image,
         "tail -f /dev/null",   # 保证容器一直运行
         detach=True,
         tty=True,
+        name=name,
         ports={"22/tcp": config.port},   # ssh端口映射
         mem_limit=mem_limit,
         cpu_quota=cpu_quota,
         device_requests=device_requests
     )
-    name = f"{config.name}" # 名字自定义
-    container.rename(name)
+    print(f"Container created with ID={container.id} and name={name}")
     container.reload()
+    print(f"Container status after creation: {container.status}")
     # container.exec_run("apt-get update && apt-get install -y openssh-server", user="root")
     # container.exec_run("service ssh start", user="root")
     # # 设置 root 密码为 root123
@@ -78,10 +92,30 @@ def create_container(owner_name: str, config:Container.Config_info)->CreateConta
 
     # # 重启 ssh 服务
     # container.exec_run("service ssh restart", user="root")
-    def _run(container, cmd: str):
-        r = container.exec_run(["/bin/sh", "-c", cmd], user="root")
-        if r.exit_code != 0:
-            raise RuntimeError(f"cmd failed: {cmd}\nexit={r.exit_code}\noutput={r.output!r}")
+    def _run(container, cmd: str, timeout_sec: int = 120):
+        # 这里用一个 shell wrapper 来实现命令超时，避免某些命令（如 apt-get）在容器内卡死导致 exec_run 永远不返回的问题
+        wrapped = (
+            "( " + cmd + " ) & pid=$!; (sleep " + str(timeout_sec) + "; kill -9 $pid 2>/dev/null) & wait $pid"
+        )
+        print(f"Running command in container {container.id}: {cmd} (wrapped timeout={timeout_sec}s)")
+        r = container.exec_run(["/bin/sh", "-c", wrapped], user="root")
+        out = None
+        try:
+            out = r.output.decode('utf-8', errors='ignore')
+        except Exception:
+            out = str(r.output)
+        # determine exit code in a backward-compatible way
+        if hasattr(r, 'exit_code'):
+            exit_code = r.exit_code
+        else:
+            try:
+                # r may be a tuple like (exit_code, output)
+                exit_code = int(r[0])
+            except Exception:
+                exit_code = 0
+        print(f"Executed command: {cmd}\nExit code: {exit_code}\nOutput: {out}")
+        if exit_code != 0:
+            raise RuntimeError(f"cmd failed: {cmd}\nexit={exit_code}\noutput={out}")
         return r
 
     _run(container, "apt-get update")
@@ -95,6 +129,19 @@ def create_container(owner_name: str, config:Container.Config_info)->CreateConta
 
     # 不用 service（容器里不一定有 init），直接启动 sshd（会后台守护）
     _run(container, "/usr/sbin/sshd")
+    # 使得公钥可选 （如果提供了公钥则安装，否则只用密码登录）
+    if public_key:
+        try:
+            # Use base64 to avoid shell-quoting issues when writing the key
+            b64 = base64.b64encode(public_key.encode('utf-8')).decode('ascii')
+            cmd = (
+                "mkdir -p /root/.ssh && chmod 700 /root/.ssh && "
+                f"echo '{b64}' | base64 -d > /root/.ssh/authorized_keys && "
+                "chmod 600 /root/.ssh/authorized_keys && chown -R root:root /root/.ssh"
+            )
+            _run(container, cmd)
+        except Exception as e:
+            print(f"Failed to install public_key into container: {e}")
 
     return CreateContainerReturn(container.id,container.name)
 
