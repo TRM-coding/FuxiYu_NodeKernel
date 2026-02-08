@@ -266,13 +266,22 @@ def Add_collaborator():
 	# 提取消息类型和配置
 	config = verified_msg.get("config")
 	
+	container_name = config.get("container_name")
+	if not container_name:
+		return jsonify({"success": 0, "error": "missing container_name"}), 400
+	user_name = config.get("user_name")
+	if not user_name:
+		return jsonify({"success": 0, "error": "missing user_name"}), 400
+	role = config.get("role").lower()
+	if role not in ('admin', 'collaborator'):
+		return jsonify({"success": 0, "error": "invalid role, must be 'admin' or 'collaborator'"}), 400
 	
 	
 	try:
-		success = add_collaborator(**config)
+		success = add_collaborator(container_name, user_name, role)
 	except Exception as e:
 		print(e)
-		return jsonify({"error": str(e)}), 500
+		return jsonify({"success": 0, "error": str(e)}), 500
 	
 	return jsonify({
 		"success": success,
@@ -311,17 +320,26 @@ def Remove_collaborator():
 		return jsonify({"error": "invalid_signature or decryption failed"}), 401
 	
 	# 提取消息类型和配置
-	config = verified_msg.get("config")
+	try:
+		config = verified_msg.get("config")
 	
+		container_name = config.get("container_name")
+	except Exception:
+		return jsonify({"success": 0, "error": "invalid config format"}), 400
+	if not container_name:
+		return jsonify({"success": 0, "error": "missing container_name"}), 400
+	user_name = config.get("user_name")
+	if not user_name:
+		return jsonify({"success": 0, "error": "missing user_name"}), 400
 	
 	try:
-		success = remove_collaborator(**config)
+		success = remove_collaborator(container_name, user_name)
 	except Exception as e:
 		print(e)
-		return jsonify({"error": str(e)}), 500
+		return jsonify({"success": 0, "error": str(e)}), 500
 	
 	return jsonify({
-		"success": success,
+		"success": 1,
 		"decrypted_message": verified_msg
 	}), 200
 

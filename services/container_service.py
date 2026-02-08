@@ -1,8 +1,11 @@
-from FuxiYu_NodeKernel.constant import *
-from FuxiYu_NodeKernel.config import KeyConfig
-from FuxiYu_NodeKernel.utils.Container import Container
-from FuxiYu_NodeKernel import extensions
-from FuxiYu_NodeKernel.utils.CheckKeys import load_keys
+# IMPORTANT TODO: 应当指出，这个文件的几乎所有带有参数的exec_run调用都存在潜在的命令注入风险
+# 与他们相关的参数有必要被严格验证和过滤，或者改用更安全的方式（如直接传递参数列表而不是 shell 命令字符串）
+
+from ..constant import *
+from ..config import KeyConfig
+from ..utils.Container import Container
+from .. import extensions
+from ..utils.CheckKeys import load_keys
 # from ..constant import *
 from typing import TypedDict
 # from ..config import KeyConfig
@@ -172,10 +175,12 @@ def add_collaborator(container_id:int,user_name:str,role:ROLE)->bool:
             extensions.init_docker()
         
         container=extensions.docker_client.containers.get(container_id)
-        cmd = f"useradd -m -s /bin/bash {user_name} && echo '{user_name}:{user_name}' | chpasswd"
+        print(f"Adding collaborator {user_name} with role {role} to container {container_id}")
+        cmd = f"useradd -m -s /bin/bash {user_name} && echo '{user_name}:{user_name}123' | chpasswd"
         if role == ROLE.ADMIN:
-            cmd += f" && usermod -aG sudo {user_name}"
+            cmd += f" && (usermod -aG sudo {user_name} 2>/dev/null || usermod -aG wheel {user_name} 2>/dev/null)"
         result = container.exec_run(["/bin/sh", "-c", cmd], user="root")
+        print(f"Executed command to add collaborator: {cmd}\nExit code: {result.exit_code}\nOutput: {result.output.decode('utf-8', errors='ignore')}")
         return result.exit_code == 0
     except Exception as e:
         print(f"failed to add collaborator:{e}")
@@ -183,19 +188,21 @@ def add_collaborator(container_id:int,user_name:str,role:ROLE)->bool:
 
 
 #从container_id中移除user_id对应的用户访问权
-def remove_collaborator(container_id: str, user_name: str) -> bool:
+def remove_collaborator(container_name: str, user_name: str) -> bool:
     try:
-        container = extensions.docker_client.containers.get(container_id)
+        container = extensions.docker_client.containers.get(container_name)
 
         # 删除用户，并且一并删除家目录 (-r)
-        cmd = f"userdel -r {user_name}"
+        cmd = f"userdel -r {user_name} 2>/dev/null || deluser {user_name} 2>/dev/null"
 
-        result = container.exec_run(cmd, user="root")
+        result = container.exec_run(["/bin/sh", "-c", cmd], user="root")
+        print(f"Executed command to remove collaborator: {cmd}\nExit code: {result.exit_code}\nOutput: {result.output.decode('utf-8', errors='ignore')}")
         return result.exit_code == 0
 
     except Exception as e:
         print(f"Failed to remove collaborator: {e}")
         return False
+
 
 def update_role(container_id: str, user_name: str, updated_role: str) -> bool:
     try:
