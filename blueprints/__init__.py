@@ -172,8 +172,7 @@ def Container_status():
 
 		return jsonify({"success": 1, "container_status": status_out, "container_name": container_name}), 200
 	except docker.errors.NotFound:
-		# not created yet
-		return jsonify({"success": 1, "container_status": "creating", "container_name": container_name}), 200
+		return jsonify({"success": 0, "error": "container not found", "container_name": container_name}), 404
 	except Exception as e:
 		return jsonify({"success": 0, "error": str(e)}), 500
 
