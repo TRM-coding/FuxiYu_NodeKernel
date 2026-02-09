@@ -120,7 +120,7 @@ def Create_container():
 		"container_name": cfg.name
 	}), 200
 
-
+# 由于部分内容需要api这个地方直接调用。并未将这个方法单独放到services里
 @api_bp.post("/container_status")
 def Container_status():
 	'''
@@ -204,6 +204,8 @@ def Container_status():
 			status_out = "offline"
 		else:
 			status_out = str(state).lower()
+
+		print(f"Container '{container_name}' status: {status_out}")
 
 		return jsonify({"success": 1, "container_status": status_out, "container_name": container_name}), 200
 	except docker.errors.NotFound:
