@@ -304,7 +304,8 @@ def Add_collaborator():
 	
 	# 提取消息类型和配置
 	config = verified_msg.get("config")
-	
+	if not config:
+		return jsonify({"success": 0, "error": "missing config", "error_reason": "missing_config"}), 400
 	container_name = config.get("container_name")
 	if not container_name:
 		return jsonify({"success": 0, "error": "missing container_name", "error_reason": "missing_container_name"}), 400
@@ -366,6 +367,8 @@ def Remove_collaborator():
 	# 提取消息类型和配置
 	try:
 		config = verified_msg.get("config")
+		if not config:
+			return jsonify({"success": 0, "error": "missing config", "error_reason": "missing_config"}), 400
 
 		container_name = config.get("container_name")
 	except Exception:
@@ -421,6 +424,8 @@ def Update_role():
 	
 	# 提取消息类型和配置
 	config = verified_msg.get("config")
+	if not config:
+		return jsonify({"success": 0, "error": "missing config", "error_reason": "missing_config"}), 400
 	container_name = config.get("container_name")
 	if not container_name:
 		return jsonify({"success": 0, "error": "missing container_name", "error_reason": "missing_container_name"}), 400
