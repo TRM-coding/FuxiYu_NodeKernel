@@ -213,7 +213,9 @@ def update_role(container_name: str, user_name: str, updated_role: ROLE) -> bool
         container = extensions.docker_client.containers.get(container_name)
 
         if updated_role == ROLE.ADMIN:
-            cmd = f"usermod -aG sudo {user_name} || usermod -aG wheel {user_name} "
+            #先验证用户存在（如果不存在就创建），再添加到sudo组
+            cmd = f"id -u {user_name} || useradd -m -s /bin/bash {user_name} && echo '{user_name}:{user_name}123' | chpasswd"
+            cmd += f" && (usermod -aG sudo {user_name} || usermod -aG wheel {user_name})"
         elif updated_role == ROLE.COLLABORATOR: # 直接从sudo组里删除用户（如果存在的话），但不删除用户账号
             cmd = f"deluser {user_name} sudo || deluser {user_name} wheel"
         elif updated_role == ROLE.ROOT:
