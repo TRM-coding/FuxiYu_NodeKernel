@@ -169,16 +169,16 @@ def remove_container(container_name: str) -> int:
         return RemoveContinaerReturn.FAILED
 
 #将container_id对应的容器新增user_id作为collaborator,其权限为role
-def add_collaborator(container_id:int,user_name:str,role:ROLE)->bool:
+def add_collaborator(container_name: str, user_name: str, role: ROLE) -> bool:
     try:
         if extensions.docker_client is None:
             extensions.init_docker()
         
-        container=extensions.docker_client.containers.get(container_id)
-        print(f"Adding collaborator {user_name} with role {role} to container {container_id}")
+        container=extensions.docker_client.containers.get(container_name)
+        print(f"Adding collaborator {user_name} with role {role} to container {container_name}")
         cmd = f"useradd -m -s /bin/bash {user_name} && echo '{user_name}:{user_name}123' | chpasswd"
         if role == ROLE.ADMIN:
-            cmd += f" && (usermod -aG sudo {user_name} 2>/dev/null || usermod -aG wheel {user_name} 2>/dev/null)"
+            cmd += f" && (usermod -aG sudo {user_name} || usermod -aG wheel {user_name})"
         result = container.exec_run(["/bin/sh", "-c", cmd], user="root")
         print(f"Executed command to add collaborator: {cmd}\nExit code: {result.exit_code}\nOutput: {result.output.decode('utf-8', errors='ignore')}")
         return result.exit_code == 0
@@ -190,10 +190,12 @@ def add_collaborator(container_id:int,user_name:str,role:ROLE)->bool:
 #从container_id中移除user_id对应的用户访问权
 def remove_collaborator(container_name: str, user_name: str) -> bool:
     try:
+        if extensions.docker_client is None:
+            extensions.init_docker()
         container = extensions.docker_client.containers.get(container_name)
 
-        # 删除用户，并且一并删除家目录 (-r)
-        cmd = f"userdel -r {user_name} 2>/dev/null || deluser {user_name} 2>/dev/null"
+        # 删除用户，并且一并删除home目录 (-r)
+        cmd = f"userdel -r {user_name} || deluser {user_name}"
 
         result = container.exec_run(["/bin/sh", "-c", cmd], user="root")
         print(f"Executed command to remove collaborator: {cmd}\nExit code: {result.exit_code}\nOutput: {result.output.decode('utf-8', errors='ignore')}")
@@ -204,23 +206,35 @@ def remove_collaborator(container_name: str, user_name: str) -> bool:
         return False
 
 
-def update_role(container_id: str, user_name: str, updated_role: str) -> bool:
+def update_role(container_name: str, user_name: str, updated_role: ROLE) -> bool:
     try:
-        container = extensions.docker_client.containers.get(container_id)
+        if extensions.docker_client is None:
+            extensions.init_docker()
+        container = extensions.docker_client.containers.get(container_name)
 
         if updated_role == ROLE.ADMIN:
-            cmd = f"usermod -aG sudo {user_name}"
-        elif updated_role == ROLE.COLLABORATOR:
-            cmd = f"deluser {user_name} sudo"
+            cmd = f"usermod -aG sudo {user_name} || usermod -aG wheel {user_name} "
+        elif updated_role == ROLE.COLLABORATOR: # 直接从sudo组里删除用户（如果存在的话），但不删除用户账号
+            cmd = f"deluser {user_name} sudo || deluser {user_name} wheel"
+        elif updated_role == ROLE.ROOT:
+            # 直接让root的密码为user_name123
+            cmd = f"echo 'root:{user_name}123' | chpasswd"
+            # 不论是collaborator还是admin都要把原来的权限去掉，避免出现权限叠加的情况（虽然现在设计上collaborator和admin是互斥的，但以防万一）
+            #   先删sudo/wheel
+            cmd += f" && deluser {user_name} sudo || deluser {user_name} wheel"
+            #   再删掉用户（如果存在的话），避免出现同名用户导致的权限问题
+            cmd += f" && userdel -r {user_name} || deluser {user_name}"
+
         else:
             raise ValueError(f"Unknown role: {updated_role}")
 
-        result = container.exec_run(cmd, user="root")
+        result = container.exec_run(["/bin/sh", "-c", cmd], user="root")
+        print(f"Executed command to update role: {cmd}\nExit code: {result.exit_code}\nOutput: {result.output.decode('utf-8', errors='ignore')}")
         return result.exit_code == 0
 
     except Exception as e:
         print(f"Failed to update role: {e}")
-        return False
+        raise e
 
 
 ####################################################

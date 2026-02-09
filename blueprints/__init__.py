@@ -10,6 +10,7 @@ from ..services.container_service import (
 )
 import threading
 from .. import extensions
+from ..constant import ROLE
 import docker
 
 # debug
@@ -66,14 +67,34 @@ def Create_container():
 		cfg = Container.Config_info(**config)
 	except Exception as e:
 		return jsonify({"error": f"invalid config: {e}"}), 400
+	# ensure docker client so we can pre-check container name collisions
+	if extensions.docker_client is None:
+		try:
+			extensions.init_docker()
+		except Exception as e:
+			return jsonify({"error": f"docker init failed: {e}"}), 500
 
+	# 额外预检：检查是否已存在同名容器，避免创建后才发现冲突
+	try:
+		existing = None
+		try:
+			existing = extensions.docker_client.containers.get(cfg.name)
+		except docker.errors.NotFound:
+			existing = None
+		if existing is not None:
+			return jsonify({"success": 0, "error": f"container {cfg.name} already exists", "container_name": cfg.name}), 409
+	except Exception as e:
+		# if we can't contact docker, return an error
+		return jsonify({"success": 0, "error": f"docker check failed: {e}"}), 500
 	# spawn background thread to perform actual creation and return early
 	def _bg_create(o_name, cfg_obj):
 		try:
 			create_container(o_name, cfg_obj, public_key=public_key)
 		except Exception as e:
+			# cannot use Flask response helpers from a background thread (no app context)
+			# Log the error so operators can diagnose; if async error reporting is required,
+			# implement an out-of-band status/notification mechanism.
 			print("create_container error:", e)
-			return jsonify({"success": 0, "error": str(e)}), 500
 
 
 	try:
@@ -239,7 +260,7 @@ def Remove_container():
 	"message":{
 		"config":
 		{
-			"container_id":"xxxx",
+			"container_name":"xxxx",
 			"user_name":"xxxx",
 			"role":['admin'|'collaborator']
 		}
@@ -272,16 +293,21 @@ def Add_collaborator():
 	user_name = config.get("user_name")
 	if not user_name:
 		return jsonify({"success": 0, "error": "missing user_name"}), 400
-	role = config.get("role").lower()
-	if role not in ('admin', 'collaborator'):
+	role_str = config.get("role").lower()
+	if role_str not in ('admin', 'collaborator'):
 		return jsonify({"success": 0, "error": "invalid role, must be 'admin' or 'collaborator'"}), 400
-	
-	
+
+	# map string role to ROLE enum
+	if role_str == 'admin':
+		role_val = ROLE.ADMIN
+	else:
+		role_val = ROLE.COLLABORATOR
+
 	try:
-		success = add_collaborator(container_name, user_name, role)
+		success = add_collaborator(container_name, user_name, role_val)
 	except Exception as e:
 		print(e)
-		return jsonify({"success": 0, "error": str(e)}), 500
+		return jsonify({"success": 1, "error": str(e)}), 500
 	
 	return jsonify({
 		"success": success,
@@ -296,7 +322,7 @@ def Add_collaborator():
 	"message":{
 		"config":
 		{
-			"container_id":"xxxx",
+			"container_name":"xxxx",
 			"user_name":"xxxx",
 		}
 	},
@@ -351,7 +377,7 @@ def Remove_collaborator():
 	"message":{
 		"config":
 		{
-			"container_id":"xxxx",
+			"container_name":"xxxx",
 			"user_name":"xxxx",
 			"updated_role":"xxxx"
 		}
@@ -377,9 +403,26 @@ def Update_role():
 	
 	# 提取消息类型和配置
 	config = verified_msg.get("config")
-	
+	container_name = config.get("container_name")
+	if not container_name:
+		return jsonify({"success": 0, "error": "missing container_name"}), 400
+	user_name = config.get("user_name")
+	if not user_name:
+		return jsonify({"success": 0, "error": "missing user_name"}), 400
+	updated_role_str = config.get("updated_role").lower()
+	if updated_role_str not in ('admin', 'collaborator', 'root'):
+		return jsonify({"success": 0, "error": "invalid updated_role, must be 'admin', 'collaborator' or 'root'"}), 400
+
+	# map string role to ROLE enum
+	if updated_role_str == 'admin':
+		updated_role_val = ROLE.ADMIN
+	elif updated_role_str == 'collaborator':
+		updated_role_val = ROLE.COLLABORATOR
+	else:
+		updated_role_val = ROLE.ROOT
+
 	try:
-		success = update_role(**config)
+		success = update_role(container_name, user_name, updated_role_val)
 	except Exception as e:
 		print(e)
 		return jsonify({"error": str(e)}), 500
