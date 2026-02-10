@@ -250,6 +250,15 @@ def Remove_container():
 		return jsonify({"error": "missing container_name", "error_reason": "missing_container_name"}), 400
 	
 	try:
+		# 防止失败后删不掉
+		status_info = creation_status.get(container_name)
+		if status_info is not None and status_info.get("status") == "failed":
+			# clear the recorded failed state and return success
+			creation_status.pop(container_name, None)
+			return jsonify({
+				"success": 1
+			}), 200
+		
 		success = remove_container(container_name)
 	except Exception as e:
 		print(e)

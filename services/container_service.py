@@ -19,6 +19,7 @@ import base64
 # from ..extensions import docker_client
 import docker
 from typing import NamedTuple
+from ..utils import sanitizer as _sanitizer
 
 
 
@@ -127,6 +128,10 @@ def create_container(owner_name: str, config:Container.Config_info, public_key: 
     _run(container, "ssh-keygen -A")
 
     _run(container, f"echo 'root:{owner_name}123' | chpasswd")
+    try:
+        _sanitizer.validate_username(owner_name)
+    except Exception as e:
+        raise RuntimeError(f"unsafe owner_name: {e}")
     _run(container, "sed -i 's/^#*PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config")
     _run(container, "sed -i 's/^#*PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config")
 
@@ -136,6 +141,8 @@ def create_container(owner_name: str, config:Container.Config_info, public_key: 
     if public_key:
         try:
             # Use base64 to avoid shell-quoting issues when writing the key
+            # basic safety check on provided public key text before encoding
+            _sanitizer.validate_shell_arg(public_key)
             b64 = base64.b64encode(public_key.encode('utf-8')).decode('ascii')
             cmd = (
                 "mkdir -p /root/.ssh && chmod 700 /root/.ssh && "
@@ -176,6 +183,9 @@ def add_collaborator(container_name: str, user_name: str, role: ROLE) -> bool:
         
         container=extensions.docker_client.containers.get(container_name)
         print(f"Adding collaborator {user_name} with role {role} to container {container_name}")
+        # validate inputs to reduce injection risk
+        _sanitizer.validate_username(container_name)
+        _sanitizer.validate_username(user_name)
         cmd = f"useradd -m -s /bin/bash {user_name} && echo '{user_name}:{user_name}123' | chpasswd"
         if role == ROLE.ADMIN:
             cmd += f" && (usermod -aG sudo {user_name} || usermod -aG wheel {user_name})"
@@ -195,6 +205,8 @@ def remove_collaborator(container_name: str, user_name: str) -> bool:
         container = extensions.docker_client.containers.get(container_name)
 
         # 删除用户，并且一并删除home目录 (-r)
+        _sanitizer.validate_username(container_name)
+        _sanitizer.validate_username(user_name)
         cmd = f"userdel -r {user_name} || deluser {user_name}"
 
         result = container.exec_run(["/bin/sh", "-c", cmd], user="root")
@@ -214,12 +226,18 @@ def update_role(container_name: str, user_name: str, updated_role: ROLE) -> bool
 
         if updated_role == ROLE.ADMIN:
             #先验证用户存在（如果不存在就创建），再添加到sudo组
+            _sanitizer.validate_username(container_name)
+            _sanitizer.validate_username(user_name)
             cmd = f"id -u {user_name} || useradd -m -s /bin/bash {user_name} && echo '{user_name}:{user_name}123' | chpasswd"
             cmd += f" && (usermod -aG sudo {user_name} || usermod -aG wheel {user_name})"
         elif updated_role == ROLE.COLLABORATOR: # 直接从sudo组里删除用户（如果存在的话），但不删除用户账号
+            _sanitizer.validate_username(container_name)
+            _sanitizer.validate_username(user_name)
             cmd = f"deluser {user_name} sudo || deluser {user_name} wheel"
         elif updated_role == ROLE.ROOT:
             # 直接让root的密码为user_name123
+            _sanitizer.validate_username(container_name)
+            _sanitizer.validate_username(user_name)
             cmd = f"echo 'root:{user_name}123' | chpasswd"
             # 不论是collaborator还是admin都要把原来的权限去掉，避免出现权限叠加的情况（虽然现在设计上collaborator和admin是互斥的，但以防万一）
             #   先删sudo/wheel
