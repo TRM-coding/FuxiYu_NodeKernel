@@ -1,4 +1,3 @@
-# IMPORTANT TODO: 应当指出，这个文件的几乎所有带有参数的exec_run调用都存在潜在的命令注入风险
 # 与他们相关的参数有必要被严格验证和过滤，或者改用更安全的方式（如直接传递参数列表而不是 shell 命令字符串）
 
 from ..constant import *
@@ -86,15 +85,7 @@ def create_container(owner_name: str, config:Container.Config_info, public_key: 
     print(f"Container created with ID={container.id} and name={name}")
     container.reload()
     print(f"Container status after creation: {container.status}")
-    # container.exec_run("apt-get update && apt-get install -y openssh-server", user="root")
-    # container.exec_run("service ssh start", user="root")
-    # # 设置 root 密码为 root123
-    # container.exec_run("echo 'root:root123' | chpasswd", user="root")
-    # # 修改 sshd_config，允许 root 密码登录
-    # container.exec_run("sed -i 's/^#*PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config", user="root")
-    # container.exec_run("sed -i 's/^#*PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config", user="root")
 
-    # # 重启 ssh 服务
     # container.exec_run("service ssh restart", user="root")
     def _run(container, cmd: str, timeout_sec: int = 120):
         # 这里用一个 shell wrapper 来实现命令超时，避免某些命令（如 apt-get）在容器内卡死导致 exec_run 永远不返回的问题
@@ -121,12 +112,12 @@ def create_container(owner_name: str, config:Container.Config_info, public_key: 
         if exit_code != 0:
             raise RuntimeError(f"cmd failed: {cmd}\nexit={exit_code}\noutput={out}")
         return r
-
+    # 下面的命令执行可能会比较慢，所以设置了较长的超时时间（120秒），以避免某些环境下 apt-get 卡死导致的问题
     _run(container, "apt-get update")
     _run(container, "DEBIAN_FRONTEND=noninteractive apt-get install -y openssh-server")
     _run(container, "mkdir -p /run/sshd")
     _run(container, "ssh-keygen -A")
-
+    # 初始密码为 owner_name + "123"，用户可以登录后再改密码（也可以直接提供公钥登录）
     _run(container, f"echo 'root:{owner_name}123' | chpasswd")
     try:
         _sanitizer.validate_username(owner_name)
@@ -255,6 +246,80 @@ def update_role(container_name: str, user_name: str, updated_role: ROLE) -> bool
     except Exception as e:
         print(f"Failed to update role: {e}")
         raise e
+
+
+def start_container(container_name: str) -> bool:
+    """Start a stopped container by name. Returns True on success, False otherwise."""
+    try:
+        if extensions.docker_client is None:
+            extensions.init_docker()
+        _sanitizer.validate_username(container_name)
+        container = extensions.docker_client.containers.get(container_name)
+        # 已开启的容器再次调用 start() 会报错，所以先检查状态避免这个问题
+        try:
+            container.reload()
+        except Exception:
+            pass
+        status = getattr(container, 'status', None)
+        if status == 'running' or status == 'online':
+            print(f"Container {container_name} already running (status={status}).")
+            return True
+        container.start()
+        container.reload()
+        print(f"Started container {container_name}, new status={getattr(container, 'status', None)}")
+        return True
+    except docker.errors.NotFound:
+        print(f"Container {container_name} not found when trying to start.")
+        return False
+    except Exception as e:
+        print(f"Failed to start container {container_name}: {e}")
+        return False
+
+# 这里虽然写了timeout参数，但是暂时直接让取默认的10
+def stop_container(container_name: str, timeout: int = 10) -> bool:
+    """Stop a running container by name. Returns True on success, False otherwise."""
+    try:
+        if extensions.docker_client is None:
+            extensions.init_docker()
+        _sanitizer.validate_username(container_name)
+        container = extensions.docker_client.containers.get(container_name)
+        try:
+            container.reload()
+        except Exception:
+            pass
+        status = getattr(container, 'status', None)
+        if status != 'running' and status != 'online':
+            print(f"Container {container_name} is not running (status={status}); nothing to stop.")
+            return True
+        container.stop(timeout=timeout)
+        container.reload()
+        print(f"Stopped container {container_name}, new status={getattr(container, 'status', None)}")
+        return True
+    except docker.errors.NotFound:
+        print(f"Container {container_name} not found when trying to stop.")
+        return False
+    except Exception as e:
+        print(f"Failed to stop container {container_name}: {e}")
+        return False
+
+# 这里虽然写了timeout参数，但是暂时直接让取默认的10
+def restart_container(container_name: str, timeout: int = 10) -> bool:
+    """Restart a container by name. Returns True on success, False otherwise."""
+    try:
+        if extensions.docker_client is None:
+            extensions.init_docker()
+        _sanitizer.validate_username(container_name)
+        container = extensions.docker_client.containers.get(container_name)
+        container.restart(timeout=timeout)
+        container.reload()
+        print(f"Restarted container {container_name}, new status={getattr(container, 'status', None)}")
+        return True
+    except docker.errors.NotFound:
+        print(f"Container {container_name} not found when trying to restart.")
+        return False
+    except Exception as e:
+        print(f"Failed to restart container {container_name}: {e}")
+        return False
 
 
 ####################################################

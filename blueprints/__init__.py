@@ -6,7 +6,10 @@ from ..services.container_service import (
     remove_container,
     add_collaborator,
     remove_collaborator,
-    update_role
+	update_role,
+	start_container,
+	stop_container,
+	restart_container
 )
 import threading
 from .. import extensions
@@ -20,6 +23,35 @@ api_bp = Blueprint("api", __name__, url_prefix="/api")
 
 # 为的是将contaienr_status检查的特殊情况局限在创作过程
 creation_status = {}
+# 通用的操作状态追踪（start/stop/restart）
+action_status = {}
+
+def _set_action_status(container_name: str, action: str, status: str, error_reason: str | None = None):
+	action_status[container_name] = {"action": action, "status": status, "error_reason": error_reason}
+
+def _get_action_status(container_name: str):
+	return action_status.get(container_name)
+
+def _clear_action_status(container_name: str):
+	action_status.pop(container_name, None)
+
+
+# Helper wrappers to mirror create behavior and keep special-case handling centralized
+def mark_creation_status(container_name: str, status: str, error_reason: str | None = None):
+	creation_status[container_name] = {"status": status, "error_reason": error_reason}
+
+def clear_creation_status(container_name: str):
+	creation_status.pop(container_name, None)
+
+def mark_start_status(container_name: str, status: str, error_reason: str | None = None):
+	_set_action_status(container_name, 'start', status, error_reason)
+
+def mark_stop_status(container_name: str, status: str, error_reason: str | None = None):
+	_set_action_status(container_name, 'stop', status, error_reason)
+
+def mark_restart_status(container_name: str, status: str, error_reason: str | None = None):
+	_set_action_status(container_name, 'restart', status, error_reason)
+
 
 '''
 通信数据格式：
@@ -157,13 +189,24 @@ def Container_status():
 
 	try:
 		# docker SDK allows get by name
-		# if there is an async failure recorded for this container name, return that first
+		# if there is an async failure/ongoing action recorded for this container name, return that first
 		status_info = creation_status.get(container_name)
 		if status_info is not None:
 			if status_info.get("status") == "failed":
 				return jsonify({"success": 0, "container_status": "failed", "error": "creation failed", "error_reason": status_info.get("error_reason")}), 200
 			elif status_info.get("status") == "creating":
 				return jsonify({"success": 1, "container_status": "creating", "container_name": container_name}), 200
+
+		# check start/stop/restart async actions
+		ainfo = _get_action_status(container_name)
+		if ainfo is not None:
+			st = ainfo.get('status')
+			act = ainfo.get('action')
+			if st == 'failed':
+				return jsonify({"success": 0, "container_status": "failed", "error": f"{act} failed", "error_reason": ainfo.get('error_reason')}), 200
+			else:
+				# return the in-progress or terminal status reported by the action tracker
+				return jsonify({"success": 1, "container_status": st, "container_name": container_name}), 200
 
 		container = extensions.docker_client.containers.get(container_name)
 		state = None
@@ -341,6 +384,187 @@ def Add_collaborator():
 		"success": success,
 		"decrypted_message": verified_msg
 	}), 200
+
+'''
+通信数据格式：
+发送格式：
+{
+	"message":{
+		"config":
+		{
+			"container_name":"xxxx"
+		}
+	},
+	signature":"xxxxxx"
+}
+返回格式：
+{
+	"success": [0|1],
+}
+'''
+@api_bp.post("/start_container")
+def Start_container_api():
+	recived_data = request.get_json(silent=True)
+	if not recived_data:
+ 		return jsonify({"error":"invalid json", "error_reason": "invalid_json"}), 400
+	
+	verified_msg = get_verified_msg(recived_data)
+	if not verified_msg:
+		return jsonify({"error": "invalid_signature or decryption failed", "error_reason": "invalid_signature"}), 401
+
+
+	config = verified_msg.get("config") or {}
+	container_name = config.get("container_name")
+	if not container_name:
+		return jsonify({"error": "missing container_name", "error_reason": "missing_container_name"}), 400
+
+	# 早返回 表征请求已接受，实际的启动操作在后台线程执行，避免阻塞API响应
+	def _bg_start(name: str):
+		try:
+			mark_start_status(name, 'starting')
+			ok = start_container(name)
+			if ok:
+				mark_start_status(name, 'online')
+				# clear tracking after short grace period so subsequent /container_status queries read from docker
+				try:
+					threading.Timer(5.0, lambda: _clear_action_status(name)).start()
+				except Exception:
+					pass
+			else:
+				mark_start_status(name, 'failed', 'start_failed')
+		except Exception as e:
+			print('bg start error:', e)
+			mark_start_status(name, 'failed', str(e))
+
+	try:
+		t = threading.Thread(target=_bg_start, args=(container_name,))
+		t.daemon = True
+		t.start()
+	except Exception as e:
+		print(e)
+		return jsonify({"success": 0, "error": str(e), "error_reason": "background_thread_failed"}), 500
+
+	return jsonify({"success": 1, "container_status": "starting", "container_name": container_name}), 200
+'''
+通信数据格式：
+发送格式：
+{
+	"message":{
+		"config":
+		{
+			"container_name":"xxxx",
+			# 虽然设计了timeout参数，但在此不将其控制器下放给用户
+		}
+	},
+	"signature":"xxxxxx"
+}
+'''
+@api_bp.post("/stop_container")
+def Stop_container_api():
+	recived_data = request.get_json(silent=True)
+	if not recived_data:
+		return jsonify({"error":"invalid json", "error_reason": "invalid_json"}), 400
+
+
+	verified_msg = get_verified_msg(recived_data)
+	if not verified_msg:
+		return jsonify({"error": "invalid_signature or decryption failed", "error_reason": "invalid_signature"}), 401
+
+
+	config = verified_msg.get("config") or {}
+	container_name = config.get("container_name")
+	if not container_name:
+		return jsonify({"error": "missing container_name", "error_reason": "missing_container_name"}), 400
+
+	# spawn background worker to stop container and return early
+	def _bg_stop(name: str):
+		try:
+			mark_stop_status(name, 'stoping')
+			ok = stop_container(name)
+			if ok:
+				mark_stop_status(name, 'offline')
+				try:
+					threading.Timer(5.0, lambda: _clear_action_status(name)).start()
+				except Exception:
+					pass
+			else:
+				mark_stop_status(name, 'failed', 'stop_failed')
+		except Exception as e:
+			print('bg stop error:', e)
+			mark_stop_status(name, 'failed', str(e))
+
+	try:
+		t = threading.Thread(target=_bg_stop, args=(container_name,))
+		t.daemon = True
+		t.start()
+	except Exception as e:
+		print(e)
+		return jsonify({"success": 0, "error": str(e), "error_reason": "background_thread_failed"}), 500
+
+	return jsonify({"success": 1, "container_status": "stoping", "container_name": container_name}), 200
+
+'''
+通信数据格式：
+发送格式：
+{
+	"message":{
+		"config":
+		{
+			"container_name":"xxxx",
+			# 虽然设计了timeout参数，但在此不将其控制器下放给用户
+		}
+	},
+	"signature":"xxxxxx"
+}
+返回格式：
+{
+	"success": [0|1],
+}
+'''
+@api_bp.post("/restart_container")
+def Restart_container_api():
+	recived_data = request.get_json(silent=True)
+	if not recived_data:
+		return jsonify({"error":"invalid json", "error_reason": "invalid_json"}), 400
+
+
+	verified_msg = get_verified_msg(recived_data)
+	if not verified_msg:
+		return jsonify({"error": "invalid_signature or decryption failed", "error_reason": "invalid_signature"}), 401
+
+
+	config = verified_msg.get("config") or {}
+	container_name = config.get("container_name")
+	if not container_name:
+		return jsonify({"error": "missing container_name", "error_reason": "missing_container_name"}), 400
+
+	# spawn background worker to restart container and return early
+	def _bg_restart(name: str):
+		try:
+			# On restart we initially treat it as stopping
+			mark_restart_status(name, 'stoping')
+			ok = restart_container(name)
+			if ok:
+				mark_restart_status(name, 'online')
+				try:
+					threading.Timer(5.0, lambda: _clear_action_status(name)).start()
+				except Exception:
+					pass
+			else:
+				mark_restart_status(name, 'failed', 'restart_failed')
+		except Exception as e:
+			print('bg restart error:', e)
+			mark_restart_status(name, 'failed', str(e))
+
+	try:
+		t = threading.Thread(target=_bg_restart, args=(container_name,))
+		t.daemon = True
+		t.start()
+	except Exception as e:
+		print(e)
+		return jsonify({"success": 0, "error": str(e), "error_reason": "background_thread_failed"}), 500
+
+	return jsonify({"success": 1, "container_status": "stoping", "container_name": container_name}), 200
 
 
 '''
