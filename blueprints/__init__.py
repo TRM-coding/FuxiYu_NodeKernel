@@ -256,6 +256,29 @@ def Container_status():
 	except Exception as e:
 		return jsonify({"success": 0, "error": str(e), "error_reason": "internal_error"}), 500
 
+
+# Minimal machine status endpoint for controller health checks
+@api_bp.post("/machine_status")
+def Machine_status():
+	recived_data = request.get_json(silent=True)
+	if not recived_data:
+		return jsonify({"success": 0, "error": "invalid json"}), 400
+
+	verified_msg = get_verified_msg(recived_data)
+	if not verified_msg:
+		return jsonify({"success": 0, "error": "invalid_signature or decryption failed", "error_reason": "invalid_signature"}), 401
+
+	# Best-effort: ensure docker client initialized; if it fails, still respond but mark non-ideal
+	try:
+		if extensions.docker_client is None:
+			extensions.init_docker()
+	except Exception as e:
+		# return success but indicate docker init failed
+		return jsonify({"success": 0, "error": f"docker init failed: {e}", "error_reason": "docker_init_failed"}), 500
+
+	# If everything looks OK, report online. Keep response minimal to be fast.
+	return jsonify({"success": 1, "machine_status": "online"}), 200
+
 '''
 通信数据格式：
 发送格式：
