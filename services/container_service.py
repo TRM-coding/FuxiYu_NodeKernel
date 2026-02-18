@@ -17,6 +17,7 @@ from cryptography.hazmat.primitives.asymmetric.rsa import RSAPrivateKey, RSAPubl
 import base64
 # from ..extensions import docker_client
 import docker
+import os
 from typing import NamedTuple
 from ..utils import sanitizer as _sanitizer
 
@@ -48,20 +49,42 @@ def create_container(owner_name: str, config:Container.Config_info, public_key: 
         extensions.init_docker()
 
     print(f"Creating container for owner={owner_name} with config={config} and public_key={public_key}")
-    cpu_quota = config.cpu_number * 100000
+    # validate owner_name early because it's used as host path component
+    try:
+        _sanitizer.validate_username(owner_name)
+    except Exception as e:
+        raise RuntimeError(f"unsafe owner_name: {e}")
+    # 补CPU LIST 从 0 开始编号，如果 cpu_number=4 就是 [0,1,2,3]
+    cpu_count = int(getattr(config, 'cpu_number', 0) or 0)
+    cpu_list = list(range(cpu_count)) if cpu_count > 0 else []
+    cpuset_cpus = ",".join(str(x) for x in cpu_list) if cpu_list else None
     mem_limit = f"{config.memory}g"
+    
+    # 构建 memswap_limit 参数，如果 swap_memory 大于0，则 memswap_limit = memory + swap_memory；如果 swap_memory 不大于0，则不设置 memswap_limit（默认为和 memory 一样，禁止使用 swap）
+    swap_amt = int(getattr(config, 'swap_memory', 0) or 0)
+    memswap_limit = f"{config.memory + swap_amt}g" if swap_amt and swap_amt >= 0 else None
+    
+    # GPU LIST为空则是CPU机器，不接受GPU请求。device_requests只用于GPU资源分配
+    gpu_list = getattr(config, 'gpu_list', None)
     device_requests = None
-    if config.gpu_list:
+    if gpu_list is not None and isinstance(gpu_list, (list, tuple)) and len(gpu_list) > 0:
+        # Use the number of provided GPU ids as the requested GPU count
         device_requests = [
             docker.types.DeviceRequest(
-                count=len(config.gpu_list),
-                device_ids=[str(x) for x in config.gpu_list],
+                count=len(gpu_list),
+                device_ids=[str(x) for x in gpu_list],
                 capabilities=[["gpu"]]
             )
         ]
     
-    print(f"DEBUG: cpu_quota={cpu_quota}, mem_limit={mem_limit}, device_requests={device_requests}")
+    print(f"DEBUG: cpu_list={cpu_count}, gpu_list={gpu_list}, mem_limit={mem_limit}, memswap_limit={memswap_limit}, device_requests={device_requests}")
     name = f"{config.name}" # 名字自定义
+    # prepare host directory to mount as container /root
+    host_root_mount = os.path.join("/home", owner_name, "containers", name)
+    try:
+        os.makedirs(host_root_mount, exist_ok=True)
+    except Exception as e:
+        raise RuntimeError(f"failed to ensure host mount path {host_root_mount}: {e}")
     # avoid creating a random-name container: check if a container with the desired name already exists
     try:
         existing = extensions.docker_client.containers.get(name)
@@ -79,8 +102,10 @@ def create_container(owner_name: str, config:Container.Config_info, public_key: 
         name=name,
         ports={"22/tcp": config.port},   # ssh端口映射
         mem_limit=mem_limit,
-        cpu_quota=cpu_quota,
-        device_requests=device_requests
+        memswap_limit=memswap_limit,
+        cpuset_cpus=cpuset_cpus,
+        device_requests=device_requests,
+        volumes={host_root_mount: {'bind': '/root', 'mode': 'rw'}}
     )
     print(f"Container created with ID={container.id} and name={name}")
     container.reload()
@@ -312,6 +337,7 @@ def restart_container(container_name: str, timeout: int = 10) -> bool:
         container = extensions.docker_client.containers.get(container_name)
         container.restart(timeout=timeout)
         container.reload()
+        container.exec_run("service ssh restart", user="root")
         print(f"Restarted container {container_name}, new status={getattr(container, 'status', None)}")
         return True
     except docker.errors.NotFound:
