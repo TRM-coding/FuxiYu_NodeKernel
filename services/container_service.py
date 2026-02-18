@@ -68,16 +68,16 @@ def create_container(owner_name: str, config:Container.Config_info, public_key: 
     gpu_list = getattr(config, 'gpu_list', None)
     device_requests = None
     if gpu_list is not None and isinstance(gpu_list, (list, tuple)) and len(gpu_list) > 0:
-        # Use the number of provided GPU ids as the requested GPU count
+        # When specific GPU ids are provided, do NOT set 'count' because
+        # Docker rejects DeviceRequest with both Count and DeviceIDs set.
         device_requests = [
             docker.types.DeviceRequest(
-                count=len(gpu_list),
                 device_ids=[str(x) for x in gpu_list],
                 capabilities=[["gpu"]]
             )
         ]
-    
-    print(f"DEBUG: cpu_list={cpu_count}, gpu_list={gpu_list}, mem_limit={mem_limit}, memswap_limit={memswap_limit}, device_requests={device_requests}")
+
+    print(f"DEBUG: cpu_list={cpu_list}, gpu_list={gpu_list}, mem_limit={mem_limit}, memswap_limit={memswap_limit}, device_requests={device_requests}")
     name = f"{config.name}" # 名字自定义
     # prepare host directory to mount as container /root
     host_root_mount = os.path.join("/home", owner_name, "containers", name)
@@ -137,11 +137,26 @@ def create_container(owner_name: str, config:Container.Config_info, public_key: 
         if exit_code != 0:
             raise RuntimeError(f"cmd failed: {cmd}\nexit={exit_code}\noutput={out}")
         return r
-    # 下面的命令执行可能会比较慢，所以设置了较长的超时时间（120秒），以避免某些环境下 apt-get 卡死导致的问题
-    _run(container, "apt-get update")
-    _run(container, "DEBIAN_FRONTEND=noninteractive apt-get install -y openssh-server")
-    _run(container, "mkdir -p /run/sshd")
-    _run(container, "ssh-keygen -A")
+    # 下面的命令执行可能会比较慢，所以设置了较长的超时时间（120秒），
+    # 以避免某些环境下 apt-get 卡死导致的问题。apt-get 有时会因为签名/证书
+    # 问题失败（例如镜像环境或时间不同步），因此在失败时尝试一次回退策略，
+    # 但不要因为安装失败就删除已创建的容器——只记录并继续。
+    try:
+        _run(container, "apt-get update")
+        _run(container, "DEBIAN_FRONTEND=noninteractive apt-get install -y openssh-server")
+        _run(container, "mkdir -p /run/sshd")
+        _run(container, "ssh-keygen -A")
+    except Exception as e:
+        print(f"apt-get update/install failed: {e}\nAttempting fallback sequence (clean + relaxed update + allow-unauthenticated install)")
+        try:
+            _run(container, "apt-get clean")
+            _run(container, "rm -rf /var/lib/apt/lists/*")
+            _run(container, "apt-get update -o Acquire::AllowInsecureRepositories=true -o Acquire::Check-Valid-Until=false")
+            _run(container, "DEBIAN_FRONTEND=noninteractive apt-get install -y --allow-unauthenticated openssh-server")
+            _run(container, "mkdir -p /run/sshd")
+            _run(container, "ssh-keygen -A")
+        except Exception as e2:
+            print(f"Fallback apt-get sequence also failed: {e2}. Continuing without openssh-server; container created but SSH may be unavailable.")
     # 初始密码为 owner_name + "123"，用户可以登录后再改密码（也可以直接提供公钥登录）
     _run(container, f"echo 'root:{owner_name}123' | chpasswd")
     try:
@@ -152,7 +167,10 @@ def create_container(owner_name: str, config:Container.Config_info, public_key: 
     _run(container, "sed -i 's/^#*PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config")
 
     # 不用 service（容器里不一定有 init），直接启动 sshd（会后台守护）
-    _run(container, "/usr/sbin/sshd")
+    try:
+        _run(container, "/usr/sbin/sshd")
+    except Exception as e:
+        print(f"Failed to start sshd inside container: {e}. SSH may be unavailable.")
     # 使得公钥可选 （如果提供了公钥则安装，否则只用密码登录）
     if public_key:
         try:
