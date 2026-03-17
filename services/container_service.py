@@ -17,6 +17,7 @@ from cryptography.hazmat.primitives.asymmetric.rsa import RSAPrivateKey, RSAPubl
 import base64
 # from ..extensions import docker_client
 import docker
+from docker.types import Mount
 import os
 from typing import NamedTuple
 from ..utils import sanitizer as _sanitizer
@@ -79,10 +80,50 @@ def create_container(owner_name: str, config:Container.Config_info, public_key: 
 
     print(f"DEBUG: cpu_list={cpu_list}, gpu_list={gpu_list}, mem_limit={mem_limit}, memswap_limit={memswap_limit}, device_requests={device_requests}")
     name = f"{config.name}" # 名字自定义
-    # prepare host directory to mount as container /root
+    # 将container的/root目录挂载到宿主机的/home/owner_name/containers/name目录，方便后续调试和数据持久化（虽然现在设计上容器是临时的，但以防万一）。这个路径也要确保合法和安全，避免注入攻击或路径遍历等问题。
     host_root_mount = os.path.join("/home", owner_name, "containers", name)
+    print(f"=== 调试信息开始 ===")
+    print(f"[1] 当前用户: {os.getuid()}:{os.getgid()}")
+    print(f"[2] owner_name: {owner_name}")
+    print(f"[3] name: {name}")
+    print(f"[4] 初始挂载路径: {host_root_mount}")
+        
     try:
-        os.makedirs(host_root_mount, exist_ok=True)
+        try: 
+            os.makedirs(host_root_mount, exist_ok=False)
+            print(f"[5] 成功创建新目录: {host_root_mount}")
+        except FileExistsError:
+            # 如果目录已经存在了，加上一个随机后缀避免冲突
+            print(f"[5] 目录已存在: {host_root_mount}")
+            import random
+            suffix = random.randint(10000, 99999)
+            host_root_mount += f"_{suffix}"
+            print(f"[6] 添加后缀后路径: {host_root_mount}")
+            try:
+                os.makedirs(host_root_mount, exist_ok=False)
+                print(f"[7] 成功创建带后缀目录: {host_root_mount}")
+            except FileExistsError:
+                raise RuntimeError(f"failed to create host mount path {host_root_mount}: directory already exists")
+        # 设置权限
+        current_uid = os.getuid()
+        current_gid = os.getgid()
+
+        stat_info = os.stat(host_root_mount)
+        print(f"[8] 目录当前状态:")
+        print(f"   - 所有者: {stat_info.st_uid}:{stat_info.st_gid}")
+        print(f"   - 权限: {oct(stat_info.st_mode & 0o777)}")
+        print(f"   - 路径: {host_root_mount}")
+
+        os.chown(host_root_mount, current_uid, current_gid)
+        os.chmod(host_root_mount, 0o755)
+
+
+        # 验证修改后状态
+        new_stat = os.stat(host_root_mount)
+        print(f"[9] 修改后状态:")
+        print(f"   - 所有者: {new_stat.st_uid}:{new_stat.st_gid}")
+        print(f"   - 权限: {oct(new_stat.st_mode & 0o777)}")
+
     except Exception as e:
         raise RuntimeError(f"failed to ensure host mount path {host_root_mount}: {e}")
     # avoid creating a random-name container: check if a container with the desired name already exists
@@ -94,22 +135,60 @@ def create_container(owner_name: str, config:Container.Config_info, public_key: 
         # good, proceed to create with explicit name
         pass
 
+    # Use docker.types.Mount for a more reliable bind mount
+    mounts = [Mount(target="/root", source=host_root_mount, type="bind", read_only=False)]
+    print(f"DEBUG: Using mounts={mounts}")
     container = extensions.docker_client.containers.run(
         config.image,
         "tail -f /dev/null",   # 保证容器一直运行
         detach=True,
         tty=True,
         name=name,
+        
         ports={"22/tcp": config.port},   # ssh端口映射
         mem_limit=mem_limit,
         memswap_limit=memswap_limit,
         cpuset_cpus=cpuset_cpus,
         device_requests=device_requests,
-        volumes={host_root_mount: {'bind': '/root', 'mode': 'rw'}}
+        mounts=mounts
     )
     print(f"Container created with ID={container.id} and name={name}")
+
+    # ==== 修复挂载目录所有权 ====
+    import time
+    time.sleep(2)  # 给 Docker 一点时间完成挂载
+
+    # 再次检查并修复目录所有权
+    current_uid = os.getuid()
+    current_gid = os.getgid()
+    stat_after = os.stat(host_root_mount)
+    if stat_after.st_uid != current_uid or stat_after.st_gid != current_gid:
+        print(f"目录所有权被修改(1)，正在修复: {stat_after.st_uid}:{stat_after.st_gid} -> {current_uid}:{current_gid}")
+        import subprocess
+        subprocess.run(f"sudo chown -R {current_uid}:{current_gid} {host_root_mount}", shell=True, check=True)
+        
+        print("目录所有权修复完成")
+    # ================================
+
     container.reload()
     print(f"Container status after creation: {container.status}")
+    try:
+        print("Container mounts after reload:", container.attrs.get('Mounts'))
+    except Exception:
+        print("Container mounts info unavailable")
+
+    # 再次检查并修复目录所有权
+    current_uid = os.getuid()
+    current_gid = os.getgid()
+    stat_after = os.stat(host_root_mount)
+    if stat_after.st_uid != current_uid or stat_after.st_gid != current_gid:
+        print(f"目录所有权被修改(2)，正在修复: {stat_after.st_uid}:{stat_after.st_gid} -> {current_uid}:{current_gid}")
+        import subprocess
+        subprocess.run(f"sudo chown -R {current_uid}:{current_gid} {host_root_mount}", shell=True, check=True)
+        
+        print("目录所有权修复完成")
+    # ================================
+
 
     # container.exec_run("service ssh restart", user="root")
     def _run(container, cmd: str, timeout_sec: int = 120):
@@ -136,6 +215,8 @@ def create_container(owner_name: str, config:Container.Config_info, public_key: 
         print(f"Executed command: {cmd}\nExit code: {exit_code}\nOutput: {out}")
         if exit_code != 0:
             raise RuntimeError(f"cmd failed: {cmd}\nexit={exit_code}\noutput={out}")
+        
+        print(f"目录所有者: {os.stat(host_root_mount).st_uid}:{os.stat(host_root_mount).st_gid} (当前用户: {os.getuid()}:{os.getgid()})")
         return r
     # 下面的命令执行可能会比较慢，所以设置了较长的超时时间（120秒），
     # 以避免某些环境下 apt-get 卡死导致的问题。apt-get 有时会因为签名/证书
@@ -181,11 +262,23 @@ def create_container(owner_name: str, config:Container.Config_info, public_key: 
             cmd = (
                 "mkdir -p /root/.ssh && chmod 700 /root/.ssh && "
                 f"echo '{b64}' | base64 -d > /root/.ssh/authorized_keys && "
-                "chmod 600 /root/.ssh/authorized_keys && chown -R root:root /root/.ssh"
+                "chmod 600 /root/.ssh/authorized_keys"
             )
             _run(container, cmd)
         except Exception as e:
             print(f"Failed to install public_key into container: {e}")
+
+        # 再次检查并修复目录所有权
+    current_uid = os.getuid()
+    current_gid = os.getgid()
+    stat_after = os.stat(host_root_mount)
+    if stat_after.st_uid != current_uid or stat_after.st_gid != current_gid:
+        print(f"目录所有权被修改(3)，正在修复: {stat_after.st_uid}:{stat_after.st_gid} -> {current_uid}:{current_gid}")
+        import subprocess
+        subprocess.run(f"sudo chown -R {current_uid}:{current_gid} {host_root_mount}", shell=True, check=True)
+        
+        print("目录所有权修复完成")
+    # ================================
 
     return CreateContainerReturn(container.id,container.name)
 
