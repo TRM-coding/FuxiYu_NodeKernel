@@ -404,4 +404,50 @@ def restart_container(container_name: str, timeout: int = 10) -> bool:
         return False
 
 
+def get_last_ssh_connect_time(container_name: str) -> str | None:
+    """
+    Return the last SSH connection time string of the container.
+    If not found or any error occurs, return None.
+    """
+    try:
+        if extensions.docker_client is None:
+            extensions.init_docker()
+
+        _sanitizer.validate_username(container_name)
+        container = extensions.docker_client.containers.get(container_name)
+
+        # Prefer `last` for authoritative login sessions, then fallback to sshd logs.
+        cmd = r"""
+if command -v last >/dev/null 2>&1; then
+  v="$(last -w -i 2>/dev/null | awk '$1!="wtmp" && $1!="reboot" && $1!="btmp" && $1!="runlevel" {print; exit}')"
+  if [ -n "$v" ]; then
+    echo "$v"
+    exit 0
+  fi
+fi
+
+if [ -f /var/log/auth.log ]; then
+  line="$(grep -E 'sshd.*(Accepted|session opened)' /var/log/auth.log | tail -n 1)"
+elif [ -f /var/log/secure ]; then
+  line="$(grep -E 'sshd.*(Accepted|session opened)' /var/log/secure | tail -n 1)"
+else
+  line=""
+fi
+echo "$line"
+"""
+
+        result = container.exec_run(["/bin/sh", "-c", cmd], user="root")
+        output = result.output.decode("utf-8", errors="ignore").strip()
+        if hasattr(result, "exit_code") and result.exit_code != 0:
+            print(f"Failed to query last ssh connect time for {container_name}: exit={result.exit_code}, output={output}")
+            return None
+        return output if output else None
+    except docker.errors.NotFound:
+        print(f"Container {container_name} not found when querying last ssh connect time.")
+        return None
+    except Exception as e:
+        print(f"Failed to get last ssh connect time for {container_name}: {e}")
+        return None
+
+
 ####################################################
