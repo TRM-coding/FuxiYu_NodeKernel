@@ -9,7 +9,8 @@ from ..services.container_service import (
 	update_role,
 	start_container,
 	stop_container,
-	restart_container
+	restart_container,
+	get_last_ssh_connect_time
 )
 import threading
 from .. import extensions
@@ -254,6 +255,58 @@ def Container_status():
 		return jsonify({"success": 1, "container_status": status_out, "container_name": container_name}), 200
 	except docker.errors.NotFound:
 		return jsonify({"success": 0, "error": "container not found", "error_reason": "not_found", "container_name": container_name}), 404
+	except Exception as e:
+		return jsonify({"success": 0, "error": str(e), "error_reason": "internal_error"}), 500
+
+
+'''
+通信数据格式：
+发送格式：
+{
+	"message":{
+		"config":
+		{
+			"container_name":"xxxx"
+		}
+	},
+	"signature":"xxxxxx"
+}
+返回格式：
+{
+	"success": 0|1,
+	"container_name": "xxxx",
+	"last_ssh_connect_time": "xxxx"
+}
+'''
+@api_bp.post("/container_last_ssh_time")
+def Container_last_ssh_time():
+	recived_data = request.get_json(silent=True)
+	if not recived_data:
+		return jsonify({"success": 0, "error":"invalid json", "error_reason": "invalid_json"}), 400
+
+	verified_msg = get_verified_msg(recived_data)
+	if not verified_msg:
+		return jsonify({"success": 0, "error": "invalid_signature or decryption failed", "error_reason": "invalid_signature"}), 401
+
+	config = verified_msg.get("config") or {}
+	container_name = config.get("container_name") or config.get("name")
+	if not container_name:
+		return jsonify({"success": 0, "error": "missing container_name", "error_reason": "missing_container_name"}), 400
+
+	try:
+		last_time = get_last_ssh_connect_time(container_name)
+		if last_time is None:
+			return jsonify({
+				"success": 0,
+				"container_name": container_name,
+				"error": "last ssh connect time not found",
+				"error_reason": "not_found"
+			}), 404
+		return jsonify({
+			"success": 1,
+			"container_name": container_name,
+			"last_ssh_connect_time": last_time
+		}), 200
 	except Exception as e:
 		return jsonify({"success": 0, "error": str(e), "error_reason": "internal_error"}), 500
 
@@ -715,4 +768,3 @@ def Update_role():
 
 def register_blueprints(app):
 	app.register_blueprint(api_bp)
-
