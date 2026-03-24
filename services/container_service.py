@@ -1,7 +1,7 @@
 # 与他们相关的参数有必要被严格验证和过滤，或者改用更安全的方式（如直接传递参数列表而不是 shell 命令字符串）
 
 from ..constant import *
-from ..config import KeyConfig
+from ..config import KeyConfig, NodeProxyConfig
 from ..utils.Container import Container
 from .. import extensions
 from ..utils.CheckKeys import load_keys
@@ -179,6 +179,29 @@ def create_container(owner_name: str, config:Container.Config_info, public_key: 
     # 以避免某些环境下 apt-get 卡死导致的问题。apt-get 有时会因为签名/证书
     # 问题失败（例如镜像环境或时间不同步），因此在失败时尝试一次回退策略，
     # 但不要因为安装失败就删除已创建的容器——只记录并继续。
+
+    # Configure network proxy inside container BEFORE any network operations.
+    # Read proxy from NodeProxyConfig so it can be changed via env/config.
+    PROXY_URL = getattr(NodeProxyConfig, 'PROXY_HOST', None)
+    try:
+        # write environment variables so new processes see the proxy
+        _run(container, (
+            "printf 'http_proxy=\"%s\"\nhttps_proxy=\"%s\"\nHTTP_PROXY=\"%s\"\nHTTPS_PROXY=\"%s\"\n' "
+            % (PROXY_URL, PROXY_URL, PROXY_URL, PROXY_URL)
+            + "> /etc/environment"
+        ))
+        # configure apt to use the proxy
+        _run(container, (
+            "mkdir -p /etc/apt/apt.conf.d && printf 'Acquire::http::Proxy \"%s\";\nAcquire::https::Proxy \"%s\";\n' "
+            % (PROXY_URL, PROXY_URL)
+            + "> /etc/apt/apt.conf.d/99proxy"
+        ))
+        # export for the current shell (helps immediate exec_run commands)
+        _run(container, f"export http_proxy={PROXY_URL} https_proxy={PROXY_URL} HTTP_PROXY={PROXY_URL} HTTPS_PROXY={PROXY_URL} || true")
+        print(f"Proxy configured inside container: {PROXY_URL}")
+    except Exception as e:
+        print(f"Failed to configure proxy inside container: {e}")
+
     try:
         _run(container, "apt-get update")
         _run(container, "DEBIAN_FRONTEND=noninteractive apt-get install -y openssh-server")

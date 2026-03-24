@@ -32,6 +32,10 @@ class AppConfig(SqlConfig, KeyConfig):
     SQLALCHEMY_TRACK_MODIFICATIONS = False
     SECRET_KEY = os.getenv("SECRET_KEY", "dev")
 
+class NodeProxyConfig(AppConfig):
+    # 代理服务器配置
+    PROXY_HOST = os.getenv("PROXY_HOST", "http://202.205.102.121:8091")
+
 
 def get_config(env: str | None = None):
     """
