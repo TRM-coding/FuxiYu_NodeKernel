@@ -354,6 +354,7 @@ def Machine_status():
 @api_bp.post("/remove_container")
 def Remove_container():
 	recived_data = request.get_json(silent=True)
+	print("Remove container called.")
 	if not recived_data:
 		return jsonify({"error":"invalid json", "error_reason": "invalid_json"}), 400
 	

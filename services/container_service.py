@@ -190,6 +190,9 @@ def create_container(owner_name: str, config:Container.Config_info, public_key: 
             % (PROXY_URL, PROXY_URL, PROXY_URL, PROXY_URL)
             + "> /etc/environment"
         ))
+        _run(container, (
+            "source /etc/environment && env | grep -i proxy"
+        ))
         # configure apt to use the proxy
         _run(container, (
             "mkdir -p /etc/apt/apt.conf.d && printf 'Acquire::http::Proxy \"%s\";\nAcquire::https::Proxy \"%s\";\n' "
@@ -259,10 +262,17 @@ def remove_container(container_name: str) -> int:
             except Exception as e:
                 print(f"Failed to init docker client: {e}")
                 raise RuntimeError(f"docker init failed: {e}")
-
+        print("Attempting to remove container with name:", container_name)
         container = extensions.docker_client.containers.get(container_name)
         container.remove(force=True)  # force=True 避免容器在运行时报错
-        return RemoveContinaerReturn.SUCCESS
+        # 验证容器确实被删除了        try:
+        try:
+            extensions.docker_client.containers.get(container_name)
+        except docker.errors.NotFound:
+            print(f"Container {container_name} successfully removed.")
+            return RemoveContinaerReturn.SUCCESS
+        print(f"Container {container_name} still exists after removal attempt.")
+        return RemoveContinaerReturn.FAILED
     except docker.errors.NotFound:
         print(f"Container {container_name} not found.")
         return RemoveContinaerReturn.NOTFOUND
