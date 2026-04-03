@@ -61,10 +61,12 @@ def create_container(owner_name: str, config:Container.Config_info, public_key: 
     cpuset_cpus = ",".join(str(x) for x in cpu_list) if cpu_list else None
     mem_limit = f"{config.memory}g"
     
-    # Docker needs an explicit memswap_limit equal to mem_limit to fully disable swap.
-    # Otherwise, leaving memswap_limit unset may allow Docker's default swap behavior.
-    swap_amt = int(getattr(config, 'swap_memory', 0) or 0)
-    memswap_limit = f"{config.memory}g" if swap_amt <= 0 else f"{config.memory + swap_amt}g"
+    # Do NOT set memswap_limit here; keep kernel swap behavior default.
+    # Instead, when provided, use `shared_memory` to set container's IPC shared memory size via `shm_size`.
+    shared_amt = int(getattr(config, 'shared_memory', 0) or 0)
+    # Docker SDK expects `shm_size` as an int (bytes) or a string like '64m'.
+    # Use bytes for clarity: convert GB -> bytes.
+    shm_size_bytes = int(shared_amt) * 1024 * 1024 * 1024 if shared_amt > 0 else None
 
     # GPU LIST为空则是CPU机器，不接受GPU请求。device_requests只用于GPU资源分配
     gpu_list = getattr(config, 'gpu_list', None)
@@ -79,7 +81,7 @@ def create_container(owner_name: str, config:Container.Config_info, public_key: 
             )
         ]
 
-    print(f"DEBUG: cpu_list={cpu_list}, gpu_list={gpu_list}, mem_limit={mem_limit}, memswap_limit={memswap_limit}, device_requests={device_requests}")
+    print(f"DEBUG: cpu_list={cpu_list}, gpu_list={gpu_list}, mem_limit={mem_limit}, shm_size_bytes={shm_size_bytes}, device_requests={device_requests}")
     name = f"{config.name}" # 名字自定义
     # 将container的/root目录挂载到宿主机的/home/owner_name/containers/name目录，方便后续调试和数据持久化（虽然现在设计上容器是临时的，但以防万一）。这个路径也要确保合法和安全，避免注入攻击或路径遍历等问题。
     host_root_mount = os.path.join("/home", owner_name, "containers", name)
@@ -132,10 +134,10 @@ def create_container(owner_name: str, config:Container.Config_info, public_key: 
         
         ports={"22/tcp": config.port},   # ssh端口映射
         mem_limit=mem_limit,
-        memswap_limit=memswap_limit,
         cpuset_cpus=cpuset_cpus,
         device_requests=device_requests,
-        mounts=mounts
+        mounts=mounts,
+        **({"shm_size": shm_size_bytes} if shm_size_bytes is not None else {})
     )
     print(f"Container created with ID={container.id} and name={name}")
 

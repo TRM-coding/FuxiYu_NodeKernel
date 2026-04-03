@@ -65,7 +65,7 @@ def mark_restart_status(container_name: str, status: str, error_reason: str | No
 			"gpu_list":[0,1,2,...], #字段为空就是CPU机器
 			"cpu_number":20,
 			"memory":16,#GB
-			"swap_memory":32,#GB
+			"shared_memory":32,#GB
 			"name":'example',
 			"port":0,
 			"image":"ubuntu24.04"
