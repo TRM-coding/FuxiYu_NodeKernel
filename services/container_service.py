@@ -61,10 +61,11 @@ def create_container(owner_name: str, config:Container.Config_info, public_key: 
     cpuset_cpus = ",".join(str(x) for x in cpu_list) if cpu_list else None
     mem_limit = f"{config.memory}g"
     
-    # 构建 memswap_limit 参数，如果 swap_memory 大于0，则 memswap_limit = memory + swap_memory；如果 swap_memory 不大于0，则不设置 memswap_limit（默认为和 memory 一样，禁止使用 swap）
+    # Docker needs an explicit memswap_limit equal to mem_limit to fully disable swap.
+    # Otherwise, leaving memswap_limit unset may allow Docker's default swap behavior.
     swap_amt = int(getattr(config, 'swap_memory', 0) or 0)
-    memswap_limit = f"{config.memory + swap_amt}g" if swap_amt and swap_amt >= 0 else None
-    
+    memswap_limit = f"{config.memory}g" if swap_amt <= 0 else f"{config.memory + swap_amt}g"
+
     # GPU LIST为空则是CPU机器，不接受GPU请求。device_requests只用于GPU资源分配
     gpu_list = getattr(config, 'gpu_list', None)
     device_requests = None
