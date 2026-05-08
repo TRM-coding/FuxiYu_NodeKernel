@@ -373,14 +373,9 @@ def Remove_container():
 	try:
 		# 防止失败后删不掉
 		status_info = creation_status.get(container_name)
-		if status_info is not None and status_info.get("status") == "failed":
-			# clear the recorded failed state and return success
-			creation_status.pop(container_name, None)
-			return jsonify({
-				"success": 1
-			}), 200
-		
 		success = remove_container(container_name)
+		if status_info is not None and status_info.get("status") == "failed" and success == 0:
+			creation_status.pop(container_name, None)
 	except Exception as e:
 		print(e)
 		return jsonify({"success": 0, "error": str(e)}), 500

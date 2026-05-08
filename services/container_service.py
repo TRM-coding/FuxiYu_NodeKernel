@@ -186,42 +186,46 @@ def create_container(owner_name: str, config:Container.Config_info, public_key: 
     # Configure network proxy inside container BEFORE any network operations.
     # Read proxy from NodeProxyConfig so it can be changed via env/config.
     PROXY_URL = getattr(NodeProxyConfig, 'PROXY_HOST', None)
-    try:
-        # write environment variables so new processes see the proxy
-        _run(container, (
-            "printf 'http_proxy=\"%s\"\nhttps_proxy=\"%s\"\nHTTP_PROXY=\"%s\"\nHTTPS_PROXY=\"%s\"\n' "
-            % (PROXY_URL, PROXY_URL, PROXY_URL, PROXY_URL)
-            + "> /etc/environment"
-        ))
-        _run(container, (
-            "source /etc/environment && env | grep -i proxy"
-        ))
-        # configure apt to use the proxy
-        _run(container, (
-            "mkdir -p /etc/apt/apt.conf.d && printf 'Acquire::http::Proxy \"%s\";\nAcquire::https::Proxy \"%s\";\n' "
-            % (PROXY_URL, PROXY_URL)
-            + "> /etc/apt/apt.conf.d/99proxy"
-        ))
-        # export for the current shell (helps immediate exec_run commands)
-        _run(container, f"export http_proxy={PROXY_URL} https_proxy={PROXY_URL} HTTP_PROXY={PROXY_URL} HTTPS_PROXY={PROXY_URL} || true")
-        print(f"Proxy configured inside container: {PROXY_URL}")
-    except Exception as e:
-        print(f"Failed to configure proxy inside container: {e}")
+    if PROXY_URL:
+        try:
+            # write environment variables so new processes see the proxy
+            _run(container, (
+                "printf 'http_proxy=\"%s\"\nhttps_proxy=\"%s\"\nHTTP_PROXY=\"%s\"\nHTTPS_PROXY=\"%s\"\n' "
+                % (PROXY_URL, PROXY_URL, PROXY_URL, PROXY_URL)
+                + "> /etc/environment"
+            ))
+            # configure apt to use the proxy before the first apt network access
+            _run(container, (
+                "mkdir -p /etc/apt/apt.conf.d && printf 'Acquire::http::Proxy \"%s\";\nAcquire::https::Proxy \"%s\";\n' "
+                % (PROXY_URL, PROXY_URL)
+                + "> /etc/apt/apt.conf.d/99proxy"
+            ))
+            _run(container, (
+                "grep -i proxy /etc/environment /etc/apt/apt.conf.d/99proxy"
+            ))
+            print(f"Proxy configured inside container: {PROXY_URL}")
+        except Exception as e:
+            print(f"Failed to configure proxy inside container: {e}")
+    else:
+        print("No proxy configured for container network setup.")
 
+    ssh_ready = False
     try:
-        _run(container, "apt-get update")
-        _run(container, "DEBIAN_FRONTEND=noninteractive apt-get install -y openssh-server")
+        _run(container, "apt-get update", timeout_sec=300)
+        _run(container, "DEBIAN_FRONTEND=noninteractive apt-get install -y openssh-server", timeout_sec=600)
         _run(container, "mkdir -p /run/sshd")
         _run(container, "ssh-keygen -A")
+        ssh_ready = True
     except Exception as e:
         print(f"apt-get update/install failed: {e}\nAttempting fallback sequence (clean + relaxed update + allow-unauthenticated install)")
         try:
             _run(container, "apt-get clean")
             _run(container, "rm -rf /var/lib/apt/lists/*")
-            _run(container, "apt-get update -o Acquire::AllowInsecureRepositories=true -o Acquire::Check-Valid-Until=false")
-            _run(container, "DEBIAN_FRONTEND=noninteractive apt-get install -y --allow-unauthenticated openssh-server")
+            _run(container, "apt-get update -o Acquire::AllowInsecureRepositories=true -o Acquire::Check-Valid-Until=false", timeout_sec=300)
+            _run(container, "DEBIAN_FRONTEND=noninteractive apt-get install -y --allow-unauthenticated openssh-server", timeout_sec=600)
             _run(container, "mkdir -p /run/sshd")
             _run(container, "ssh-keygen -A")
+            ssh_ready = True
         except Exception as e2:
             print(f"Fallback apt-get sequence also failed: {e2}. Continuing without openssh-server; container created but SSH may be unavailable.")
     # 初始密码为 owner_name + "123"，用户可以登录后再改密码（也可以直接提供公钥登录）
@@ -230,14 +234,18 @@ def create_container(owner_name: str, config:Container.Config_info, public_key: 
         _sanitizer.validate_username(owner_name)
     except Exception as e:
         raise RuntimeError(f"unsafe owner_name: {e}")
-    _run(container, "sed -i 's/^#*PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config")
-    _run(container, "sed -i 's/^#*PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config")
+    if ssh_ready:
+        _run(container, "sed -i 's/^#*PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config")
+        _run(container, "sed -i 's/^#*PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config")
+    else:
+        print("Skipping sshd_config edits because openssh-server is not installed.")
 
     # 不用 service（容器里不一定有 init），直接启动 sshd（会后台守护）
-    try:
-        _run(container, "/usr/sbin/sshd")
-    except Exception as e:
-        print(f"Failed to start sshd inside container: {e}. SSH may be unavailable.")
+    if ssh_ready:
+        try:
+            _run(container, "/usr/sbin/sshd")
+        except Exception as e:
+            print(f"Failed to start sshd inside container: {e}. SSH may be unavailable.")
     # 使得公钥可选 （如果提供了公钥则安装，否则只用密码登录）
     if public_key:
         try:
