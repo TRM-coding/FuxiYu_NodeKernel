@@ -220,7 +220,7 @@ def Container_status():
 		if state is None:
 			status_out = "unknown"
 		elif state.lower() == 'running':
-			# additional readiness checks: ensure sshd is listening and authorized_keys exists
+			# additional readiness checks: ensure sshd is listening (one exec to avoid multiple roundtrips)
 			def _exec_check(cmd: str) -> bool:
 				try:
 					r = container.exec_run(["/bin/sh", "-c", cmd], user="root")
@@ -228,12 +228,13 @@ def Container_status():
 				except Exception:
 					return False
 
-			# try multiple ways to detect ssh listening (ss/netstat/ps/pgrep)
-			ssh_listening = False
-			for c in ["ss -ltn | grep :22", "netstat -ltn | grep :22", "pgrep -f sshd", "ps aux | grep [s]shd"]:
-				if _exec_check(c):
-					ssh_listening = True
-					break
+			# merge four ssh-detection checks into a single exec_run call
+			ssh_listening = _exec_check(
+				"ss -ltn 2>/dev/null | grep -q :22 || "
+				"netstat -ltn 2>/dev/null | grep -q :22 || "
+				"pgrep -f sshd >/dev/null 2>&1 || "
+				"ps aux 2>/dev/null | grep -q [s]shd"
+			)
 
 			# check authorized_keys exists and is non-empty
 			#auth_ok = _exec_check("test -s /root/.ssh/authorized_keys")

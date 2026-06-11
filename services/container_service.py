@@ -460,6 +460,14 @@ def get_last_ssh_connect_time(container_name: str) -> str | None:
         _sanitizer.validate_username(container_name)
         container = extensions.docker_client.containers.get(container_name)
 
+        # 容器未运行则跳过 exec_run，避免等待 Docker 返回 409 耗时
+        try:
+            _state = (container.attrs.get('State') or {}).get('Status', '')
+        except Exception:
+            _state = ''
+        if str(_state).lower() in ('exited', 'dead', 'created', 'paused', 'removing'):
+            return None
+
         # Prefer `last` for authoritative login sessions, then fallback to sshd logs.
         cmd = r"""
 if command -v last >/dev/null 2>&1; then
