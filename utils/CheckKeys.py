@@ -133,13 +133,9 @@ def verify_signature(message:bytes, signature:bytes)->bool:
         return False
     
 def get_verified_msg(recived_message:dict)->dict:
-    """
-    解密并验证签名的消息
-    :param recived_message: 包含加密消息和签名的字典 {"message": bytes/str, "signature": bytes/str}
-    :return: 验证成功返回解密后的字典，失败返回空字典
-    """
+    import datetime as _dt
+    _t0 = _dt.datetime.now()
     try:
-        # 提取加密消息和签名
         encrypted_msg = recived_message.get("message")
         signature_data = recived_message.get("signature")
 
@@ -147,37 +143,45 @@ def get_verified_msg(recived_message:dict)->dict:
             encrypted_msg = base64.b64decode(encrypted_msg)
         if isinstance(signature_data, str):
             signature_data = base64.b64decode(signature_data)
-        
+
         if not encrypted_msg or not signature_data:
             return {}
-        
-        # 确保是 bytes 类型
+
         if isinstance(encrypted_msg, str):
             encrypted_msg = encrypted_msg.encode()
         if isinstance(signature_data, str):
             signature_data = signature_data.encode()
-        
-        # 解密消息
+        _t1 = _dt.datetime.now()
+
         try:
             decrypted_msg = decryption(encrypted_msg)
         except Exception as e:
-            print("[Decryption Failed]", e)
+            _te = _dt.datetime.now()
+            print(f"[perf][node] verify_msg FAILED decrypt after {(_te-_t0).total_seconds()*1000:.0f}ms: {e}")
             return {}
-        
-        # 验证签名
+        _t2 = _dt.datetime.now()
+
         if not verify_signature(decrypted_msg, signature_data):
-            print("[Signature Verification Failed]")
+            _te = _dt.datetime.now()
+            print(f"[perf][node] verify_msg FAILED signature after {(_te-_t0).total_seconds()*1000:.0f}ms")
             return {}
-        
-        # 将解密后的消息转换为字典
+        _t3 = _dt.datetime.now()
+
         try:
             message_dict = json.loads(decrypted_msg.decode('utf-8'))
         except Exception as e:
-            print("[JSON Decode Error]", e)
+            _te = _dt.datetime.now()
+            print(f"[perf][node] verify_msg FAILED json after {(_te-_t0).total_seconds()*1000:.0f}ms: {e}")
             return {}
-        
+
+        _t4 = _dt.datetime.now()
+        _b64 = (_t1-_t0).total_seconds()*1000
+        _dec = (_t2-_t1).total_seconds()*1000
+        _vrf = (_t3-_t2).total_seconds()*1000
+        _jsn = (_t4-_t3).total_seconds()*1000
+        print(f"[perf][node] verify_msg  b64={_b64:.0f}ms  decrypt={_dec:.0f}ms  verify={_vrf:.0f}ms  json={_jsn:.0f}ms")
         return message_dict
     except Exception as e:
-        # 任何异常都返回空字典
-        print("[Unexpected Error in get_verified_msg]", e)
+        _te = _dt.datetime.now()
+        print(f"[perf][node] verify_msg FAILED after {(_te-_t0).total_seconds()*1000:.0f}ms: {e}")
         return {}

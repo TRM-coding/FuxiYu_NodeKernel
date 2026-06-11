@@ -170,11 +170,14 @@ def Container_status():
 		"signature":"xxxxxx"
 	}
 	'''
+	import datetime as _dt
+	_t0 = _dt.datetime.now()
 	recived_data = request.get_json(silent=True)
 	if not recived_data:
 		return jsonify({"success": 0, "error":"invalid json"}), 400
 
 	verified_msg = get_verified_msg(recived_data)
+	_t1 = _dt.datetime.now()
 	if not verified_msg:
 		return jsonify({"success": 0, "error": "invalid_signature or decryption failed", "error_reason": "invalid_signature"}), 401
 	config = verified_msg.get("config") or {}
@@ -252,11 +255,17 @@ def Container_status():
 			status_out = str(state).lower()
 
 		print(f"Container '{container_name}' status: {status_out}")
+		_t2 = _dt.datetime.now()
+		print(f"[perf][node] container_status  name={container_name}  verify_msg={(_t1-_t0).total_seconds()*1000:.0f}ms  docker={(_t2-_t1).total_seconds()*1000:.0f}ms  result={status_out}")
 
 		return jsonify({"success": 1, "container_status": status_out, "container_name": container_name}), 200
 	except docker.errors.NotFound:
+		_t2 = _dt.datetime.now()
+		print(f"[perf][node] container_status  name={container_name}  verify_msg={(_t1-_t0).total_seconds()*1000:.0f}ms  docker={(_t2-_t1).total_seconds()*1000:.0f}ms  result=not_found")
 		return jsonify({"success": 0, "error": "container not found", "error_reason": "not_found", "container_name": container_name}), 404
 	except Exception as e:
+		_t2 = _dt.datetime.now()
+		print(f"[perf][node] container_status  name={container_name}  verify_msg={(_t1-_t0).total_seconds()*1000:.0f}ms  docker={(_t2-_t1).total_seconds()*1000:.0f}ms  FAILED: {e}")
 		return jsonify({"success": 0, "error": str(e), "error_reason": "internal_error"}), 500
 
 
@@ -281,11 +290,14 @@ def Container_status():
 '''
 @api_bp.post("/container_last_ssh_time")
 def Container_last_ssh_time():
+	import datetime as _dt
+	_t0 = _dt.datetime.now()
 	recived_data = request.get_json(silent=True)
 	if not recived_data:
 		return jsonify({"success": 0, "error":"invalid json", "error_reason": "invalid_json"}), 400
 
 	verified_msg = get_verified_msg(recived_data)
+	_t1 = _dt.datetime.now()
 	if not verified_msg:
 		return jsonify({"success": 0, "error": "invalid_signature or decryption failed", "error_reason": "invalid_signature"}), 401
 
@@ -296,6 +308,10 @@ def Container_last_ssh_time():
 
 	try:
 		last_time = get_last_ssh_connect_time(container_name)
+		_t2 = _dt.datetime.now()
+		_vrf = (_t1-_t0).total_seconds()*1000
+		_ssh = (_t2-_t1).total_seconds()*1000
+		print(f"[perf][node] container_last_ssh_time  name={container_name}  verify_msg={_vrf:.0f}ms  get_ssh_time={_ssh:.0f}ms")
 		if last_time is None:
 			return jsonify({
 				"success": 0,
@@ -315,11 +331,14 @@ def Container_last_ssh_time():
 # Minimal machine status endpoint for controller health checks
 @api_bp.post("/machine_status")
 def Machine_status():
+	import datetime as _dt
+	_t0 = _dt.datetime.now()
 	recived_data = request.get_json(silent=True)
 	if not recived_data:
 		return jsonify({"success": 0, "error": "invalid json"}), 400
 
 	verified_msg = get_verified_msg(recived_data)
+	_t1 = _dt.datetime.now()
 	if not verified_msg:
 		return jsonify({"success": 0, "error": "invalid_signature or decryption failed", "error_reason": "invalid_signature"}), 401
 
@@ -328,10 +347,10 @@ def Machine_status():
 		if extensions.docker_client is None:
 			extensions.init_docker()
 	except Exception as e:
-		# return success but indicate docker init failed
 		return jsonify({"success": 0, "error": f"docker init failed: {e}", "error_reason": "docker_init_failed"}), 500
 
-	# If everything looks OK, report online. Keep response minimal to be fast.
+	_t2 = _dt.datetime.now()
+	print(f"[perf][node] machine_status  verify_msg={(_t1-_t0).total_seconds()*1000:.0f}ms  docker_init={(_t2-_t1).total_seconds()*1000:.0f}ms")
 	return jsonify({"success": 1, "machine_status": "online"}), 200
 
 '''
