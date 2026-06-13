@@ -246,6 +246,8 @@ def Container_status():
 				status_out = "starting"
 		elif state.lower() in ('created', 'restarting', 'starting'):
 			status_out = "starting"
+		elif state.lower() == 'paused':
+			status_out = "paused"
 		elif state.lower() in ('exited', 'dead'):
 			status_out = "offline"
 		else:
@@ -759,6 +761,124 @@ def Update_role():
 		"success": success,
 		"decrypted_message": verified_msg
 	}), 200
+
+
+'''
+通信数据格式：
+发送格式：
+{
+    "message":{
+        "config":
+        {
+            "container_name":"xxxx"
+        }
+    },
+    "signature":"xxxxxx"
+}
+返回格式：
+{
+    "success": [0|1],
+    "machine_disk": { "total_gb": ..., "used_gb": ..., "free_gb": ..., "percent": ... },
+    "container": { "overlay_rw_bytes": ..., "bind_mount_bytes": ..., "bind_mount_path": ..., "total_bytes": ... }
+}
+'''
+@api_bp.post("/check_disk_usage")
+def Check_disk_usage():
+	recived_data = request.get_json(silent=True)
+	if not recived_data:
+		return jsonify({"success": 0, "error": "invalid json", "error_reason": "invalid_json"}), 400
+
+	verified_msg = get_verified_msg(recived_data)
+	if not verified_msg:
+		return jsonify({"success": 0, "error": "invalid_signature or decryption failed",
+						"error_reason": "invalid_signature"}), 401
+
+	config = verified_msg.get("config") or {}
+	container_name = config.get("container_name")
+	if not container_name:
+		return jsonify({"success": 0, "error": "missing container_name",
+						"error_reason": "missing_container_name"}), 400
+
+	try:
+		if extensions.docker_client is None:
+			extensions.init_docker()
+	except Exception as e:
+		return jsonify({"success": 0, "error": f"docker init failed: {e}",
+						"error_reason": "docker_init_failed"}), 500
+
+	from ..services.container_service import get_disk_usage
+	try:
+		result = get_disk_usage(container_name)
+	except Exception as e:
+		return jsonify({"success": 0, "error": str(e),
+						"error_reason": "internal_error"}), 500
+
+	return jsonify({"success": 1, **result}), 200
+
+
+'''
+通信数据格式：
+发送格式：
+{
+    "message":{
+        "config":
+        {
+            "container_name":"xxxx",
+            "action":"pause"|"unpause"
+        }
+    },
+    "signature":"xxxxxx"
+}
+返回格式：
+{
+    "success": [0|1]
+}
+'''
+@api_bp.post("/pause_container")
+def Pause_container():
+	recived_data = request.get_json(silent=True)
+	if not recived_data:
+		return jsonify({"success": 0, "error": "invalid json", "error_reason": "invalid_json"}), 400
+
+	verified_msg = get_verified_msg(recived_data)
+	if not verified_msg:
+		return jsonify({"success": 0, "error": "invalid_signature or decryption failed",
+						"error_reason": "invalid_signature"}), 401
+
+	config = verified_msg.get("config") or {}
+	container_name = config.get("container_name")
+	if not container_name:
+		return jsonify({"success": 0, "error": "missing container_name",
+						"error_reason": "missing_container_name"}), 400
+
+	action = config.get("action", "pause")
+	if action not in ("pause", "unpause"):
+		return jsonify({"success": 0, "error": "invalid action, must be 'pause' or 'unpause'",
+						"error_reason": "invalid_action"}), 400
+
+	try:
+		if extensions.docker_client is None:
+			extensions.init_docker()
+	except Exception as e:
+		return jsonify({"success": 0, "error": f"docker init failed: {e}",
+						"error_reason": "docker_init_failed"}), 500
+
+	try:
+		container = extensions.docker_client.containers.get(container_name)
+		if action == "pause":
+			container.pause()
+			print(f"Container {container_name} paused.")
+		else:
+			container.unpause()
+			print(f"Container {container_name} unpaused.")
+	except docker.errors.NotFound:
+		return jsonify({"success": 0, "error": "container not found",
+						"error_reason": "not_found"}), 404
+	except Exception as e:
+		return jsonify({"success": 0, "error": str(e),
+						"error_reason": "internal_error"}), 500
+
+	return jsonify({"success": 1}), 200
 
 
 def register_blueprints(app):

@@ -21,6 +21,8 @@ from docker.types import Mount
 import os
 from typing import NamedTuple
 from ..utils import sanitizer as _sanitizer
+import subprocess
+import shutil
 
 
 
@@ -302,7 +304,14 @@ def add_collaborator(container_name: str, user_name: str, role: ROLE) -> bool:
         # validate inputs to reduce injection risk
         _sanitizer.validate_username(container_name)
         _sanitizer.validate_username(user_name)
-        cmd = f"useradd -m -s /bin/bash {user_name} && echo '{user_name}:{user_name}123' | chpasswd"
+        cmd = (
+            f"mkdir -p /root/.collaborators && "
+            f"mkdir -p /root/.collaborators/{user_name} && "
+            f"useradd -M -d /root/.collaborators/{user_name} -s /bin/bash {user_name} && "
+            f"echo '{user_name}:{user_name}123' | chpasswd && "
+            f"ln -s /root/.collaborators/{user_name} /home/{user_name} && "
+            f"chown -R {user_name}:{user_name} /root/.collaborators/{user_name}"
+        )
         if role == ROLE.ADMIN:
             cmd += f" && (usermod -aG sudo {user_name} || usermod -aG wheel {user_name})"
         result = container.exec_run(["/bin/sh", "-c", cmd], user="root")
@@ -320,10 +329,15 @@ def remove_collaborator(container_name: str, user_name: str) -> bool:
             extensions.init_docker()
         container = extensions.docker_client.containers.get(container_name)
 
-        # 删除用户，并且一并删除home目录 (-r)
+        # 删除用户，数据改名存档到 .legacy_ 避免数据丢失
         _sanitizer.validate_username(container_name)
         _sanitizer.validate_username(user_name)
-        cmd = f"userdel -r {user_name} || deluser {user_name}"
+        cmd = (
+            f"ts=$(date +%Y%m%d%H%M%S); "
+            f"mv /root/.collaborators/{user_name} /root/.collaborators/.legacy_{user_name}_$ts 2>/dev/null || true; "
+            f"userdel {user_name} || deluser {user_name}; "
+            f"rm -f /home/{user_name}"
+        )
 
         result = container.exec_run(["/bin/sh", "-c", cmd], user="root")
         print(f"Executed command to remove collaborator: {cmd}\nExit code: {result.exit_code}\nOutput: {result.output.decode('utf-8', errors='ignore')}")
@@ -354,12 +368,14 @@ def update_role(container_name: str, user_name: str, updated_role: ROLE) -> bool
             # 直接让root的密码为user_name123
             _sanitizer.validate_username(container_name)
             _sanitizer.validate_username(user_name)
-            cmd = f"echo 'root:{user_name}123' | chpasswd"
-            # 不论是collaborator还是admin都要把原来的权限去掉，避免出现权限叠加的情况（虽然现在设计上collaborator和admin是互斥的，但以防万一）
-            #   先删sudo/wheel
-            cmd += f" && deluser {user_name} sudo || deluser {user_name} wheel"
-            #   再删掉用户（如果存在的话），避免出现同名用户导致的权限问题
-            cmd += f" && userdel -r {user_name} || deluser {user_name}"
+            cmd = (
+                f"echo 'root:{user_name}123' | chpasswd && "
+                f"(deluser {user_name} sudo || deluser {user_name} wheel) && "
+                f"ts=$(date +%Y%m%d%H%M%S); "
+                f"mv /root/.collaborators/{user_name} /root/.collaborators/.legacy_{user_name}_$ts 2>/dev/null || true; "
+                f"userdel {user_name} || deluser {user_name}; "
+                f"rm -f /home/{user_name}"
+            )
 
         else:
             raise ValueError(f"Unknown role: {updated_role}")
@@ -391,6 +407,11 @@ def start_container(container_name: str) -> bool:
             return True
         container.start()
         container.reload()
+        # 容器无 init，手动起 sshd
+        try:
+            container.exec_run(["/usr/sbin/sshd"], user="root")
+        except Exception:
+            pass
         print(f"Started container {container_name}, new status={getattr(container, 'status', None)}")
         return True
     except docker.errors.NotFound:
@@ -437,7 +458,7 @@ def restart_container(container_name: str, timeout: int = 10) -> bool:
         container = extensions.docker_client.containers.get(container_name)
         container.restart(timeout=timeout)
         container.reload()
-        container.exec_run("service ssh restart", user="root")
+        container.exec_run(["/usr/sbin/sshd"], user="root")
         print(f"Restarted container {container_name}, new status={getattr(container, 'status', None)}")
         return True
     except docker.errors.NotFound:
@@ -500,6 +521,115 @@ echo "$line"
     except Exception as e:
         print(f"Failed to get last ssh connect time for {container_name}: {e}")
         return None
+
+
+def get_disk_usage(container_name: str) -> dict:
+    """
+    获取单个容器的磁盘使用情况（只读，两路求和）。
+    - overlay2 可写层: Docker SDK container.attrs['SizeRw']
+    - bind mount 目录: du -sb <Source> (从 attrs['Mounts'] 取 /root 的 Source)
+    - 宿主机磁盘: shutil.disk_usage("/home")
+
+    两路互斥（bind mount 把 /root 从 overlay2 抽离），直接相加即总占用。
+    函数不抛异常，所有错误都 swallowing 到返回 dict 中。
+    """
+    result = {
+        "machine_disk": {"total_gb": 0.0, "used_gb": 0.0, "free_gb": 0.0, "percent": 0.0},
+        "container": {
+            "container_name": container_name,
+            "overlay_rw_bytes": None,
+            "bind_mount_bytes": None,
+            "bind_mount_path": None,
+            "total_bytes": 0,
+        },
+    }
+
+    # --- 宿主机磁盘 ---
+    try:
+        usage = shutil.disk_usage("/home")
+        total_gb = usage.total / (1024**3)
+        used_gb = usage.used / (1024**3)
+        free_gb = usage.free / (1024**3)
+        percent = (usage.used / usage.total * 100) if usage.total > 0 else 0.0
+        result["machine_disk"] = {
+            "total_gb": round(total_gb, 1),
+            "used_gb": round(used_gb, 1),
+            "free_gb": round(free_gb, 1),
+            "percent": round(percent, 1),
+        }
+    except Exception as e:
+        result["machine_disk"]["error"] = str(e)
+
+    # --- 容器 ---
+    try:
+        if extensions.docker_client is None:
+            extensions.init_docker()
+        container = extensions.docker_client.containers.get(container_name)
+    except docker.errors.NotFound:
+        result["container"]["error"] = "container_not_found"
+        return result
+    except Exception as e:
+        result["container"]["error"] = f"docker_access_failed: {e}"
+        return result
+
+    # 第一路: overlay2 可写层
+    try:
+        size_rw = (container.attrs.get('SizeRw') or 0)
+        if size_rw <= 0:
+            try:
+                df = extensions.docker_client.df()
+                for c_df in df.get('Containers', []) or []:
+                    names = c_df.get('Names', []) or []
+                    if f"/{container_name}" in names:
+                        size_rw = c_df.get('SizeRw', 0) or 0
+                        break
+            except Exception:
+                pass
+                size_rw = 0
+        result["container"]["overlay_rw_bytes"] = int(size_rw)
+    except Exception as e:
+        result["container"]["overlay_rw_bytes"] = None
+        result["container"]["overlay_rw_error"] = str(e)
+
+    # 第二路: bind mount 目录 (Destination == "/root")
+    try:
+        mounts = container.attrs.get('Mounts', []) or []
+        bind_root_source = None
+        for m in mounts:
+            if m.get('Destination') == '/root' and m.get('Type') == 'bind':
+                bind_root_source = m.get('Source')
+                break
+        if bind_root_source:
+            result["container"]["bind_mount_path"] = bind_root_source
+            try:
+                r = subprocess.run(["du", "-sb", bind_root_source], capture_output=True, text=True, timeout=10)
+                out = r.stdout.strip()
+                if out:
+                    try:
+                        result["container"]["bind_mount_bytes"] = int(out.split()[0])
+                    except Exception:
+                        pass
+            except subprocess.TimeoutExpired:
+                result["container"]["bind_mount_bytes"] = None
+                result["container"]["bind_mount_error"] = "du_timeout"
+            except Exception as e:
+                result["container"]["bind_mount_bytes"] = None
+                result["container"]["bind_mount_error"] = str(e)
+        else:
+            result["container"]["bind_mount_bytes"] = None
+            result["container"]["bind_mount_error"] = "no_bind_mount_for_root"
+    except Exception as e:
+        result["container"]["bind_mount_bytes"] = None
+        result["container"]["bind_mount_error"] = str(e)
+
+    # 总和
+    rw = result["container"]["overlay_rw_bytes"] or 0
+    bm = result["container"]["bind_mount_bytes"] or 0
+    result["container"]["total_bytes"] = rw + bm
+
+    def _h(b): return f"{b/1024/1024:.0f}M" if b >= 1024*1024 else f"{b/1024:.0f}K" if b >= 1024 else f"{b}B"
+    print(f"[disk-check] {container_name} overlay={_h(rw)} bind={_h(bm)} total={_h(rw + bm)}")
+    return result
 
 
 ####################################################
