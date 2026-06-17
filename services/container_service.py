@@ -493,9 +493,10 @@ def get_last_ssh_connect_time(container_name: str) -> str | None:
             return None
 
         # Prefer `last` for authoritative login sessions, then fallback to sshd logs.
+        # TZ=UTC 强制 last 输出 UTC 时间，Ctrl 侧全程 UTC 无需转换。
         cmd = r"""
 if command -v last >/dev/null 2>&1; then
-  v="$(last -w -i 2>/dev/null | awk '$1!="wtmp" && $1!="reboot" && $1!="btmp" && $1!="runlevel" {print; exit}')"
+  v="$(TZ=UTC last -w -i 2>/dev/null | awk '$1!="wtmp" && $1!="reboot" && $1!="btmp" && $1!="runlevel" {print; exit}')"
   if [ -n "$v" ]; then
     echo "$v"
     exit 0
