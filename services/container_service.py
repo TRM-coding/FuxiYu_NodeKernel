@@ -22,6 +22,9 @@ import os
 from typing import NamedTuple
 from ..utils import sanitizer as _sanitizer
 import subprocess
+import threading
+import time
+from datetime import datetime
 import shutil
 
 
@@ -523,6 +526,98 @@ echo "$line"
         return None
 
 
+# bind mount 磁盘用量缓存: {path: {"bytes": int, "updated_at": datetime, "running": bool}}
+_bind_disk_cache: dict[str, dict] = {}
+_bind_cache_lock = threading.Lock()
+_BIND_CACHE_TTL_SEC = 900  # 15 分钟
+
+
+def _du_background(bind_path: str) -> None:
+    """在后台线程中跑 du -sb，完成后写入缓存。"""
+    try:
+        r = subprocess.run(
+            ["du", "-sb", bind_path],
+            capture_output=True, text=True, timeout=300,  # 大目录最多等 5 分钟
+        )
+        out = r.stdout.strip()
+        if out:
+            size = int(out.split()[0])
+            with _bind_cache_lock:
+                _bind_disk_cache[bind_path] = {
+                    "bytes": size,
+                    "running": False,
+                    "updated_at": datetime.utcnow(),
+                }
+            return
+    except subprocess.TimeoutExpired:
+        pass
+    except Exception:
+        pass
+    # 失败: 标记 running=False，下次请求会重试
+    with _bind_cache_lock:
+        entry = _bind_disk_cache.get(bind_path)
+        if entry:
+            entry["running"] = False
+
+
+def _resolve_bind_disk(bind_path: str) -> dict:
+    """
+    解析 bind mount 磁盘用量（缓存 + 异步后台 du）。
+    返回: {"bind_mount_bytes": int|None, "bind_mount_source": str, "bind_mount_path": str}
+    """
+    with _bind_cache_lock:
+        entry = _bind_disk_cache.get(bind_path)
+
+    if entry and entry.get("bytes") is not None:
+        age = (datetime.utcnow() - entry["updated_at"]).total_seconds()
+        if age < _BIND_CACHE_TTL_SEC:
+            # 新鲜缓存，直接返回
+            return {
+                "bind_mount_bytes": entry["bytes"],
+                "bind_mount_source": "fresh" if not entry.get("running") else "cached",
+                "bind_mount_path": bind_path,
+            }
+        # 过期: 返回旧值，触发后台刷新
+        if not entry.get("running"):
+            with _bind_cache_lock:
+                entry["running"] = True
+            threading.Thread(target=_du_background, args=(bind_path,), daemon=True).start()
+        return {
+            "bind_mount_bytes": entry["bytes"],
+            "bind_mount_source": "stale",
+            "bind_mount_path": bind_path,
+        }
+
+    # 无缓存: 触发后台 du，先返回 None
+    if not entry:
+        with _bind_cache_lock:
+            _bind_disk_cache[bind_path] = {"bytes": None, "running": True, "updated_at": datetime.utcnow()}
+        threading.Thread(target=_du_background, args=(bind_path,), daemon=True).start()
+        return {
+            "bind_mount_bytes": None,
+            "bind_mount_source": "measuring",
+            "bind_mount_path": bind_path,
+        }
+
+    # 正在跑 du（entry 存在但 bytes=None 且 running=True）
+    if entry.get("running"):
+        return {
+            "bind_mount_bytes": None,
+            "bind_mount_source": "measuring",
+            "bind_mount_path": bind_path,
+        }
+
+    # 上一轮 du 失败（entry 存在，bytes=None，running=False），重试
+    with _bind_cache_lock:
+        entry["running"] = True
+    threading.Thread(target=_du_background, args=(bind_path,), daemon=True).start()
+    return {
+        "bind_mount_bytes": None,
+        "bind_mount_source": "measuring",
+        "bind_mount_path": bind_path,
+    }
+
+
 def get_disk_usage(container_name: str) -> dict:
     """
     获取单个容器的磁盘使用情况（只读，两路求和）。
@@ -540,6 +635,7 @@ def get_disk_usage(container_name: str) -> dict:
             "overlay_rw_bytes": None,
             "bind_mount_bytes": None,
             "bind_mount_path": None,
+            "bind_mount_source": "none",
             "total_bytes": 0,
         },
     }
@@ -591,7 +687,7 @@ def get_disk_usage(container_name: str) -> dict:
         result["container"]["overlay_rw_bytes"] = None
         result["container"]["overlay_rw_error"] = str(e)
 
-    # 第二路: bind mount 目录 (Destination == "/root")
+    # 第二路: bind mount 目录 (Destination == "/root")，使用缓存 + 异步后台 du
     try:
         mounts = container.attrs.get('Mounts', []) or []
         bind_root_source = None
@@ -600,21 +696,10 @@ def get_disk_usage(container_name: str) -> dict:
                 bind_root_source = m.get('Source')
                 break
         if bind_root_source:
-            result["container"]["bind_mount_path"] = bind_root_source
-            try:
-                r = subprocess.run(["du", "-sb", bind_root_source], capture_output=True, text=True, timeout=10)
-                out = r.stdout.strip()
-                if out:
-                    try:
-                        result["container"]["bind_mount_bytes"] = int(out.split()[0])
-                    except Exception:
-                        pass
-            except subprocess.TimeoutExpired:
-                result["container"]["bind_mount_bytes"] = None
-                result["container"]["bind_mount_error"] = "du_timeout"
-            except Exception as e:
-                result["container"]["bind_mount_bytes"] = None
-                result["container"]["bind_mount_error"] = str(e)
+            resolved = _resolve_bind_disk(bind_root_source)
+            result["container"]["bind_mount_path"] = resolved["bind_mount_path"]
+            result["container"]["bind_mount_bytes"] = resolved["bind_mount_bytes"]
+            result["container"]["bind_mount_source"] = resolved["bind_mount_source"]
         else:
             result["container"]["bind_mount_bytes"] = None
             result["container"]["bind_mount_error"] = "no_bind_mount_for_root"
@@ -628,7 +713,8 @@ def get_disk_usage(container_name: str) -> dict:
     result["container"]["total_bytes"] = rw + bm
 
     def _h(b): return f"{b/1024/1024:.0f}M" if b >= 1024*1024 else f"{b/1024:.0f}K" if b >= 1024 else f"{b}B"
-    print(f"[disk-check] {container_name} overlay={_h(rw)} bind={_h(bm)} total={_h(rw + bm)}")
+    src = result["container"].get("bind_mount_source", "none")
+    print(f"[disk-check] {container_name} overlay={_h(rw)} bind={_h(bm)} bind_src={src} total={_h(rw + bm)}")
     return result
 
 
