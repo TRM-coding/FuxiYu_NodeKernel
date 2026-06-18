@@ -881,5 +881,44 @@ def Pause_container():
 	return jsonify({"success": 1}), 200
 
 
+@api_bp.post("/clean_mount")
+def Clean_mount():
+	"""清理已删除容器的宿主机 mount 目录。
+
+	安全检查：路径必须以 /home/ 开头且包含 /containers/。
+	"""
+	recived_data = request.get_json(silent=True)
+	if not recived_data:
+		return jsonify({"success": 0, "error": "invalid json", "error_reason": "invalid_json"}), 400
+
+	verified_msg = get_verified_msg(recived_data)
+	if not verified_msg:
+		return jsonify({"success": 0, "error": "invalid_signature or decryption failed",
+						"error_reason": "invalid_signature"}), 401
+
+	config = verified_msg.get("config") or {}
+	mount_path = config.get("mount_path")
+	if not mount_path:
+		return jsonify({"success": 0, "error": "missing mount_path",
+						"error_reason": "missing_mount_path"}), 400
+
+	# 安全检查：路径必须在 /home/*/containers/ 下
+	if not str(mount_path).startswith("/home/") or "/containers/" not in str(mount_path):
+		return jsonify({"success": 0, "error": "invalid mount_path",
+						"error_reason": "invalid_path"}), 400
+
+	import subprocess
+	try:
+		subprocess.run(["rm", "-rf", str(mount_path)], timeout=30, check=False)
+		print(f"Mount cleaned: {mount_path}")
+		return jsonify({"success": 1}), 200
+	except subprocess.TimeoutExpired:
+		return jsonify({"success": 0, "error": "rm timeout",
+						"error_reason": "timeout"}), 500
+	except Exception as e:
+		return jsonify({"success": 0, "error": str(e),
+						"error_reason": "internal_error"}), 500
+
+
 def register_blueprints(app):
 	app.register_blueprint(api_bp)
