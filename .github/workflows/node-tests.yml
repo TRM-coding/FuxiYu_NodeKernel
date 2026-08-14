@@ -1,0 +1,53 @@
+name: Node Tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  safe-tests:
+    runs-on: ubuntu-latest
+    env:
+      PYTHONUNBUFFERED: "1"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+          python -m pip install pytest pytest-cov
+
+      - name: Prepare import path (repo root as FuxiYu_NodeKernel package)
+        run: |
+          mkdir -p /tmp/pkgroot
+          ln -s "$GITHUB_WORKSPACE" /tmp/pkgroot/FuxiYu_NodeKernel
+
+      - name: Run safe pytest suite (no docker daemon)
+        env:
+          PYTHONPATH: /tmp/pkgroot
+        run: |
+          mkdir -p reports
+          python -m pytest tests/ \
+            --cov --cov-report=term-missing --cov-report=xml --cov-report=html \
+            --junitxml=reports/pytest.xml
+
+      - name: Upload pytest report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: pytest-report
+          path: reports/pytest.xml
+
+      - name: Upload coverage html
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coverage-html
+          path: reports/htmlcov
