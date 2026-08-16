@@ -42,6 +42,18 @@ def test_error_path_collaborator_are_root(monkeypatch):
     assert remove_collaborator("c1", "root") is True
 
 
+def test_remove_archives_legacy_real_home(monkeypatch):
+    """兼容历史容器：/home/用户名 为真实目录（旧 update_role 的 useradd -m 产物）时，
+    移除命令应先归档到 .legacy_*.home 再删账号，而不是 rm 删不掉目录报错。"""
+    c = FakeContainer("c1", exec_exit_code=0)
+    monkeypatch.setattr(extensions, "docker_client", FakeDockerClient(FakeContainers([c])))
+    assert remove_collaborator("c1", "u1") is True
+    assert c.exec_calls, "预期执行过容器命令"
+    cmd = c.exec_calls[0][0][2]
+    assert "! -L /home/u1" in cmd
+    assert ".legacy_u1_$ts.home" in cmd
+
+
 @pytest.mark.docker
 def test_happy_path():
     """真实 docker：建容器 → 加用户再删除 → 验证用户不存在 → 清理。"""

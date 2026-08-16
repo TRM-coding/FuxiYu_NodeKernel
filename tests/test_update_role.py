@@ -51,6 +51,19 @@ def test_error_path_role_are_root(monkeypatch):
     assert update_role("c1", "u1", ROLE.ROOT) is True
 
 
+def test_admin_ensure_user_home_in_collaborators(monkeypatch):
+    """ADMIN 分支确保账号存在时，家目录必须建在 /root/.collaborators（持久化挂载），
+    而非 useradd -m 默认的 /home（overlay2 可写层）。回归测试。"""
+    c = FakeContainer("c1", exec_exit_code=0)
+    monkeypatch.setattr(extensions, "docker_client", FakeDockerClient(FakeContainers([c])))
+    assert update_role("c1", "u1", ROLE.ADMIN) is True
+    assert c.exec_calls, "预期执行过容器命令"
+    cmd = c.exec_calls[0][0][2]  # exec_run(["/bin/sh", "-c", cmd], user="root")
+    assert "useradd -M -d /root/.collaborators/u1" in cmd
+    assert "useradd -m" not in cmd
+    assert "ln -s /root/.collaborators/u1 /home/u1" in cmd
+
+
 @pytest.mark.docker
 def test_happy_path():
     """真实 docker：建容器 → 升 ADMIN（入 sudo 组）→ 降 COLLABORATOR（出 sudo 组）→ 清理。"""

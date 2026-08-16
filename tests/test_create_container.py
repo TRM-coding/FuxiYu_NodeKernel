@@ -86,7 +86,8 @@ def test_happy_path():
         real = client.containers.get(result.container_id)
         assert real.name == test_config.name
         assert real.attrs["HostConfig"]["Memory"] == test_config.memory * 1024 * 1024 * 1024
-        assert real.attrs["HostConfig"]["CpuQuota"] == test_config.cpu_number * 100000
+        # 生产代码按 cpuset 固定核（cpu_number=2 → "0,1"），不是 CpuQuota 配额
+        assert real.attrs["HostConfig"]["CpusetCpus"] == ",".join(str(i) for i in range(test_config.cpu_number))
         assert "22/tcp" in real.attrs["HostConfig"]["PortBindings"]
         assert real.attrs["HostConfig"]["PortBindings"]["22/tcp"][0]["HostPort"] == str(test_config.port)
     finally:

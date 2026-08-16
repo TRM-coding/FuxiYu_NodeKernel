@@ -88,8 +88,10 @@ def create_container(owner_name: str, config:Container.Config_info, public_key: 
 
     print(f"DEBUG: cpu_list={cpu_list}, gpu_list={gpu_list}, mem_limit={mem_limit}, shm_size_bytes={shm_size_bytes}, device_requests={device_requests}")
     name = f"{config.name}" # 名字自定义
-    # 将container的/root目录挂载到宿主机的/home/owner_name/containers/name目录，方便后续调试和数据持久化（虽然现在设计上容器是临时的，但以防万一）。这个路径也要确保合法和安全，避免注入攻击或路径遍历等问题。
-    host_root_mount = os.path.join("/home", owner_name, "containers", name)
+    # 将container的/root目录挂载到宿主机的{NODE_CONTAINERS_BASE}/owner_name/containers/name目录，方便后续调试和数据持久化（虽然现在设计上容器是临时的，但以防万一）。这个路径也要确保合法和安全，避免注入攻击或路径遍历等问题。
+    # 挂载根目录可配置：生产默认 /home（Node 以 root 运行）；开发环境指向可写路径，避免非 root 无权建 /home 下的目录。
+    containers_base = os.getenv("NODE_CONTAINERS_BASE", "/home")
+    host_root_mount = os.path.join(containers_base, owner_name, "containers", name)
         
     try:
         try: 
@@ -338,6 +340,12 @@ def remove_collaborator(container_name: str, user_name: str) -> bool:
         cmd = (
             f"ts=$(date +%Y%m%d%H%M%S); "
             f"mv /root/.collaborators/{user_name} /root/.collaborators/.legacy_{user_name}_$ts 2>/dev/null || true; "
+            # 兼容历史容器：/home/用户名 可能是真实目录（旧 update_role 的 useradd -m 产物），
+            # 同样归档进持久化挂载，避免 rm 删不掉真实目录导致操作报错、数据无法找回。
+            f"if [ -d /home/{user_name} ] && [ ! -L /home/{user_name} ]; then "
+            f"mkdir -p /root/.collaborators && "
+            f"mv /home/{user_name} /root/.collaborators/.legacy_{user_name}_$ts.home 2>/dev/null || true; "
+            f"fi; "
             f"userdel {user_name} || deluser {user_name}; "
             f"rm -f /home/{user_name}"
         )
@@ -361,7 +369,19 @@ def update_role(container_name: str, user_name: str, updated_role: ROLE) -> bool
             #先验证用户存在（如果不存在就创建），再添加到sudo组
             _sanitizer.validate_username(container_name)
             _sanitizer.validate_username(user_name)
-            cmd = f"id -u {user_name} || useradd -m -s /bin/bash {user_name} && echo '{user_name}:{user_name}123' | chpasswd"
+            # 新建账号必须与 add_collaborator 保持同一家目录模式：
+            # 家目录放 /root/.collaborators/用户名（宿主机持久化挂载内），/home 下只放软链。
+            # 若用 useradd -m，家目录会落在容器 overlay2 可写层，容器删除即丢数据，
+            # 且后续移除时 mv 归档找不到目录、rm 删不掉真实目录（操作报错且数据不归档）。
+            cmd = (
+                f"id -u {user_name} || ("
+                f"mkdir -p /root/.collaborators/{user_name} && "
+                f"useradd -M -d /root/.collaborators/{user_name} -s /bin/bash {user_name} && "
+                f"echo '{user_name}:{user_name}123' | chpasswd && "
+                f"ln -s /root/.collaborators/{user_name} /home/{user_name} && "
+                f"chown -R {user_name}:{user_name} /root/.collaborators/{user_name}"
+                f")"
+            )
             cmd += f" && (usermod -aG sudo {user_name} || usermod -aG wheel {user_name})"
         elif updated_role == ROLE.COLLABORATOR: # 直接从sudo组里删除用户（如果存在的话），但不删除用户账号
             _sanitizer.validate_username(container_name)
@@ -643,7 +663,7 @@ def get_disk_usage(container_name: str) -> dict:
 
     # --- 宿主机磁盘 ---
     try:
-        usage = shutil.disk_usage("/home")
+        usage = shutil.disk_usage(os.getenv("NODE_CONTAINERS_BASE", "/home"))
         total_gb = usage.total / (1024**3)
         used_gb = usage.used / (1024**3)
         free_gb = usage.free / (1024**3)
