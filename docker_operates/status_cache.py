@@ -1,0 +1,221 @@
+# docker_operates/status_cache.py（Node 侧）
+"""容器状态缓存：docker events 订阅（主）+ 定时对账（兜底）→ 内存缓存。
+
+与 disk_usage_cache/last_ssh_cache 同构的「采集 & 读缓存」模式：
+- 采集侧（update/_apply_event/_apply_container/_events_loop/_reconcile_loop）：
+  docker 状态 → 缓存回填。API 层不负责任何形式的内容采集。
+- 读取侧（get/get_state/snapshot）：只读缓存 + 状态语义，不做任何 IO。
+- 转换态（begin_action/finish_action/clear_pending/get_pending）：独立变量字段，
+  覆盖"动作已触发、返回值未到"的等待阶段。
+
+Ctrl 侧高频轮询/订阅的是本缓存，而不是直接打 docker——
+docker 状态映射到应用枚举语义与 blueprints/__init__.py 的 /container_status 对齐
+（running→online 等；sshd 就绪细节由动作追踪 creation/action status 覆盖，缓存不做 exec 检查）。
+"""
+import datetime
+import logging
+import threading
+import time
+
+import docker
+
+logger = logging.getLogger(__name__)
+
+# 缓存对账间隔（秒）：事件流漏报时的兜底全量刷新
+RECONCILE_INTERVAL = 15
+
+# 转换态超时兜底（秒）：后台任务异常退出时防止永久卡 ing。
+# 必须宽于正常流程耗时上限（创建含镜像 pull + sshd 安装，可达数十分钟），按操作分级：
+_ACTION_TTL = {
+    "create": 1800,   # 镜像 pull + apt 安装 sshd，最长达 30 分钟
+    "start": 300,
+    "stop": 300,
+    "restart": 300,
+}
+PENDING_TTL_SEC = 300  # 未知操作的兜底
+
+# docker 终态（containers.list 的 c.status）→ 应用状态字符串
+_DOCKER_STATUS_TO_APP = {
+    "running": "online",
+    "exited": "offline",
+    "dead": "offline",
+    "created": "starting",
+    "restarting": "starting",
+    "paused": "paused",
+    "removing": "offline",
+}
+
+# docker events 的 status 字段 → 应用状态字符串
+_EVENT_STATUS_MAP = {
+    "start": "online",
+    "unpause": "online",
+    "stop": "offline",
+    "die": "offline",
+    "kill": "offline",
+    "destroy": "offline",
+    "oom": "offline",
+    "pause": "paused",
+    "create": "starting",
+    "restart": "starting",
+}
+
+
+def _map_container_to_status(container) -> str:
+    """docker 容器对象（c.status）→ 应用状态字符串。"""
+    return _DOCKER_STATUS_TO_APP.get(getattr(container, 'status', '') or '', "unknown")
+
+
+def _map_event_to_status(event: dict) -> str:
+    """docker events 事件 → 应用状态字符串（事件是"发生了什么"，不是终态）。"""
+    return _EVENT_STATUS_MAP.get(str(event.get("status", "")), "unknown")
+
+
+class ContainerStatusCache:
+    def __init__(self):
+        self._cache = {}    # name -> {"status": str, "updated_at": str}
+        self._pending = {}  # name -> {"action", "status", "error_reason", "started_at"}
+        self._lock = threading.Lock()
+
+
+    ##################
+    # 转换态管理
+
+    def begin_action(self, name: str, action: str, ing_status: str) -> None:
+        """标记转换开始：等待返回值期间保持 ing 状态（creating/starting/stopping...）。
+
+        *ing_status* 为等待阶段对外暴露的状态（如 'starting'）。
+        """
+        with self._lock:
+            self._pending[name] = {
+                "action": action,
+                "status": ing_status,
+                "error_reason": None,
+                "started_at": datetime.datetime.utcnow(),
+                "ttl": _ACTION_TTL.get(action, PENDING_TTL_SEC),
+            }
+
+    def finish_action(self, name: str, status: str | None, error_reason: str | None = None) -> None:
+        """转换结束，按返回值更新状态。
+
+        - status=None：仅清 pending（创建完成场景：端点 miss 后走实时+sshd 检查回填）
+        - status='failed'：pending 保留为终态语义（Ctrl 读取失败原因），等下次 begin 覆盖
+        - 其他终态（online/offline...）：清 pending + 回填缓存（无缝衔接空闲态）
+        """
+        if status == "failed":
+            with self._lock:
+                entry = self._pending.get(name)
+                if entry is not None:
+                    entry["status"] = "failed"
+                    entry["error_reason"] = error_reason
+            return
+        with self._lock:
+            self._pending.pop(name, None)
+        if status is not None:
+            self.update(name, status)
+
+    def clear_pending(self, name: str) -> None:
+        """直接清除 pending（如删除容器后清理遗留的 failed 标记）。"""
+        with self._lock:
+            self._pending.pop(name, None)
+
+    def get_pending(self, name: str) -> dict | None:
+        """读转换态；等待中的 ing 态超时（PENDING_TTL_SEC）强制转 failed，防止永久卡 ing。"""
+        with self._lock:
+            entry = self._pending.get(name)
+            if entry is None:
+                return None
+            if entry["status"] != "failed":
+                age = (datetime.datetime.utcnow() - entry["started_at"]).total_seconds()
+                if age > entry.get("ttl", PENDING_TTL_SEC):
+                    self._pending.pop(name, None)
+                    return {"action": entry["action"], "status": "failed",
+                            "error_reason": "operation_timeout", "timed_out": True}
+            return dict(entry)
+
+    ##################
+    # 采集侧（docker 事件/对账 → 缓存回填；API 层不可调用）
+
+    def update(self, name: str, status: str) -> None:
+        """采集回填口（events/对账/转换态终态共用）：
+        存在则更新、不存在则创建（填充器语义：events/对账发现新容器也要能落缓存）。"""
+        with self._lock:
+            self._cache[name] = {
+                "status": status,
+                "updated_at": datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%S'),
+            }
+
+    def _apply_event(self, event: dict) -> None:
+        """采集侧：单条 docker event → 状态缓存 + 事件轨迹（event_log）。"""
+        actor = event.get("Actor") or {}
+        attrs = actor.get("Attributes") or {}
+        name = attrs.get("name")
+        if not name:
+            return
+        self.update(name, _map_event_to_status(event))
+        # 事件轨迹：同步记录到 event_log（时间轴/告警/推送素材）
+        from .. import extensions
+        extensions.event_log.record(
+            name,
+            event.get("status", ""),
+            exit_code=attrs.get("exitCode"),
+            reason="oom" if event.get("status") == "oom" else None,
+        )
+
+    def _apply_container(self, container) -> None:
+        """采集侧：单容器对账 → 状态缓存。"""
+        self.update(container.name, _map_container_to_status(container))
+
+    ##################
+    # 读缓存
+
+    def get(self, name: str) -> dict | None:
+        """读空闲态缓存（返回拷贝，防外部篡改）。"""
+        with self._lock:
+            entry = self._cache.get(name)
+        return dict(entry) if entry is not None else None
+
+    def get_state(self, name: str) -> dict:
+        """统一读状态：pending 优先（含超时兜底），缓存兜底。
+
+        返回: {"source": "pending"|"cache"|"miss", "status", ...}
+        """
+        pending = self.get_pending(name)
+        if pending is not None:
+            return {"source": "pending", "status": pending["status"],
+                    "error_reason": pending.get("error_reason")}
+        cached = self.get(name)
+        if cached is not None:
+            return {"source": "cache", "status": cached["status"],
+                    "cache_updated_at": cached["updated_at"]}
+        return {"source": "miss"}
+
+    def snapshot(self) -> dict:
+        with self._lock:
+            return dict(self._cache)
+
+    #################
+    # 循环维护
+
+    def start(self):
+        threading.Thread(target=self._events_loop, daemon=True, name="status-cache-events").start()
+        threading.Thread(target=self._reconcile_loop, daemon=True, name="status-cache-reconcile").start()
+
+    def _events_loop(self):  # 主通道：docker events 订阅（push）
+        while True:
+            try:
+                client = docker.from_env()
+                for event in client.events(decode=True, filters={"type": "container"}):
+                    self._apply_event(event)
+            except Exception as e:
+                logger.warning("status-cache events loop interrupted (will retry): %s", e)
+                time.sleep(2)  # docker daemon 断连重试
+
+    def _reconcile_loop(self):  # 兜底：定时全量对账（poll）
+        while True:
+            time.sleep(RECONCILE_INTERVAL)
+            try:
+                client = docker.from_env()
+                for c in client.containers.list(all=True):
+                    self._apply_container(c)
+            except Exception as e:
+                logger.warning("status-cache reconcile failed (will retry): %s", e)

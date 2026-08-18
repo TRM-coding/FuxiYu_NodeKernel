@@ -212,7 +212,8 @@ def test_start_container_success(client, monkeypatch):
     assert body["success"] == 1
     assert body["container_status"] == "starting"
     time.sleep(0.1)
-    assert blueprints._get_action_status("c1")["status"] == "online"
+    # 终态回填缓存（pending 清除后缓存无缝接管）
+    assert extensions.status_cache.get_state("c1")["status"] == "online"
 
 
 def test_stop_container_success(client, monkeypatch):
@@ -220,9 +221,9 @@ def test_stop_container_success(client, monkeypatch):
     payload = {"config": {"container_name": "c1"}}
     resp = client.post("/api/stop_container", json=encrypted_body(payload))
     assert resp.status_code == 200
-    assert resp.get_json()["container_status"] == "stoping"
+    assert resp.get_json()["container_status"] == "stopping"
     time.sleep(0.1)
-    assert blueprints._get_action_status("c1")["status"] == "offline"
+    assert extensions.status_cache.get_state("c1")["status"] == "offline"
 
 
 def test_restart_container_success(client, monkeypatch):
@@ -230,9 +231,9 @@ def test_restart_container_success(client, monkeypatch):
     payload = {"config": {"container_name": "c1"}}
     resp = client.post("/api/restart_container", json=encrypted_body(payload))
     assert resp.status_code == 200
-    assert resp.get_json()["container_status"] == "stoping"
+    assert resp.get_json()["container_status"] == "stopping"
     time.sleep(0.1)
-    assert blueprints._get_action_status("c1")["status"] == "online"
+    assert extensions.status_cache.get_state("c1")["status"] == "online"
 
 
 # ── container_last_ssh_time ──────────────────────────────────────────────

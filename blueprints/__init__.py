@@ -22,36 +22,8 @@ import docker
 
 api_bp = Blueprint("api", __name__, url_prefix="/api")
 
-# 为的是将contaienr_status检查的特殊情况局限在创作过程
-creation_status = {}
-# 通用的操作状态追踪（start/stop/restart）
-action_status = {}
-
-def _set_action_status(container_name: str, action: str, status: str, error_reason: str | None = None):
-	action_status[container_name] = {"action": action, "status": status, "error_reason": error_reason}
-
-def _get_action_status(container_name: str):
-	return action_status.get(container_name)
-
-def _clear_action_status(container_name: str):
-	action_status.pop(container_name, None)
-
-
-# Helper wrappers to mirror create behavior and keep special-case handling centralized
-def mark_creation_status(container_name: str, status: str, error_reason: str | None = None):
-	creation_status[container_name] = {"status": status, "error_reason": error_reason}
-
-def clear_creation_status(container_name: str):
-	creation_status.pop(container_name, None)
-
-def mark_start_status(container_name: str, status: str, error_reason: str | None = None):
-	_set_action_status(container_name, 'start', status, error_reason)
-
-def mark_stop_status(container_name: str, status: str, error_reason: str | None = None):
-	_set_action_status(container_name, 'stop', status, error_reason)
-
-def mark_restart_status(container_name: str, status: str, error_reason: str | None = None):
-	_set_action_status(container_name, 'restart', status, error_reason)
+# 状态机（转换态 pending + 空闲态缓存）由 docker_operates/status_cache.py 统一管理，
+# 端点只通过 extensions.status_cache 读写（begin_action/finish_action/get_state）。
 
 
 '''
@@ -127,14 +99,14 @@ def Create_container():
 	def _bg_create(o_name, cfg_obj):
 			try:
 				# mark as creating
-				creation_status[cfg_obj.name] = {"status": "creating"}
+				extensions.status_cache.begin_action(cfg_obj.name, 'create', 'creating')
 				create_container(o_name, cfg_obj, public_key=public_key)
-				# creation succeeded -> remove tracking entry
-				creation_status.pop(cfg_obj.name, None) # 使得创建后的容器状态查询可以直接从docker获取最新状态，而不是被卡在"creating"里
+				# creation succeeded -> 仅清 pending；端点 miss 后走实时+sshd 检查回填缓存
+				extensions.status_cache.finish_action(cfg_obj.name, None)
 			except Exception as e:
 				# record failure so /container_status can surface it to the controller
 				print("create_container error:", e)
-				creation_status[cfg_obj.name] = {"status": "failed", "error_reason": str(e)}
+				extensions.status_cache.finish_action(cfg_obj.name, 'failed', str(e))
 
 
 	try:
@@ -190,26 +162,17 @@ def Container_status():
 			return jsonify({"success": 0, "error": f"docker init failed: {e}"}), 500
 
 	try:
-		# docker SDK allows get by name
-		# if there is an async failure/ongoing action recorded for this container name, return that first
-		status_info = creation_status.get(container_name)
-		if status_info is not None:
-			if status_info.get("status") == "failed":
-				return jsonify({"success": 0, "container_status": "failed", "error": "creation failed", "error_reason": status_info.get("error_reason")}), 200
-			elif status_info.get("status") == "creating":
-				return jsonify({"success": 1, "container_status": "creating", "container_name": container_name}), 200
+		# 状态机统一入口：pending（转换态，返回值等待）优先 → 缓存（空闲态）兜底
+		state = extensions.status_cache.get_state(container_name)
+		if state["source"] == "pending":
+			if state["status"] == "failed":
+				return jsonify({"success": 0, "container_status": "failed", "error": "operation failed", "error_reason": state.get("error_reason")}), 200
+			return jsonify({"success": 1, "container_status": state["status"], "container_name": container_name}), 200
+		if state["source"] == "cache":
+			return jsonify({"success": 1, "container_status": state["status"], "container_name": container_name,
+							"cache_updated_at": state.get("cache_updated_at")}), 200
 
-		# check start/stop/restart async actions
-		ainfo = _get_action_status(container_name)
-		if ainfo is not None:
-			st = ainfo.get('status')
-			act = ainfo.get('action')
-			if st == 'failed':
-				return jsonify({"success": 0, "container_status": "failed", "error": f"{act} failed", "error_reason": ainfo.get('error_reason')}), 200
-			else:
-				# return the in-progress or terminal status reported by the action tracker
-				return jsonify({"success": 1, "container_status": st, "container_name": container_name}), 200
-
+		# 缓存 miss：实时查 docker（含 sshd 就绪检查），回填缓存
 		container = extensions.docker_client.containers.get(container_name)
 		state = None
 		try:
@@ -254,8 +217,61 @@ def Container_status():
 			status_out = str(state).lower()
 
 		print(f"Container '{container_name}' status: {status_out}")
+		# 实时查询结果回填缓存（后续查询直接吃缓存）
+		extensions.status_cache.update(container_name, status_out)
 
 		return jsonify({"success": 1, "container_status": status_out, "container_name": container_name}), 200
+	except docker.errors.NotFound:
+		return jsonify({"success": 0, "error": "container not found", "error_reason": "not_found", "container_name": container_name}), 404
+	except Exception as e:
+		return jsonify({"success": 0, "error": str(e), "error_reason": "internal_error"}), 500
+
+
+@api_bp.post("/container_status_cache")
+def Container_status_cache():
+	'''
+	读容器状态缓存（events 订阅 + 定时对账填充），缓存 miss 时实时查 docker 兜底并回填。
+	高频轮询打这个端点，而不是 /container_status（后者含动作追踪与 sshd 就绪检查，较重）。
+	'''
+	recived_data = request.get_json(silent=True)
+	if not recived_data:
+		return jsonify({"success": 0, "error": "invalid json"}), 400
+
+	verified_msg = get_verified_msg(recived_data)
+	if not verified_msg:
+		return jsonify({"success": 0, "error": "invalid_signature or decryption failed", "error_reason": "invalid_signature"}), 401
+	config = verified_msg.get("config") or {}
+	container_name = config.get("container_name") or config.get("name")
+	if not container_name:
+		return jsonify({"success": 0, "error": "missing container_name", "error_reason": "missing_container_name"}), 400
+
+	cached = extensions.status_cache.get(container_name)
+	if cached is not None:
+		return jsonify({
+			"success": 1,
+			"container_status": cached["status"],
+			"cache_updated_at": cached["updated_at"],
+			"container_name": container_name,
+		}), 200
+
+	# 缓存 miss：实时查 docker 状态（简化映射，不做 sshd 检查），回填缓存
+	if extensions.docker_client is None:
+		try:
+			extensions.init_docker()
+		except Exception as e:
+			return jsonify({"success": 0, "error": f"docker init failed: {e}"}), 500
+
+	try:
+		container = extensions.docker_client.containers.get(container_name)
+		from ..docker_operates.status_cache import _map_container_to_status
+		status_out = _map_container_to_status(container)
+		extensions.status_cache.update(container_name, status_out)
+		return jsonify({
+			"success": 1,
+			"container_status": status_out,
+			"cache_updated_at": extensions.status_cache.get(container_name)["updated_at"],
+			"container_name": container_name,
+		}), 200
 	except docker.errors.NotFound:
 		return jsonify({"success": 0, "error": "container not found", "error_reason": "not_found", "container_name": container_name}), 404
 	except Exception as e:
@@ -372,11 +388,11 @@ def Remove_container():
 		return jsonify({"error": "missing container_name", "error_reason": "missing_container_name"}), 400
 	
 	try:
-		# 防止失败后删不掉
-		status_info = creation_status.get(container_name)
+		# 防止失败后删不掉：删除成功后清理遗留的 failed 转换态标记
+		status_info = extensions.status_cache.get_pending(container_name)
 		success = remove_container(container_name)
 		if status_info is not None and status_info.get("status") == "failed" and success == 0:
-			creation_status.pop(container_name, None)
+			extensions.status_cache.clear_pending(container_name)
 	except Exception as e:
 		print(e)
 		return jsonify({"success": 0, "error": str(e)}), 500
@@ -480,8 +496,7 @@ def Add_collaborator():
 def Start_container_api():
 	recived_data = request.get_json(silent=True)
 	if not recived_data:
- 		return jsonify({"error":"invalid json", "error_reason": "invalid_json"}), 400
-	
+		return jsonify({"error":"invalid json", "error_reason": "invalid_json"}), 400
 	verified_msg = get_verified_msg(recived_data)
 	if not verified_msg:
 		return jsonify({"error": "invalid_signature or decryption failed", "error_reason": "invalid_signature"}), 401
@@ -495,20 +510,16 @@ def Start_container_api():
 	# 早返回 表征请求已接受，实际的启动操作在后台线程执行，避免阻塞API响应
 	def _bg_start(name: str):
 		try:
-			mark_start_status(name, 'starting')
+			extensions.status_cache.begin_action(name, 'start', 'starting')
 			ok = start_container(name)
 			if ok:
-				mark_start_status(name, 'online')
-				# clear tracking after short grace period so subsequent /container_status queries read from docker
-				try:
-					threading.Timer(5.0, lambda: _clear_action_status(name)).start()
-				except Exception:
-					pass
+				# 终态回填缓存（pending 清除后缓存无缝接管）
+				extensions.status_cache.finish_action(name, 'online')
 			else:
-				mark_start_status(name, 'failed', 'start_failed')
+				extensions.status_cache.finish_action(name, 'failed', 'start_failed')
 		except Exception as e:
 			print('bg start error:', e)
-			mark_start_status(name, 'failed', str(e))
+			extensions.status_cache.finish_action(name, 'failed', str(e))
 
 	try:
 		t = threading.Thread(target=_bg_start, args=(container_name,))
@@ -553,19 +564,16 @@ def Stop_container_api():
 	# spawn background worker to stop container and return early
 	def _bg_stop(name: str):
 		try:
-			mark_stop_status(name, 'stoping')
+			extensions.status_cache.begin_action(name, 'stop', 'stopping')
 			ok = stop_container(name)
 			if ok:
-				mark_stop_status(name, 'offline')
-				try:
-					threading.Timer(5.0, lambda: _clear_action_status(name)).start()
-				except Exception:
-					pass
+				# 终态回填缓存（pending 清除后缓存无缝接管）
+				extensions.status_cache.finish_action(name, 'offline')
 			else:
-				mark_stop_status(name, 'failed', 'stop_failed')
+				extensions.status_cache.finish_action(name, 'failed', 'stop_failed')
 		except Exception as e:
 			print('bg stop error:', e)
-			mark_stop_status(name, 'failed', str(e))
+			extensions.status_cache.finish_action(name, 'failed', str(e))
 
 	try:
 		t = threading.Thread(target=_bg_stop, args=(container_name,))
@@ -575,7 +583,7 @@ def Stop_container_api():
 		print(e)
 		return jsonify({"success": 0, "error": str(e), "error_reason": "background_thread_failed"}), 500
 
-	return jsonify({"success": 1, "container_status": "stoping", "container_name": container_name}), 200
+	return jsonify({"success": 1, "container_status": "stopping", "container_name": container_name}), 200
 
 '''
 通信数据格式：
@@ -616,19 +624,16 @@ def Restart_container_api():
 	def _bg_restart(name: str):
 		try:
 			# On restart we initially treat it as stopping
-			mark_restart_status(name, 'stoping')
+			extensions.status_cache.begin_action(name, 'restart', 'restarting')
 			ok = restart_container(name)
 			if ok:
-				mark_restart_status(name, 'online')
-				try:
-					threading.Timer(5.0, lambda: _clear_action_status(name)).start()
-				except Exception:
-					pass
+				# 终态回填缓存（pending 清除后缓存无缝接管）
+				extensions.status_cache.finish_action(name, 'online')
 			else:
-				mark_restart_status(name, 'failed', 'restart_failed')
+				extensions.status_cache.finish_action(name, 'failed', 'restart_failed')
 		except Exception as e:
 			print('bg restart error:', e)
-			mark_restart_status(name, 'failed', str(e))
+			extensions.status_cache.finish_action(name, 'failed', str(e))
 
 	try:
 		t = threading.Thread(target=_bg_restart, args=(container_name,))
@@ -638,7 +643,7 @@ def Restart_container_api():
 		print(e)
 		return jsonify({"success": 0, "error": str(e), "error_reason": "background_thread_failed"}), 500
 
-	return jsonify({"success": 1, "container_status": "stoping", "container_name": container_name}), 200
+	return jsonify({"success": 1, "container_status": "stopping", "container_name": container_name}), 200
 
 
 '''
