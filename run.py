@@ -1,5 +1,6 @@
 import sys
 import os
+import ssl
 from pathlib import Path
 
 import uvicorn
@@ -17,10 +18,20 @@ from FuxiYu_NodeKernel.network.wss import ensure_self_signed_certificate  # noqa
 
 if __name__ == '__main__':
     cert_files = ensure_self_signed_certificate()
+    ssl_kwargs = {
+        "ssl_certfile": str(cert_files.cert_file),
+        "ssl_keyfile": str(cert_files.key_file),
+    }
+    # mTLS：校验调用者（Ctrl）客户端证书 —— check_keys 双向验签语义的 TLS 落点。
+    # Ctrl 证书路径（部署时人工拷贝 Ctrl CA/证书到 Node），配置后开启 REQUIRED。
+    ctrl_ca = os.getenv("NODE_CTRL_CA_FILE")
+    if ctrl_ca and os.path.exists(ctrl_ca):
+        ssl_kwargs["ssl_ca_certs"] = ctrl_ca
+        ssl_kwargs["ssl_cert_reqs"] = ssl.CERT_REQUIRED
+        ssl_kwargs["ssl_verify_mode"] = ssl.VerifyMode.CERT_REQUIRED
     uvicorn.run(
         create_app('development'),
         host='0.0.0.0',
         port=NetConfig.NODE_PORT,
-        ssl_certfile=str(cert_files.cert_file),
-        ssl_keyfile=str(cert_files.key_file),
+        **ssl_kwargs,
     )

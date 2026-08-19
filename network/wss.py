@@ -352,13 +352,9 @@ def verify_ctrl_peer_certificate(websocket, expected_fingerprint: str | None = N
 async def push_snapshots_forever(stop_event: threading.Event, interval_seconds: float = 5.0) -> None:
     """持续向 Ctrl 推送状态快照。
 
-    没有身份牌或缺少 websockets 依赖时不报错退出，避免影响 HTTP 操作通道启动。
+    缺少 websockets 依赖时不报错退出，避免影响 HTTP 操作通道启动。
+    身份牌在循环内重读：Ctrl 运行中注册（issue_uid 写 identity 文件）后自动生效，无需重启。
     """
-
-    identity = load_node_identity()
-    if identity is None:
-        logger.info("node identity is not available; WSS pusher is idle")
-        return
 
     try:
         import websockets
@@ -366,15 +362,26 @@ async def push_snapshots_forever(stop_event: threading.Event, interval_seconds: 
         logger.warning("websockets package is not installed; WSS pusher is disabled")
         return
 
-    url = ctrl_wss_url(identity)
-    ssl_context = build_wss_ssl_context() if url.startswith("wss://") else None
-    expected_fingerprint = expected_ctrl_certificate_fingerprint()
     while not stop_event.is_set():
+        identity = load_node_identity()
+        if identity is None:
+            logger.info("node identity is not available yet; retrying")
+            await asyncio.sleep(min(interval_seconds, 5.0))
+            continue
+
+        url = ctrl_wss_url(identity)
+        ssl_context = build_wss_ssl_context() if url.startswith("wss://") else None
+        expected_fingerprint = expected_ctrl_certificate_fingerprint()
         try:
             async with websockets.connect(url, ssl=ssl_context) as websocket:
                 verify_ctrl_peer_certificate(websocket, expected_fingerprint)
                 logger.info("connected to Ctrl WSS: %s", url)
                 while not stop_event.is_set():
+                    # 幽灵容器感知：先发消失 delete 帧，再发快照
+                    from .. import extensions
+                    for name in extensions.status_cache.take_deleted():
+                        await websocket.send(
+                            json.dumps({"type": "delete", "container_name": name}, ensure_ascii=True))
                     await websocket.send(json.dumps(build_snapshot_batch(identity), ensure_ascii=True))
                     await asyncio.sleep(interval_seconds)
         except Exception as e:

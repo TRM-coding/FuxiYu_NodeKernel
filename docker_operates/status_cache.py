@@ -88,7 +88,14 @@ class ContainerStatusCache:
     def __init__(self):
         self._cache = {}    # name -> {"status": str, "updated_at": str, "ready_check"?}
         self._pending = {}  # name -> {"action", "status", "error_reason", "started_at"}
+        self._deleted = []  # 对账发现的消失容器名（待 WSS pusher 取走推 delete 帧）
         self._lock = threading.Lock()
+
+    def take_deleted(self) -> list[str]:
+        """取走待推送的消失容器名（取后清空）。"""
+        with self._lock:
+            deleted, self._deleted = self._deleted, []
+        return deleted
 
 
     ##################
@@ -292,7 +299,19 @@ class ContainerStatusCache:
             time.sleep(RECONCILE_INTERVAL)
             try:
                 client = docker.from_env()
+                live = set()
                 for c in client.containers.list(all=True):
+                    live.add(c.name)
                     self._apply_container(c)
+                # 消失检测（幽灵容器感知）：缓存/pending 有、docker 无 → 清缓存 + 入队 delete
+                with self._lock:
+                    known = set(self._cache) | set(self._pending)
+                vanished = known - live
+                for name in sorted(vanished):
+                    with self._lock:
+                        self._cache.pop(name, None)
+                        self._pending.pop(name, None)
+                        self._deleted.append(name)
+                    logger.warning("status-cache reconcile: container %r vanished (delete queued)", name)
             except Exception as e:
                 logger.warning("status-cache reconcile failed (will retry): %s", e)
