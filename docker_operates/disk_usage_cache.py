@@ -14,6 +14,7 @@ import os
 import shutil
 import subprocess
 import threading
+import time
 
 import docker
 
@@ -21,11 +22,16 @@ logger = logging.getLogger(__name__)
 
 # bind mount 缓存 TTL（秒）：15 分钟
 BIND_CACHE_TTL_SEC = 900
+# 容器级用量滚动采集 TTL（秒）与流水线步进：与 last_ssh_cache 同构的滚动自驱
+DISK_SWEEP_TTL_SEC = 900
+DISK_SWEEP_STEP_SLEEP = 2
 
 
 class DiskUsageCache:
     def __init__(self):
         self._bind_cache = {}  # bind_path -> {"bytes": int|None, "running": bool, "updated_at": datetime}
+        # name -> {"usage": {...}, "updated_at": datetime}（滚动采集回填的容器用量快照）
+        self._container_cache = {}
         self._lock = threading.Lock()
 
     ##################
@@ -100,8 +106,106 @@ class DiskUsageCache:
         except Exception as e:
             return {"error": str(e)}
 
+    def collect_container(self, container_name: str) -> None:
+        """滚动采集线程体：单容器 overlay + bind 用量 → 回填 _container_cache。
+
+        bind 目录 du -sb 较重（大目录分钟级），由 get_bind 异步后台执行；
+        du 完成后最迟下轮 sweep 组装进快照。滚动自驱 + TTL 节流，读侧不触发采集。
+        """
+        import docker as _docker
+        try:
+            from .. import extensions
+            if extensions.docker_client is None:
+                extensions.init_docker()
+            container = extensions.docker_client.containers.get(container_name)
+
+            usage = {
+                "container_name": container_name,
+                "overlay_rw_bytes": None,
+                "bind_mount_bytes": None,
+                "bind_mount_path": None,
+                "bind_mount_source": "none",
+                "total_bytes": 0,
+            }
+
+            # 第一路: overlay2 可写层（实时 attrs，轻量）
+            try:
+                size_rw = self.collect_overlay_rw(container_name)
+                if size_rw is not None:
+                    usage["overlay_rw_bytes"] = size_rw
+            except Exception:
+                pass
+
+            # 第二路: bind mount 目录 (Destination == "/root")，缓存 + 异步后台 du
+            try:
+                mounts = container.attrs.get('Mounts', []) or []
+                bind_root_source = None
+                for m in mounts:
+                    if m.get('Destination') == '/root' and m.get('Type') == 'bind':
+                        bind_root_source = m.get('Source')
+                        break
+                if bind_root_source:
+                    resolved = self.get_bind(bind_root_source)
+                    usage["bind_mount_path"] = resolved["bind_mount_path"]
+                    usage["bind_mount_bytes"] = resolved["bind_mount_bytes"]
+                    usage["bind_mount_source"] = resolved["bind_mount_source"]
+            except Exception:
+                pass
+
+            rw = usage["overlay_rw_bytes"] or 0
+            bm = usage["bind_mount_bytes"] or 0
+            usage["total_bytes"] = rw + bm
+
+            with self._lock:
+                self._container_cache[container_name] = {
+                    "usage": usage,
+                    "updated_at": datetime.datetime.utcnow(),
+                }
+        except _docker.errors.NotFound:
+            # 容器已消失：不写（对账侧自行清理残留条目）
+            return
+        except Exception as e:
+            logger.warning("disk collect error for %s (will retry): %s", container_name, e)
+
+    def _needs_collect(self, name: str) -> bool:
+        with self._lock:
+            entry = self._container_cache.get(name)
+        if entry is None:
+            return True
+        age = (datetime.datetime.utcnow() - entry["updated_at"]).total_seconds()
+        return age > DISK_SWEEP_TTL_SEC
+
+    def _sweep_loop(self):  # 滚动采集流水线：持续取 TTL 到期的容器，负载恒定
+        while True:
+            try:
+                client = docker.from_env()
+                for c in client.containers.list(all=True):
+                    if not self._needs_collect(c.name):
+                        continue
+                    self.collect_container(c.name)
+                    time.sleep(DISK_SWEEP_STEP_SLEEP)
+            except Exception as e:
+                logger.warning("disk sweep failed (will retry): %s", e)
+                time.sleep(DISK_SWEEP_STEP_SLEEP * 5)
+            time.sleep(DISK_SWEEP_STEP_SLEEP)
+
+    def start(self):
+        threading.Thread(target=self._sweep_loop, daemon=True, name="disk-usage-sweep").start()
+
     ##################
     # 读缓存
+
+    def snapshot(self) -> dict:
+        """读缓存全量快照：{"machine_disk": {...}, "containers": {name: usage}}。
+
+        machine_disk 为宿主机共享段（shutil 轻量实时）；containers 为滚动采集回填值，
+        可能略旧（TTL 900s 内），读侧不做任何采集。
+        """
+        machine = self.collect_machine_disk()
+        with self._lock:
+            containers = {name: dict(e["usage"]) for name, e in self._container_cache.items()}
+        return {"machine_disk": machine, "containers": containers}
+
     def get_bind(self, bind_path: str) -> dict:
         """读 bind mount 缓存（原 _resolve_bind_disk 语义）。
 
@@ -159,76 +263,3 @@ class DiskUsageCache:
             "bind_mount_source": "measuring",
             "bind_mount_path": bind_path,
         }
-
-    def get_container_usage(self, container_name: str) -> dict:
-        """组装单容器磁盘用量（machine_disk + overlay + bind），不抛异常。"""
-        result = {
-            "machine_disk": {"total_gb": 0.0, "used_gb": 0.0, "free_gb": 0.0, "percent": 0.0},
-            "container": {
-                "container_name": container_name,
-                "overlay_rw_bytes": None,
-                "bind_mount_bytes": None,
-                "bind_mount_path": None,
-                "bind_mount_source": "none",
-                "total_bytes": 0,
-            },
-        }
-
-        # --- 宿主机磁盘（实时，轻量）---
-        result["machine_disk"] = self.collect_machine_disk()
-
-        # --- 容器 ---
-        import docker as _docker
-        from .. import extensions
-        try:
-            if extensions.docker_client is None:
-                extensions.init_docker()
-            container = extensions.docker_client.containers.get(container_name)
-        except _docker.errors.NotFound:
-            result["container"]["error"] = "container_not_found"
-            return result
-        except Exception as e:
-            result["container"]["error"] = f"docker_access_failed: {e}"
-            return result
-
-        # 第一路: overlay2 可写层（实时 attrs）
-        try:
-            size_rw = self.collect_overlay_rw(container_name)
-            if size_rw is None:
-                raise ValueError("overlay collect failed")
-            result["container"]["overlay_rw_bytes"] = size_rw
-        except Exception as e:
-            result["container"]["overlay_rw_bytes"] = None
-            result["container"]["overlay_rw_error"] = str(e)
-
-        # 第二路: bind mount 目录 (Destination == "/root")，缓存 + 异步后台 du
-        try:
-            mounts = container.attrs.get('Mounts', []) or []
-            bind_root_source = None
-            for m in mounts:
-                if m.get('Destination') == '/root' and m.get('Type') == 'bind':
-                    bind_root_source = m.get('Source')
-                    break
-            if bind_root_source:
-                resolved = self.get_bind(bind_root_source)
-                result["container"]["bind_mount_path"] = resolved["bind_mount_path"]
-                result["container"]["bind_mount_bytes"] = resolved["bind_mount_bytes"]
-                result["container"]["bind_mount_source"] = resolved["bind_mount_source"]
-            else:
-                result["container"]["bind_mount_bytes"] = None
-                result["container"]["bind_mount_error"] = "no_bind_mount_for_root"
-        except Exception as e:
-            result["container"]["bind_mount_bytes"] = None
-            result["container"]["bind_mount_error"] = str(e)
-
-        # 总和
-        rw = result["container"]["overlay_rw_bytes"] or 0
-        bm = result["container"]["bind_mount_bytes"] or 0
-        result["container"]["total_bytes"] = rw + bm
-
-        def _h(b):
-            return f"{b/1024/1024:.0f}M" if b >= 1024*1024 else f"{b/1024:.0f}K" if b >= 1024 else f"{b}B"
-        src = result["container"].get("bind_mount_source", "none")
-        logger.info("[disk-check] %s overlay=%s bind=%s bind_src=%s total=%s",
-                    container_name, _h(rw), _h(bm), src, _h(rw + bm))
-        return result

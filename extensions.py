@@ -2,6 +2,7 @@ import docker
 from .docker_operates.status_cache import ContainerStatusCache
 from .docker_operates.event_log import ContainerEventLog
 from .docker_operates.last_ssh_cache import LastSshCache
+from .docker_operates.disk_usage_cache import DiskUsageCache
 
 docker_client=None
 # 容器状态缓存（docker events 订阅 + 定时对账 → 内存缓存），Ctrl 高频读取目标
@@ -10,6 +11,8 @@ status_cache = ContainerStatusCache()
 event_log = ContainerEventLog()
 # SSH 登录时间缓存（滚动采集流水线 → 内存缓存），/container_last_ssh_time 读取目标
 last_ssh_cache = LastSshCache()
+# 磁盘用量缓存（滚动采集流水线 → 内存缓存），/check_disk_usage 读取目标
+disk_usage_cache = DiskUsageCache()
 
 
 def init_docker():

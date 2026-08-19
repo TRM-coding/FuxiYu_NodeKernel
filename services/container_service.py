@@ -4,16 +4,9 @@ from ..constant import *
 from ..config import KeyConfig, NodeProxyConfig
 from ..utils.Container import Container
 from .. import extensions
-from ..utils.CheckKeys import load_keys
 # from ..constant import *
 from typing import TypedDict
-# from ..config import KeyConfig
-# from ..utils.CheckKeys import load_keys
 # from ..utils.Container import Container
-import requests
-from cryptography.hazmat.primitives.asymmetric import padding
-from cryptography.hazmat.primitives import hashes
-from cryptography.hazmat.primitives.asymmetric.rsa import RSAPrivateKey, RSAPublicKey
 import base64
 # from ..extensions import docker_client
 import docker
@@ -24,8 +17,11 @@ from ..utils import sanitizer as _sanitizer
 import subprocess
 import threading
 import time
+import logging
 from datetime import datetime
 import shutil
+
+logger = logging.getLogger(__name__)
 
 
 
@@ -492,35 +488,90 @@ def restart_container(container_name: str, timeout: int = 10) -> bool:
         return False
 
 
-def get_last_ssh_connect_time(container_name: str) -> str | None:
-    """读取 Node 侧 SSH 登录时间缓存（只读，不做任何 IO）。
+def clean_mount(mount_path: str) -> bool:
+    """清理已删除容器的宿主机 mount 目录（校验 + 执行都在 service 层）。
+
+    安全检查：路径必须位于 NODE_CONTAINERS_BASE 下且包含 /containers/，
+    realpath 规范化防止 ../ 路径穿越绕过检查。超时抛 subprocess.TimeoutExpired。
+    """
+    base = os.path.realpath(os.getenv("NODE_CONTAINERS_BASE", "/home"))
+    real = os.path.realpath(str(mount_path))
+    if not real.startswith(base + os.sep) or "/containers/" not in real:
+        raise ValueError("invalid mount_path")
+    subprocess.run(["rm", "-rf", real], timeout=30, check=False)
+    return True
+
+
+def container_exists(container_name: str) -> bool:
+    """同名预检：容器是否已存在（创建前冲突检查）。
+
+    docker 不可达时抛异常（由端点转为 docker_check_failed），NotFound 视为不存在。
+    """
+    if extensions.docker_client is None:
+        extensions.init_docker()
+    _sanitizer.validate_username(container_name)
+    try:
+        extensions.docker_client.containers.get(container_name)
+        return True
+    except docker.errors.NotFound:
+        return False
+
+
+def pause_container(container_name: str, action: str = "pause") -> bool:
+    """暂停/恢复容器。action: 'pause'|'unpause'。返回 True on success。"""
+    try:
+        if extensions.docker_client is None:
+            extensions.init_docker()
+        _sanitizer.validate_username(container_name)
+        container = extensions.docker_client.containers.get(container_name)
+        if action == "pause":
+            container.pause()
+        else:
+            container.unpause()
+        return True
+    except docker.errors.NotFound:
+        logger.warning("Container %s not found when trying to %s.", container_name, action)
+        return False
+    except Exception as e:
+        logger.warning("Failed to %s container %s: %s", action, container_name, e)
+        return False
+
+
+def list_container_status() -> dict:
+    """全量容器状态快照（读侧 list）：{name: {"source", "status", ...}}。
+
+    桥接：读取逻辑在 docker_operates.status_cache.ContainerStatusCache.list_states
+    （pending 优先 + cache 兜底合并）。单容器过滤由此承担。
+    """
+    return extensions.status_cache.list_states()
+
+
+def list_last_ssh() -> dict:
+    """全量 SSH 登录时间快照（读侧 list）：{name: {"last_ssh_connect_time", "updated_at"}}。
 
     桥接：采集在 docker_operates.last_ssh_cache.LastSshCache（滚动流水线 + TTL 节流），
-    函数只读缓存。miss（含非运行态跳过、从未采集）返回 None → Ctrl 侧 404 保持 DB 旧值，
-    与迁移前语义一致。
+    本函数只读缓存。单容器过滤由此承担：未采到/非运行态 → last_ssh_connect_time=None
+    （Ctrl 侧保持 DB 旧值，与迁移前语义一致）。
     """
-    _sanitizer.validate_username(container_name)
-    return extensions.last_ssh_cache.get(container_name)["last_ssh_connect_time"]
+    snap = extensions.last_ssh_cache.snapshot()
+    result = {}
+    for name, entry in snap.items():
+        updated = entry.get("updated_at")
+        result[name] = {
+            "last_ssh_connect_time": entry.get("value"),
+            "updated_at": updated.strftime('%Y-%m-%dT%H:%M:%S') if updated else None,
+        }
+    return result
 
 
-# bind mount 磁盘用量缓存已迁移至 docker_operates/disk_usage_cache.py（采集/读取分离）
-_disk_usage_cache = None
+def list_disk_usage() -> dict:
+    """全量磁盘用量快照（读侧 list）：{"machine_disk": {...}, "containers": {name: usage}}。
 
-
-def get_disk_usage(container_name: str) -> dict:
-    """获取单个容器的磁盘使用情况（只读，两路求和）。
-
-    桥接：读取逻辑在 docker_operates.disk_usage_cache.DiskUsageCache。
-    - overlay2 可写层: Docker SDK container.attrs['SizeRw']
-    - bind mount 目录: du -sb <Source>（缓存 + 后台刷新）
-    - 宿主机磁盘: shutil.disk_usage("/home")
-    函数不抛异常，所有错误都 swallowing 到返回 dict 中。
+    桥接：采集在 docker_operates.disk_usage_cache.DiskUsageCache（滚动流水线 + TTL 节流），
+    本函数只读缓存（可能略旧，TTL 900s 内）。单容器过滤由此承担：快照未含 → 该容器
+    暂无用量数据。
     """
-    global _disk_usage_cache
-    if _disk_usage_cache is None:
-        from ..docker_operates.disk_usage_cache import DiskUsageCache
-        _disk_usage_cache = DiskUsageCache()
-    return _disk_usage_cache.get_container_usage(container_name)
+    return extensions.disk_usage_cache.snapshot()
 
 
 ####################################################

@@ -24,6 +24,18 @@ logger = logging.getLogger(__name__)
 # 缓存对账间隔（秒）：事件流漏报时的兜底全量刷新
 RECONCILE_INTERVAL = 15
 
+# sshd 就绪探测间隔（秒）：对「创建完成、等待就绪确认」的容器做 exec probe。
+# 就绪确认中的容器数量极少（创建中的那几台），10s 节流成本可控。
+PROBE_INTERVAL = 10
+
+# sshd 就绪判定：容器内 :22 监听检查（四路合并，一次 exec）
+_SSHD_READY_CMD = (
+    "ss -ltn 2>/dev/null | grep -q :22 || "
+    "netstat -ltn 2>/dev/null | grep -q :22 || "
+    "pgrep -f sshd >/dev/null 2>&1 || "
+    "ps aux 2>/dev/null | grep -q [s]shd"
+)
+
 # 转换态超时兜底（秒）：后台任务异常退出时防止永久卡 ing。
 # 必须宽于正常流程耗时上限（创建含镜像 pull + sshd 安装，可达数十分钟），按操作分级：
 _ACTION_TTL = {
@@ -31,6 +43,8 @@ _ACTION_TTL = {
     "start": 300,
     "stop": 300,
     "restart": 300,
+    "pause": 300,
+    "unpause": 300,
 }
 PENDING_TTL_SEC = 300  # 未知操作的兜底
 
@@ -72,7 +86,7 @@ def _map_event_to_status(event: dict) -> str:
 
 class ContainerStatusCache:
     def __init__(self):
-        self._cache = {}    # name -> {"status": str, "updated_at": str}
+        self._cache = {}    # name -> {"status": str, "updated_at": str, "ready_check"?}
         self._pending = {}  # name -> {"action", "status", "error_reason", "started_at"}
         self._lock = threading.Lock()
 
@@ -118,6 +132,20 @@ class ContainerStatusCache:
         with self._lock:
             self._pending.pop(name, None)
 
+    def mark_ready_check(self, name: str) -> None:
+        """创建完成入口：清 pending + 落 starting + 标记 sshd 就绪确认中。
+
+        docker 层看到 running 早于 sshd 就绪，就绪确认由采集侧 probe 循环负责
+        （exec 检查 :22 监听，就绪后升 online 并清标记）。
+        """
+        with self._lock:
+            self._pending.pop(name, None)
+            self._cache[name] = {
+                "status": "starting",
+                "ready_check": True,
+                "updated_at": datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%S'),
+            }
+
     def get_pending(self, name: str) -> dict | None:
         """读转换态；等待中的 ing 态超时（PENDING_TTL_SEC）强制转 failed，防止永久卡 ing。"""
         with self._lock:
@@ -162,7 +190,16 @@ class ContainerStatusCache:
         )
 
     def _apply_container(self, container) -> None:
-        """采集侧：单容器对账 → 状态缓存。"""
+        """采集侧：单容器对账 → 状态缓存。
+
+        就绪确认中的容器（ready_check）：docker running 时保持 starting（等 probe 确认 sshd），
+        非 running 按终态覆盖（update 整条目覆盖，自动清标记）。
+        """
+        with self._lock:
+            entry = self._cache.get(container.name)
+            if entry is not None and entry.get("ready_check") \
+                    and str(getattr(container, 'status', '') or '') == 'running':
+                return  # 保持 starting + ready_check，等 probe 升 online
         self.update(container.name, _map_container_to_status(container))
 
     ##################
@@ -193,12 +230,52 @@ class ContainerStatusCache:
         with self._lock:
             return dict(self._cache)
 
+    def list_states(self) -> dict:
+        """全量状态快照（读侧 list 用）：pending 优先 + cache 兜底合并。
+
+        返回: {name: {"source": "pending"|"cache", "status", "error_reason"?, "cache_updated_at"?}}
+        复用 get_state 语义（含 pending 超时兜底），缓存无条目的容器不进列表。
+        """
+        with self._lock:
+            names = set(self._cache) | set(self._pending)
+        result = {}
+        for name in names:
+            st = self.get_state(name)
+            if st["source"] != "miss":
+                result[name] = st
+        return result
+
     #################
     # 循环维护
 
     def start(self):
         threading.Thread(target=self._events_loop, daemon=True, name="status-cache-events").start()
         threading.Thread(target=self._reconcile_loop, daemon=True, name="status-cache-reconcile").start()
+        threading.Thread(target=self._probe_loop, daemon=True, name="status-cache-probe").start()
+
+    def _probe_sshd(self, name: str) -> bool:
+        """exec 检查容器内 sshd 是否就绪（:22 监听）。任何异常视为未就绪。"""
+        try:
+            from .. import extensions
+            if extensions.docker_client is None:
+                extensions.init_docker()
+            container = extensions.docker_client.containers.get(name)
+            r = container.exec_run(["/bin/sh", "-c", _SSHD_READY_CMD], user="root")
+            return getattr(r, 'exit_code', r[0]) == 0
+        except Exception:
+            return False
+
+    def _probe_loop(self):  # sshd 就绪确认：对 ready_check 容器节流探测，就绪升 online
+        while True:
+            time.sleep(PROBE_INTERVAL)
+            try:
+                with self._lock:
+                    targets = [name for name, e in self._cache.items() if e.get("ready_check")]
+                for name in targets:
+                    if self._probe_sshd(name):
+                        self.update(name, "online")  # update 整条目覆盖，自动清 ready_check
+            except Exception as e:
+                logger.warning("status-cache probe loop interrupted (will retry): %s", e)
 
     def _events_loop(self):  # 主通道：docker events 订阅（push）
         while True:
