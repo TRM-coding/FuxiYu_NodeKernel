@@ -36,10 +36,13 @@ def _patch_fs(monkeypatch):
     """把 create_container 的宿主挂载目录准备逻辑全部打掉，避免真实文件系统副作用。"""
     monkeypatch.setattr(os, "makedirs", lambda *a, **k: None)
     monkeypatch.setattr(os, "stat", lambda *a, **k: _stat_stub())
-    monkeypatch.setattr(os, "chown", lambda *a, **k: None)
+    if hasattr(os, "chown"):  # POSIX-only；Windows 无此属性
+        monkeypatch.setattr(os, "chown", lambda *a, **k: None)
     monkeypatch.setattr(os, "chmod", lambda *a, **k: None)
-    monkeypatch.setattr(os, "getuid", lambda: 0)
-    monkeypatch.setattr(os, "getgid", lambda: 0)
+    if hasattr(os, "getuid"):  # POSIX-only
+        monkeypatch.setattr(os, "getuid", lambda: 0)
+    if hasattr(os, "getgid"):  # POSIX-only
+        monkeypatch.setattr(os, "getgid", lambda: 0)
 
 
 def test_error_path_invalid_config(monkeypatch):

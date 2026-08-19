@@ -574,4 +574,21 @@ def list_disk_usage() -> dict:
     return extensions.disk_usage_cache.snapshot()
 
 
+def list_sys_snapshot() -> dict | None:
+    """全量系统快照（读侧 list）：静态硬件 + 动态指标。
+
+    桥接：采集在 docker_operates.sys_cache.SysSnapshotCache（后台循环 + TTL），
+    本函数只读缓存。静态字段供首连 enrollment_profile / 建档使用。
+    """
+    return extensions.sys_cache.snapshot()
+
+
+def static_sys_snapshot() -> dict | None:
+    """静态硬件快照：首连 enrollment_profile 与建档用。
+
+    首连可能早于后台线程第一次采集，因此这里允许触发一次低频静态采集。
+    """
+    return extensions.sys_cache.collect_static()
+
+
 ####################################################

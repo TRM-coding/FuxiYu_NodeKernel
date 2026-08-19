@@ -6,3 +6,4 @@ docker
 cryptography
 pydantic
 python-dotenv
+psutil

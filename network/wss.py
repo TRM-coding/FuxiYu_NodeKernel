@@ -18,7 +18,13 @@ from cryptography.x509.oid import NameOID
 from pydantic import BaseModel
 
 from ..config import NetConfig
-from ..services.container_service import list_container_status, list_disk_usage, list_last_ssh
+from ..services.container_service import (
+    list_container_status,
+    list_disk_usage,
+    list_last_ssh,
+    list_sys_snapshot,
+    static_sys_snapshot,
+)
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/node_identity", tags=["node_identity"])
@@ -191,6 +197,7 @@ def build_enrollment_profile() -> dict[str, Any]:
     """返回 Ctrl 首连登记 Node 时需要读取的接入资料。
 
     这个函数不返回证书指纹。Ctrl 必须从 TLS 层直接计算 Node 证书 SHA-256 指纹。
+    hardware 为静态硬件快照（sys_snapshot 协议），供 Ctrl 注册建档与漂移检测。
     """
 
     ensure_self_signed_certificate()
@@ -199,6 +206,7 @@ def build_enrollment_profile() -> dict[str, Any]:
         "uid": identity.uid if identity else None,
         "identity_initialized": identity is not None,
         "wss_enabled": os.getenv("NODE_WSS_ENABLED", "0").lower() in {"1", "true", "yes", "on"},
+        "hardware": static_sys_snapshot(),
     }
 
 
@@ -242,10 +250,16 @@ def build_disk_usage_snapshot() -> dict[str, Any]:
     return {"type": "snapshot", "topic": "disk_usage", "payload": list_disk_usage()}
 
 
+def build_sys_snapshot() -> dict[str, Any]:
+    """构造宿主机系统快照帧（静态硬件 + 动态指标）。"""
+
+    return {"type": "snapshot", "topic": "sys_snapshot", "payload": list_sys_snapshot()}
+
+
 def build_snapshot_batch(identity: NodeIdentity) -> dict[str, Any]:
     """组合一次 WSS 推送批次。
 
-    三个 list 快照共用 service 层读面，WSS 只负责传输。
+    四个 list 快照共用 service 层读面，WSS 只负责传输。
     """
 
     return {
@@ -255,6 +269,7 @@ def build_snapshot_batch(identity: NodeIdentity) -> dict[str, Any]:
             build_status_snapshot(),
             build_last_ssh_snapshot(),
             build_disk_usage_snapshot(),
+            build_sys_snapshot(),
         ],
     }
 

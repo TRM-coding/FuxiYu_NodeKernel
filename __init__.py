@@ -19,6 +19,7 @@ async def lifespan(app: FastAPI):
     extensions.status_cache.start()
     extensions.last_ssh_cache.start()
     extensions.disk_usage_cache.start()
+    extensions.sys_cache.start()
 
     stop_event = threading.Event()
     wss_thread = start_wss_pusher(stop_event)
@@ -29,6 +30,7 @@ async def lifespan(app: FastAPI):
     finally:
         stop_event.set()
         wait_for_thread_stop(wss_thread)
+        extensions.sys_cache.stop()
 
 
 def create_app(config: str | None = None) -> FastAPI:
