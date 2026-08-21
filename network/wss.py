@@ -1,8 +1,10 @@
 import asyncio
 import datetime as _dt
+import ipaddress
 import json
 import logging
 import os
+import socket
 import ssl
 import threading
 import time
@@ -15,6 +17,7 @@ from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.x509.oid import NameOID
+from cryptography.x509.oid import ExtendedKeyUsageOID
 from pydantic import BaseModel
 
 from ..config import NetConfig
@@ -97,6 +100,50 @@ def _sha256_fingerprint_der(cert_der: bytes) -> str:
     return digest.finalize().hex()
 
 
+def _node_certificate_alt_names() -> list[x509.GeneralName]:
+    """生成 Node 自签证书 SAN，保证 ctrl 用 IP/DNS 访问时能通过主机名校验。"""
+
+    names: list[x509.GeneralName] = [
+        x509.DNSName("localhost"),
+        x509.IPAddress(ipaddress.ip_address("127.0.0.1")),
+    ]
+    hostname = socket.gethostname()
+    if hostname:
+        names.append(x509.DNSName(hostname))
+
+    extra = os.getenv("NODE_CERT_ALT_NAMES", "")
+    for raw in [item.strip() for item in extra.split(",") if item.strip()]:
+        try:
+            names.append(x509.IPAddress(ipaddress.ip_address(raw)))
+        except ValueError:
+            names.append(x509.DNSName(raw))
+    return names
+
+
+def _certificate_matches_node_defaults(cert_file: Path, names: list[x509.GeneralName]) -> bool:
+    """检查既有默认证书是否可同时做 TLS 证书和 TOFU pin 信任锚。"""
+
+    try:
+        cert = x509.load_pem_x509_certificate(cert_file.read_bytes())
+        basic = cert.extensions.get_extension_for_class(x509.BasicConstraints).value
+        san = cert.extensions.get_extension_for_class(x509.SubjectAlternativeName).value
+    except Exception:
+        return False
+
+    if not basic.ca:
+        return False
+
+    for name in names:
+        try:
+            if isinstance(name, x509.DNSName) and name.value not in san.get_values_for_type(x509.DNSName):
+                return False
+            if isinstance(name, x509.IPAddress) and name.value not in san.get_values_for_type(x509.IPAddress):
+                return False
+        except Exception:
+            return False
+    return True
+
+
 def ensure_self_signed_certificate() -> NodeCertificateFiles:
     """确保 Node 有一套本机自签证书。
 
@@ -105,7 +152,11 @@ def ensure_self_signed_certificate() -> NodeCertificateFiles:
 
     files = _certificate_files()
     if files.cert_file.exists() and files.key_file.exists():
-        return files
+        if os.getenv("NODE_TLS_CERT_FILE") or os.getenv("NODE_TLS_KEY_FILE"):
+            return files
+        if _certificate_matches_node_defaults(files.cert_file, _node_certificate_alt_names()):
+            return files
+        logger.warning("node default TLS certificate is not usable as current TOFU pin anchor; regenerating %s", files.cert_file)
 
     files.cert_file.parent.mkdir(parents=True, exist_ok=True)
     files.key_file.parent.mkdir(parents=True, exist_ok=True)
@@ -125,7 +176,26 @@ def ensure_self_signed_certificate() -> NodeCertificateFiles:
         .serial_number(x509.random_serial_number())
         .not_valid_before(now - _dt.timedelta(minutes=1))
         .not_valid_after(now + _dt.timedelta(days=int(os.getenv("NODE_CERT_VALID_DAYS", "3650"))))
-        .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
+        .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
+        .add_extension(
+            x509.KeyUsage(
+                digital_signature=True,
+                content_commitment=False,
+                key_encipherment=True,
+                data_encipherment=False,
+                key_agreement=False,
+                key_cert_sign=True,
+                crl_sign=False,
+                encipher_only=False,
+                decipher_only=False,
+            ),
+            critical=True,
+        )
+        .add_extension(
+            x509.ExtendedKeyUsage([ExtendedKeyUsageOID.SERVER_AUTH, ExtendedKeyUsageOID.CLIENT_AUTH]),
+            critical=False,
+        )
+        .add_extension(x509.SubjectAlternativeName(_node_certificate_alt_names()), critical=False)
         .sign(private_key, hashes.SHA256())
     )
 

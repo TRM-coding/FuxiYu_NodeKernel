@@ -7,3 +7,6 @@
 /logs/*
 !/logs/.gitkeep
 .env
+# TLS 自签证书（TOFU：Node 私钥材料，绝不入库；Ctrl 侧通过 pin 流程持有公钥）
+/certs/*
+!/certs/.gitkeep

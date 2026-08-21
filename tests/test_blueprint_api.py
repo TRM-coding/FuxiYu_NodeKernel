@@ -1,7 +1,10 @@
 import time
 import ssl
+import ipaddress
 
 import pytest
+from cryptography import x509
+from cryptography.x509.oid import ExtensionOID, ExtendedKeyUsageOID
 from fastapi.testclient import TestClient
 
 from FuxiYu_NodeKernel import create_app, extensions
@@ -77,6 +80,23 @@ def test_wss_ssl_context_loads_node_client_certificate(monkeypatch, tmp_path):
     assert (tmp_path / "node_cert.pem").exists()
     assert (tmp_path / "node_key.pem").exists()
     assert context.verify_mode == ssl.CERT_NONE
+
+
+def test_node_self_signed_certificate_is_valid_pin_anchor(monkeypatch, tmp_path):
+    monkeypatch.setenv("NODE_TLS_CERT_FILE", str(tmp_path / "node_cert.pem"))
+    monkeypatch.setenv("NODE_TLS_KEY_FILE", str(tmp_path / "node_key.pem"))
+
+    files = wss_module.ensure_self_signed_certificate()
+    cert = x509.load_pem_x509_certificate(files.cert_file.read_bytes())
+    basic = cert.extensions.get_extension_for_oid(ExtensionOID.BASIC_CONSTRAINTS).value
+    san = cert.extensions.get_extension_for_oid(ExtensionOID.SUBJECT_ALTERNATIVE_NAME).value
+    eku = cert.extensions.get_extension_for_oid(ExtensionOID.EXTENDED_KEY_USAGE).value
+
+    assert basic.ca is True
+    assert "localhost" in san.get_values_for_type(x509.DNSName)
+    assert ipaddress.ip_address("127.0.0.1") in san.get_values_for_type(x509.IPAddress)
+    assert ExtendedKeyUsageOID.SERVER_AUTH in eku
+    assert ExtendedKeyUsageOID.CLIENT_AUTH in eku
 
 
 def test_create_container_success(client, monkeypatch):
