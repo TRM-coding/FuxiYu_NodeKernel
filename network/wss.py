@@ -4,6 +4,7 @@ import ipaddress
 import json
 import logging
 import os
+import shutil
 import socket
 import ssl
 import threading
@@ -11,6 +12,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from fastapi import APIRouter
 from cryptography import x509
@@ -33,6 +35,7 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/node_identity", tags=["node_identity"])
 
 _TRUE_ENV_VALUES = {"1", "true", "yes", "on"}
+_NODE_ROOT = Path(__file__).resolve().parents[1]
 
 
 class IssueNodeUidRequest(BaseModel):
@@ -62,7 +65,7 @@ class NodeCertificateFiles:
 def _identity_file() -> Path:
     """返回本机持久化身份牌文件路径。"""
 
-    default_path = Path(__file__).resolve().parents[1] / ".node_identity.json"
+    default_path = _NODE_ROOT / ".node_identity.json"
     return Path(os.getenv("NODE_IDENTITY_FILE", str(default_path)))
 
 
@@ -72,10 +75,68 @@ def _certificate_files() -> NodeCertificateFiles:
     证书默认放在 NodeKernel/certs 下；部署时可以用环境变量覆盖。
     """
 
-    base_dir = Path(__file__).resolve().parents[1] / "certs"
+    base_dir = _NODE_ROOT / "certs"
     cert_file = Path(os.getenv("NODE_TLS_CERT_FILE", str(base_dir / "node_cert.pem")))
     key_file = Path(os.getenv("NODE_TLS_KEY_FILE", str(base_dir / "node_key.pem")))
     return NodeCertificateFiles(cert_file=cert_file, key_file=key_file)
+
+
+def _resolve_node_path(value: str | None, default: Path | None = None) -> Path | None:
+    """Resolve Node-local config paths from the project root."""
+
+    if value:
+        path = Path(value)
+        return path if path.is_absolute() else _NODE_ROOT / path
+    return default
+
+
+def _default_ctrl_ca_file() -> Path:
+    """Default trust anchor used by Node to verify Ctrl."""
+
+    return _NODE_ROOT / "certs" / "ctrl_ca.pem"
+
+
+def _candidate_local_ctrl_ca_files() -> list[Path]:
+    """Local monorepo candidates for Ctrl public CA.
+
+    This only copies the public CA certificate. The CA private key never leaves
+    Ctrl.
+    """
+
+    return [
+        _NODE_ROOT.parent / "FuxiYu_CtrKernel" / "certs" / "ctrl_ca.pem",
+    ]
+
+
+def ensure_ctrl_ca_trust_file(configured_path: str | None = None) -> Path | None:
+    """Ensure Node has a Ctrl CA trust file when local source is available.
+
+    Cross-host deployment still requires placing ctrl_ca.pem on Node. In the
+    local monorepo case, this bootstraps the public CA into Node/certs so WSS
+    and HTTPS mTLS can both use the same trust anchor without disabling TLS
+    verification.
+    """
+
+    target = _resolve_node_path(configured_path, _default_ctrl_ca_file())
+    if target is None:
+        return None
+    if target.exists():
+        return target
+
+    for source in _candidate_local_ctrl_ca_files():
+        if not source.exists() or source.resolve() == target.resolve():
+            continue
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(source, target)
+            logger.info("bootstrapped Ctrl CA trust file: source=%s target=%s", source, target)
+            return target
+        except Exception as e:
+            logger.warning("failed to bootstrap Ctrl CA trust file: source=%s target=%s error=%s", source, target, e)
+            return None
+
+    logger.warning("Ctrl CA trust file is missing: expected=%s", target)
+    return None
 
 
 def _truthy_env(name: str, default: str = "0") -> bool:
@@ -305,7 +366,13 @@ def issue_uid_api(message: IssueNodeUidRequest) -> dict[str, Any]:
 def build_status_snapshot() -> dict[str, Any]:
     """构造容器状态快照帧。"""
 
-    return {"type": "snapshot", "topic": "container_status", "payload": list_container_status()}
+    payload = list_container_status()
+    logger.debug(
+        "build_status_snapshot: containers=%s statuses=%s",
+        len(payload),
+        {name: item.get("status") for name, item in payload.items()},
+    )
+    return {"type": "snapshot", "topic": "container_status", "payload": payload}
 
 
 def build_last_ssh_snapshot() -> dict[str, Any]:
@@ -349,10 +416,14 @@ def ctrl_wss_url(identity: NodeIdentity) -> str:
 
     configured = os.getenv("NODE_CTRL_WSS_URL")
     if configured:
-        return configured
+        parts = urlsplit(configured)
+        query = dict(parse_qsl(parts.query, keep_blank_values=True))
+        query.setdefault("uid", identity.uid)
+        return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query), parts.fragment))
     scheme = os.getenv("NODE_CTRL_WSS_SCHEME", "wss")
+    port = os.getenv("NODE_CTRL_WSS_PORT") or os.getenv("CTRL_WSS_PORT") or "5001"
     return (
-        f"{scheme}://{NetConfig.CTRL_IP}:{NetConfig.CTRL_PORT}/ws/node"
+        f"{scheme}://{NetConfig.CTRL_IP}:{port}/ws/node"
         f"?uid={identity.uid}"
     )
 
@@ -375,13 +446,15 @@ def build_wss_ssl_context() -> ssl.SSLContext:
     Ctrl 证书文件或显式指纹 pin 校验 Ctrl 身份。
     """
 
-    ctrl_ca_file = os.getenv("NODE_CTRL_CA_FILE") or os.getenv("NODE_CTRL_CERT_FILE")
+    configured_ctrl_ca_file = os.getenv("NODE_CTRL_CA_FILE") or os.getenv("NODE_CTRL_CERT_FILE")
+    ctrl_ca_file = ensure_ctrl_ca_trust_file(configured_ctrl_ca_file)
     expected_fingerprint = expected_ctrl_certificate_fingerprint()
     tls_insecure = _truthy_env("NODE_CTRL_TLS_INSECURE", "0")
 
     if ctrl_ca_file:
-        context = ssl.create_default_context(cafile=ctrl_ca_file)
+        context = ssl.create_default_context(cafile=str(ctrl_ca_file))
     else:
+        logger.warning("Ctrl CA trust file is not configured/found; WSS will use system trust store")
         context = ssl.create_default_context()
 
     if tls_insecure or (expected_fingerprint and not ctrl_ca_file):
@@ -455,7 +528,7 @@ async def push_snapshots_forever(stop_event: threading.Event, interval_seconds: 
                     await websocket.send(json.dumps(build_snapshot_batch(identity), ensure_ascii=True))
                     await asyncio.sleep(interval_seconds)
         except Exception as e:
-            logger.warning("Ctrl WSS push loop error: %s", e)
+            logger.warning("Ctrl WSS push loop error: url=%s uid=%s error=%s", url, identity.uid, e)
             await asyncio.sleep(min(interval_seconds, 5.0))
 
 

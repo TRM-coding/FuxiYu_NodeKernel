@@ -16,8 +16,11 @@ class ContainerStatus(Enum):
     OFFLINE = "offline"
     CREATING = "creating"
     STARTING = "starting"
+    RESTARTING = "restarting"
     STOPPING = "stopping"
     FAILED = "failed"
+    PAUSED = "paused"
+    UNKNOWN = "unknown"
 
 
 class ROLE(Enum):

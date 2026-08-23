@@ -166,7 +166,7 @@ class RestartContainerMessage(BaseModel):
 
 
 class RestartContainerResponse(ContainerOperationAcceptedResponse):
-    # Success JSON: {"success": 1, "container_status": "stopping", "container_name": "..."}.
+    # Success JSON: {"success": 1, "container_status": "restarting", "container_name": "..."}.
     pass
 
 

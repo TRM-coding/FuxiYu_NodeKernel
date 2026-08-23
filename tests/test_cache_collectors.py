@@ -9,6 +9,7 @@ import datetime as dt
 import subprocess
 
 from FuxiYu_NodeKernel import extensions
+from FuxiYu_NodeKernel.constant import ContainerStatus
 from FuxiYu_NodeKernel.docker_operates.disk_usage_cache import DiskUsageCache
 from FuxiYu_NodeKernel.docker_operates.status_cache import ContainerStatusCache
 from FuxiYu_NodeKernel.docker_operates.sys_cache import SysSnapshotCache
@@ -77,6 +78,15 @@ def test_status_cache_applies_events_pending_ready_and_deleted(monkeypatch):
     assert cache.get_state("c1")["status"] == "online"
 
     cache.mark_ready_check("creating-c")
+    cache._apply_event({"status": "start", "Actor": {"Attributes": {"name": "creating-c"}}})
+    assert cache.get_state("creating-c")["status"] == "starting"
+    assert cache.get("creating-c")["ready_check"] is True
+
+    cache.mark_ready_check("restarting-c", status=ContainerStatus.RESTARTING.value)
+    cache._apply_event({"status": "start", "Actor": {"Attributes": {"name": "restarting-c"}}})
+    assert cache.get_state("restarting-c")["status"] == ContainerStatus.RESTARTING.value
+    assert cache.get("restarting-c")["ready_check"] is True
+
     monkeypatch.setattr(cache, "_probe_sshd", lambda name: True)
     for name, entry in list(cache._cache.items()):
         if entry.get("ready_check") and cache._probe_sshd(name):
@@ -95,7 +105,7 @@ def test_status_cache_applies_events_pending_ready_and_deleted(monkeypatch):
         cache._cache.pop(name, None)
         cache._pending.pop(name, None)
         cache._deleted.append(name)
-    assert cache.take_deleted() == ["c1", "creating-c", "vanished-c"]
+    assert cache.take_deleted() == ["c1", "creating-c", "restarting-c", "vanished-c"]
 
 
 def test_disk_usage_cache_collects_overlay_bind_and_snapshot(monkeypatch, tmp_path):
@@ -186,3 +196,45 @@ def test_wss_snapshot_batch_reads_all_cache_views(monkeypatch):
     assert batch["node_uid"] == "node-cache-test"
     topics = [frame["topic"] for frame in batch["payload"]]
     assert topics == ["container_status", "last_ssh", "disk_usage", "sys_snapshot"]
+
+
+def test_ctrl_wss_url_defaults_to_wss_receiver_port(monkeypatch):
+    identity = wss.NodeIdentity(uid="node-url-test")
+    monkeypatch.delenv("NODE_CTRL_WSS_URL", raising=False)
+    monkeypatch.delenv("NODE_CTRL_WSS_PORT", raising=False)
+    monkeypatch.delenv("CTRL_WSS_PORT", raising=False)
+    monkeypatch.setattr(wss.NetConfig, "CTRL_IP", "10.0.0.1")
+    monkeypatch.setattr(wss.NetConfig, "CTRL_PORT", 5000)
+
+    assert wss.ctrl_wss_url(identity) == "wss://10.0.0.1:5001/ws/node?uid=node-url-test"
+
+
+def test_ctrl_wss_url_accepts_explicit_wss_port(monkeypatch):
+    identity = wss.NodeIdentity(uid="node-url-test")
+    monkeypatch.delenv("NODE_CTRL_WSS_URL", raising=False)
+    monkeypatch.setenv("CTRL_WSS_PORT", "5011")
+    monkeypatch.setattr(wss.NetConfig, "CTRL_IP", "10.0.0.1")
+
+    assert wss.ctrl_wss_url(identity) == "wss://10.0.0.1:5011/ws/node?uid=node-url-test"
+
+
+def test_ctrl_wss_url_appends_uid_to_configured_url(monkeypatch):
+    identity = wss.NodeIdentity(uid="node-url-test")
+    monkeypatch.setenv("NODE_CTRL_WSS_URL", "wss://127.0.0.1:5001/ws/node")
+
+    assert wss.ctrl_wss_url(identity) == "wss://127.0.0.1:5001/ws/node?uid=node-url-test"
+
+
+def test_ctrl_ca_trust_file_bootstraps_public_ca(monkeypatch, tmp_path):
+    node_root = tmp_path / "FuxiYu_NodeKernel"
+    source = tmp_path / "FuxiYu_CtrKernel" / "certs" / "ctrl_ca.pem"
+    source.parent.mkdir(parents=True)
+    source.write_text("public ctrl ca", encoding="utf-8")
+
+    monkeypatch.setattr(wss, "_NODE_ROOT", node_root)
+    monkeypatch.setattr(wss, "_candidate_local_ctrl_ca_files", lambda: [source])
+
+    target = wss.ensure_ctrl_ca_trust_file()
+
+    assert target == node_root / "certs" / "ctrl_ca.pem"
+    assert target.read_text(encoding="utf-8") == "public ctrl ca"

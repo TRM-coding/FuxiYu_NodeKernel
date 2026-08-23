@@ -51,6 +51,8 @@ def create_container(owner_name: str, config:Container.Config_info, public_key: 
         extensions.init_docker()
 
     print(f"Creating container for owner={owner_name} with config={config} and public_key={public_key}")
+    logger.info("create_container service begin: name=%s owner=%s image=%s port=%s",
+                config.name, owner_name, config.image, config.port)
     # validate owner_name early because it's used as host path component
     try:
         _sanitizer.validate_username(owner_name)
@@ -247,8 +249,10 @@ def create_container(owner_name: str, config:Container.Config_info, public_key: 
     if ssh_ready:
         try:
             _run(container, "/usr/sbin/sshd")
+            logger.info("create_container sshd started: name=%s container_id=%s", name, container.id)
         except Exception as e:
             print(f"Failed to start sshd inside container: {e}. SSH may be unavailable.")
+            logger.warning("create_container sshd start failed: name=%s error=%s", name, e)
     # 使得公钥可选 （如果提供了公钥则安装，否则只用密码登录）
     if public_key:
         try:
@@ -264,7 +268,12 @@ def create_container(owner_name: str, config:Container.Config_info, public_key: 
             _run(container, cmd)
         except Exception as e:
             print(f"Failed to install public_key into container: {e}")
+            logger.warning("create_container public_key install failed: name=%s error=%s", name, e)
+    else:
+        logger.info("create_container no public_key provided: name=%s", name)
 
+    logger.info("create_container service complete: name=%s container_id=%s ssh_ready=%s",
+                name, container.id, ssh_ready)
     return CreateContainerReturn(container.id,container.name)
 
 #删除容器并删除其所有者记录

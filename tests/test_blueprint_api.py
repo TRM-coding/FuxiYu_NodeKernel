@@ -246,11 +246,27 @@ def test_stop_container_success(client, monkeypatch):
 
 def test_restart_container_success(client, monkeypatch):
     _patched_service(monkeypatch, "restart_container", lambda name: True)
-    resp = client.post("/api/restart_container", json={"config": {"container_name": "c1"}})
+    resp = client.post("/api/restart_container", json={"config": {"container_name": "c_restart"}})
     assert resp.status_code == 200
-    assert resp.json()["container_status"] == "stopping"
+    assert resp.json()["container_status"] == "restarting"
     time.sleep(0.1)
-    assert extensions.status_cache.get_state("c1")["status"] == "online"
+    state = extensions.status_cache.get_state("c_restart")
+    assert state["status"] == "restarting"
+    assert extensions.status_cache.get("c_restart")["ready_check"] is True
+
+
+def test_restart_container_waits_for_sshd_probe_before_online(client, monkeypatch):
+    _patched_service(monkeypatch, "restart_container", lambda name: True)
+    monkeypatch.setattr(extensions.status_cache, "_probe_sshd", lambda name: True)
+
+    resp = client.post("/api/restart_container", json={"config": {"container_name": "c_restart_probe"}})
+
+    assert resp.status_code == 200
+    time.sleep(0.1)
+    for name, entry in list(extensions.status_cache.snapshot().items()):
+        if entry.get("ready_check") and extensions.status_cache._probe_sshd(name):
+            extensions.status_cache.update(name, "online")
+    assert extensions.status_cache.get_state("c_restart_probe")["status"] == "online"
 
 
 def test_pause_container_success(client, monkeypatch):

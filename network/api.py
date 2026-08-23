@@ -6,7 +6,7 @@ from fastapi import APIRouter
 from fastapi.responses import JSONResponse
 
 from .. import extensions
-from ..constant import ROLE
+from ..constant import ContainerStatus, MachineStatus, ROLE
 from ..schemas import (
     AddCollaboratorMessage,
     AddCollaboratorResponse,
@@ -128,12 +128,19 @@ def create_container_api(message: CreateContainerMessage):
 
     def _bg_create(owner_name: str, cfg_obj):
         try:
-            extensions.status_cache.begin_action(cfg_obj.name, "create", "creating")
-            create_container(owner_name, cfg_obj, public_key=message.public_key)
+            logger.info("create_container background started: name=%s owner=%s", cfg_obj.name, owner_name)
+            extensions.status_cache.begin_action(cfg_obj.name, "create", ContainerStatus.CREATING.value)
+            result = create_container(owner_name, cfg_obj, public_key=message.public_key)
+            logger.info(
+                "create_container service returned: name=%s container_id=%s",
+                result.container_name,
+                result.container_id,
+            )
             extensions.status_cache.mark_ready_check(cfg_obj.name)
+            logger.info("create_container marked ready_check: name=%s", cfg_obj.name)
         except Exception as e:
             logger.warning("create_container error: %s", e)
-            extensions.status_cache.finish_action(cfg_obj.name, "failed", str(e))
+            extensions.status_cache.finish_action(cfg_obj.name, ContainerStatus.FAILED.value, str(e))
 
     try:
         threading.Thread(target=_bg_create, args=(message.owner_name, cfg), daemon=True).start()
@@ -143,7 +150,7 @@ def create_container_api(message: CreateContainerMessage):
             content={"success": 0, "error": str(e), "error_reason": "background_thread_failed"},
         )
 
-    return {"success": 1, "container_status": "creating", "container_name": cfg.name}
+    return {"success": 1, "container_status": ContainerStatus.CREATING.value, "container_name": cfg.name}
 
 
 @router.post("/container_status", response_model=ContainerStatusResponse)
@@ -160,12 +167,12 @@ def container_status_api(message: ContainerStatusMessage):
     try:
         state = list_container_status().get(container_name)
         if state is None:
-            return {"success": 1, "container_status": "unknown", "container_name": container_name}
+            return {"success": 1, "container_status": ContainerStatus.UNKNOWN.value, "container_name": container_name}
         if state["source"] == "pending":
-            if state["status"] == "failed":
+            if state["status"] == ContainerStatus.FAILED.value:
                 return {
                     "success": 0,
-                    "container_status": "failed",
+                    "container_status": ContainerStatus.FAILED.value,
                     "container_name": container_name,
                     "error": "operation failed",
                     "error_reason": state.get("error_reason"),
@@ -219,7 +226,7 @@ def machine_status_api(_: MachineStatusMessage):
             status_code=500,
             content={"success": 0, "error": f"docker init failed: {e}", "error_reason": "docker_init_failed"},
         )
-    return {"success": 1, "machine_status": "online"}
+    return {"success": 1, "machine_status": MachineStatus.ONLINE.value}
 
 
 @router.post("/remove_container", response_model=RemoveContainerResponse)
@@ -234,7 +241,7 @@ def remove_container_api(message: RemoveContainerMessage):
     try:
         status_info = extensions.status_cache.get_pending(container_name)
         success = remove_container(container_name)
-        if status_info is not None and status_info.get("status") == "failed" and success == 0:
+        if status_info is not None and status_info.get("status") == ContainerStatus.FAILED.value and success == 0:
             extensions.status_cache.clear_pending(container_name)
     except Exception as e:
         return JSONResponse(status_code=500, content={"success": 0, "error": str(e)})
@@ -267,15 +274,19 @@ def start_container_api(message: StartContainerMessage):
 
     def _bg_start(name: str):
         try:
-            extensions.status_cache.begin_action(name, "start", "starting")
+            extensions.status_cache.begin_action(name, "start", ContainerStatus.STARTING.value)
             ok = start_container(name)
-            extensions.status_cache.finish_action(name, "online" if ok else "failed", None if ok else "start_failed")
+            extensions.status_cache.finish_action(
+                name,
+                ContainerStatus.ONLINE.value if ok else ContainerStatus.FAILED.value,
+                None if ok else "start_failed",
+            )
         except Exception as e:
             logger.warning("bg start error: %s", e)
-            extensions.status_cache.finish_action(name, "failed", str(e))
+            extensions.status_cache.finish_action(name, ContainerStatus.FAILED.value, str(e))
 
     threading.Thread(target=_bg_start, args=(container_name,), daemon=True).start()
-    return {"success": 1, "container_status": "starting", "container_name": container_name}
+    return {"success": 1, "container_status": ContainerStatus.STARTING.value, "container_name": container_name}
 
 
 @router.post("/stop_container", response_model=StopContainerResponse)
@@ -288,20 +299,24 @@ def stop_container_api(message: StopContainerMessage):
 
     def _bg_stop(name: str):
         try:
-            extensions.status_cache.begin_action(name, "stop", "stopping")
+            extensions.status_cache.begin_action(name, "stop", ContainerStatus.STOPPING.value)
             ok = stop_container(name)
-            extensions.status_cache.finish_action(name, "offline" if ok else "failed", None if ok else "stop_failed")
+            extensions.status_cache.finish_action(
+                name,
+                ContainerStatus.OFFLINE.value if ok else ContainerStatus.FAILED.value,
+                None if ok else "stop_failed",
+            )
         except Exception as e:
             logger.warning("bg stop error: %s", e)
-            extensions.status_cache.finish_action(name, "failed", str(e))
+            extensions.status_cache.finish_action(name, ContainerStatus.FAILED.value, str(e))
 
     threading.Thread(target=_bg_stop, args=(container_name,), daemon=True).start()
-    return {"success": 1, "container_status": "stopping", "container_name": container_name}
+    return {"success": 1, "container_status": ContainerStatus.STOPPING.value, "container_name": container_name}
 
 
 @router.post("/restart_container", response_model=RestartContainerResponse)
 def restart_container_api(message: RestartContainerMessage):
-    """重启容器；实际重启动作放入后台线程，接口沿用 stopping 响应语义。"""
+    """重启容器；实际重启动作放入后台线程，接口立即返回 restarting。"""
 
     container_name = _container_name(message.config)
     if not container_name:
@@ -309,15 +324,18 @@ def restart_container_api(message: RestartContainerMessage):
 
     def _bg_restart(name: str):
         try:
-            extensions.status_cache.begin_action(name, "restart", "restarting")
+            extensions.status_cache.begin_action(name, "restart", ContainerStatus.RESTARTING.value)
             ok = restart_container(name)
-            extensions.status_cache.finish_action(name, "online" if ok else "failed", None if ok else "restart_failed")
+            if ok:
+                extensions.status_cache.mark_ready_check(name, status=ContainerStatus.RESTARTING.value)
+            else:
+                extensions.status_cache.finish_action(name, ContainerStatus.FAILED.value, "restart_failed")
         except Exception as e:
             logger.warning("bg restart error: %s", e)
-            extensions.status_cache.finish_action(name, "failed", str(e))
+            extensions.status_cache.finish_action(name, ContainerStatus.FAILED.value, str(e))
 
     threading.Thread(target=_bg_restart, args=(container_name,), daemon=True).start()
-    return {"success": 1, "container_status": "stopping", "container_name": container_name}
+    return {"success": 1, "container_status": ContainerStatus.RESTARTING.value, "container_name": container_name}
 
 
 @router.post("/remove_collaborator", response_model=RemoveCollaboratorResponse)
@@ -384,12 +402,15 @@ def pause_container_api(message: PauseContainerMessage):
             extensions.status_cache.begin_action(name, act, "pausing" if act == "pause" else "unpausing")
             ok = pause_container(name, act)
             if ok:
-                extensions.status_cache.finish_action(name, "paused" if act == "pause" else "online")
+                extensions.status_cache.finish_action(
+                    name,
+                    ContainerStatus.PAUSED.value if act == "pause" else ContainerStatus.ONLINE.value,
+                )
             else:
-                extensions.status_cache.finish_action(name, "failed", f"{act}_failed")
+                extensions.status_cache.finish_action(name, ContainerStatus.FAILED.value, f"{act}_failed")
         except Exception as e:
             logger.warning("bg pause error for %s: %s", name, e)
-            extensions.status_cache.finish_action(name, "failed", str(e))
+            extensions.status_cache.finish_action(name, ContainerStatus.FAILED.value, str(e))
 
     threading.Thread(target=_bg_pause, args=(container_name, action), daemon=True).start()
     return {
