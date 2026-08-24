@@ -227,12 +227,30 @@ def test_update_role_invalid_role_422(client):
 
 
 def test_start_container_success(client, monkeypatch):
+    # 与 restart 同构：start 成功后进入 ready_check 确认门禁（docker running ≠ sshd 就绪），
+    # 由 probe 循环验 :22 通过后才 ONLINE
     _patched_service(monkeypatch, "start_container", lambda name: True)
     resp = client.post("/api/start_container", json={"config": {"container_name": "c1"}})
     assert resp.status_code == 200
     assert resp.json()["container_status"] == "starting"
     time.sleep(0.1)
-    assert extensions.status_cache.get_state("c1")["status"] == "online"
+    state = extensions.status_cache.get_state("c1")
+    assert state["status"] == "starting"
+    assert extensions.status_cache.get("c1")["ready_check"] is True
+
+
+def test_start_container_waits_for_sshd_probe_before_online(client, monkeypatch):
+    _patched_service(monkeypatch, "start_container", lambda name: True)
+    monkeypatch.setattr(extensions.status_cache, "_probe_sshd", lambda name: True)
+
+    resp = client.post("/api/start_container", json={"config": {"container_name": "c_start_probe"}})
+
+    assert resp.status_code == 200
+    time.sleep(0.1)
+    for name, entry in list(extensions.status_cache.snapshot().items()):
+        if entry.get("ready_check") and extensions.status_cache._probe_sshd(name):
+            extensions.status_cache.update(name, "online")
+    assert extensions.status_cache.get_state("c_start_probe")["status"] == "online"
 
 
 def test_stop_container_success(client, monkeypatch):

@@ -276,11 +276,12 @@ def start_container_api(message: StartContainerMessage):
         try:
             extensions.status_cache.begin_action(name, "start", ContainerStatus.STARTING.value)
             ok = start_container(name)
-            extensions.status_cache.finish_action(
-                name,
-                ContainerStatus.ONLINE.value if ok else ContainerStatus.FAILED.value,
-                None if ok else "start_failed",
-            )
+            if ok:
+                # 与 restart 同构：docker running ≠ sshd 就绪——进入 ready_check 确认门禁，
+                # 由 probe 循环验 :22 通过后才 ONLINE（无 init 容器 sshd 不自启的兜底）。
+                extensions.status_cache.mark_ready_check(name, status=ContainerStatus.STARTING.value)
+            else:
+                extensions.status_cache.finish_action(name, ContainerStatus.FAILED.value, "start_failed")
         except Exception as e:
             logger.warning("bg start error: %s", e)
             extensions.status_cache.finish_action(name, ContainerStatus.FAILED.value, str(e))

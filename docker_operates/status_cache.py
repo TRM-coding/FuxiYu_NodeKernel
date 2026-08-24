@@ -34,7 +34,7 @@ PROBE_INTERVAL = 10
 _SSHD_READY_CMD = (
     "ss -ltn 2>/dev/null | grep -q :22 || "
     "netstat -ltn 2>/dev/null | grep -q :22 || "
-    "pgrep -f sshd >/dev/null 2>&1 || "
+    "pgrep -f '[s]shd' >/dev/null 2>&1 || "
     "ps aux 2>/dev/null | grep -q [s]shd"
 )
 
@@ -265,14 +265,36 @@ class ContainerStatusCache:
     def _apply_container(self, container) -> None:
         """采集侧：单容器对账 → 状态缓存。
 
-        就绪确认中的容器（ready_check）：docker running 时保持 starting（等 probe 确认 sshd），
-        非 running 按终态覆盖（update 整条目覆盖，自动清标记）。
+        - 就绪确认中（ready_check）+ docker running → 保持 starting（等 probe 确认 sshd）
+        - 冷启动/新容器（缓存无条目）+ docker running → **不直接 online**：落 starting +
+          ready_check，由 probe 循环验 :22（不通补启动）后才 online——崩溃恢复复合确认，
+          防"docker running 但 sshd 未就绪"的过早 ONLINE（契约 C1 延伸）
+        - 冷启动/新容器 + docker "created"（从未运行）→ 陈旧半成品（create 中途炸/从未启动，
+          无进程会推进）→ 终态 FAILED，等人工处置
+        - 已有 FAILED 条目 → 终态守卫：不被对账从 docker 状态复活（恢复路径 = 平台操作 restart/删除重建）
+        - 其余：按 docker 状态覆盖（update 整条目覆盖，自动清标记）
         """
         with self._lock:
             entry = self._cache.get(container.name)
             if entry is not None and entry.get("ready_check") \
                     and str(getattr(container, 'status', '') or '') == 'running':
                 return  # 保持 starting + ready_check，等 probe 升 online
+        if entry is None:
+            raw = _map_container_to_status(container)
+            if raw == ContainerStatus.ONLINE.value:
+                self.mark_ready_check(container.name)
+                return
+            if raw == ContainerStatus.STARTING.value:
+                # docker "created"：从未运行的陈旧半成品，终态 FAILED（恢复 = 删除重建/平台操作）
+                logger.warning(
+                    "status-cache: cold-start container %r is docker 'created' (stale half-create); marking FAILED",
+                    container.name,
+                )
+                self.update(container.name, ContainerStatus.FAILED.value)
+                return
+        elif entry.get("status") == ContainerStatus.FAILED.value:
+            # 终态守卫：FAILED 不被对账复活（操作/事件路径仍可恢复：restart → ready_check 门禁）
+            return
         self.update(container.name, _map_container_to_status(container))
 
     ##################
@@ -342,20 +364,86 @@ class ContainerStatusCache:
         except Exception:
             return False
 
-    def _probe_loop(self):  # sshd 就绪确认：对 ready_check 容器节流探测，就绪升 online
+    def _ensure_sshd_started(self, name: str) -> str:
+        """保障：exec 拉起容器内 sshd（无 init 容器下 /usr/sbin/sshd 是唯一可靠入口，create 同款）。
+
+        /usr/sbin/sshd 幂等：已在运行时报错退出，无害。
+        返回: "started" | "not_installed"（sshd 未安装 → 终态 FAILED，等人工处置）| "transient"（可重试）
+        """
+        try:
+            from .. import extensions
+            if extensions.docker_client is None:
+                extensions.init_docker()
+            container = extensions.docker_client.containers.get(name)
+            # 注意：docker-py exec_run 不支持 timeout 参数（真实环境传了会 TypeError，
+            # 被吞后永远走 transient，FAILED 路径失效——真 docker 集成测试抓到的坑）
+            r = container.exec_run(
+                ["/bin/sh", "-c", "mkdir -p /run/sshd && /usr/sbin/sshd"],
+                user="root",
+            )
+            exit_code = getattr(r, 'exit_code', None)
+            if exit_code is None:
+                try:
+                    exit_code = int(r[0])
+                except Exception:
+                    exit_code = -1
+            if exit_code == 0:
+                logger.info("status-cache sshd started (ensure): name=%s", name)
+                return "started"
+            out = ""
+            try:
+                out = r.output.decode('utf-8', errors='ignore') if isinstance(r.output, bytes) else str(r.output or '')
+            except Exception:
+                pass
+            if exit_code == 127 or 'not found' in (out or '').lower():
+                # sshd 未安装（create 半成品/安装失败）：平台不可用终态，FAILED 等人工处置
+                logger.warning(
+                    "status-cache sshd NOT installed in %s (exit=%s): %s",
+                    name, exit_code, out.strip()[:120],
+                )
+                return "not_installed"
+            logger.debug(
+                "status-cache sshd start exit=%s (transient, will retry): name=%s out=%s",
+                exit_code, name, out.strip()[:120],
+            )
+            return "transient"
+        except Exception as e:
+            logger.debug("status-cache sshd start attempt failed (will retry): name=%s err=%s", name, e)
+            return "transient"
+
+    def _probe_ready_checks_once(self) -> None:
+        """单轮就绪确认（保障）：对 ready_check 容器探测，就绪升 online；未就绪尝试拉起。
+
+        - 就绪（:22 监听）→ update 整条目覆盖为 online，自动清 ready_check
+        - 未就绪 → _ensure_sshd_started 尝试拉起（无 init 容器下 sshd 不自启的兜底），保持 starting
+        """
+        try:
+            with self._lock:
+                targets = [name for name, e in self._cache.items() if e.get("ready_check")]
+            for name in targets:
+                if self._probe_sshd(name):
+                    logger.info("status-cache sshd probe ready: name=%s", name)
+                    self.update(name, ContainerStatus.ONLINE.value)
+                else:
+                    # 自愈（保障）：sshd 未就绪 → 尝试拉起。无 init 容器下 /usr/sbin/sshd
+                    # 是唯一可靠入口（create 同款启动方式）；幂等，已在运行时报错但无害。
+                    ensure_status = self._ensure_sshd_started(name)
+                    if ensure_status == "not_installed":
+                        # sshd 未安装 = 平台不可用终态：FAILED，等人工处置（删除重建/修复）
+                        logger.warning(
+                            "status-cache: sshd missing in %s; marking FAILED (manual handling)",
+                            name,
+                        )
+                        self.update(name, ContainerStatus.FAILED.value)
+                    else:
+                        logger.warning("status-cache sshd probe not ready, trying to start sshd: name=%s", name)
+        except Exception as e:
+            logger.warning("status-cache probe loop interrupted (will retry): %s", e)
+
+    def _probe_loop(self):  # sshd 就绪确认 + 自愈：对 ready_check 容器节流探测，就绪升 online
         while True:
             time.sleep(PROBE_INTERVAL)
-            try:
-                with self._lock:
-                    targets = [name for name, e in self._cache.items() if e.get("ready_check")]
-                for name in targets:
-                    if self._probe_sshd(name):
-                        logger.info("status-cache sshd probe ready: name=%s", name)
-                        self.update(name, ContainerStatus.ONLINE.value)  # update 整条目覆盖，自动清 ready_check
-                    else:
-                        logger.debug("status-cache sshd probe not ready: name=%s", name)
-            except Exception as e:
-                logger.warning("status-cache probe loop interrupted (will retry): %s", e)
+            self._probe_ready_checks_once()
 
     def _events_loop(self):  # 主通道：docker events 订阅（push）
         while True:

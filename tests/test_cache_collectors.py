@@ -5,8 +5,11 @@ objects. They are not real-daemon tests; real Docker coverage should be added
 under the explicit ``docker`` marker.
 """
 
+import asyncio
 import datetime as dt
+import json
 import subprocess
+import threading
 
 from FuxiYu_NodeKernel import extensions
 from FuxiYu_NodeKernel.constant import ContainerStatus
@@ -125,6 +128,123 @@ def test_status_cache_unrecognized_event_ignored_without_pollution():
     assert cache.get_state("c1")["status"] == "online"
 
 
+class _ExecResult:
+    def __init__(self, exit_code, output=b""):
+        self.exit_code = exit_code
+        self.output = output
+
+
+def _fake_docker_client(container):
+    class _Containers:
+        def get(self, name):
+            return container
+
+    class _Client:
+        containers = _Containers()
+
+    return _Client()
+
+
+def test_ensure_sshd_started_detects_not_installed(monkeypatch):
+    # 保障：拉起失败且 exit=127/not found → not_installed（终态 FAILED 依据）
+    cache = ContainerStatusCache()
+    calls = []
+
+    class _Container:
+        def exec_run(self, *a, **k):
+            calls.append(a)
+            return _ExecResult(127, b"sh: 1: /usr/sbin/sshd: not found")
+
+    monkeypatch.setattr(extensions, "docker_client", _fake_docker_client(_Container()))
+    assert cache._ensure_sshd_started("c1") == "not_installed"
+    assert calls
+
+
+def test_ensure_sshd_started_started_and_transient(monkeypatch):
+    cache = ContainerStatusCache()
+
+    class _OkContainer:
+        def exec_run(self, *a, **k):
+            return _ExecResult(0, b"")
+
+    monkeypatch.setattr(extensions, "docker_client", _fake_docker_client(_OkContainer()))
+    assert cache._ensure_sshd_started("c1") == "started"
+
+    class _ErrContainer:
+        def exec_run(self, *a, **k):
+            return _ExecResult(255, b"some transient error")
+
+    monkeypatch.setattr(extensions, "docker_client", _fake_docker_client(_ErrContainer()))
+    assert cache._ensure_sshd_started("c1") == "transient"
+
+    class _BoomContainer:
+        def exec_run(self, *a, **k):
+            raise RuntimeError("exec failed")
+
+    monkeypatch.setattr(extensions, "docker_client", _fake_docker_client(_BoomContainer()))
+    assert cache._ensure_sshd_started("c1") == "transient"
+
+
+def test_probe_marks_failed_when_sshd_missing(monkeypatch):
+    # 探测失败 + 拉起发现 sshd 未装 → 终态 FAILED（等人工处置），清 ready_check
+    cache = ContainerStatusCache()
+    cache.mark_ready_check("c1")
+    monkeypatch.setattr(cache, "_probe_sshd", lambda name: False)
+    monkeypatch.setattr(cache, "_ensure_sshd_started", lambda name: "not_installed")
+
+    cache._probe_ready_checks_once()
+
+    assert cache.get_state("c1")["status"] == "failed"
+    assert cache.get("c1").get("ready_check") is not True
+
+
+def test_probe_transient_keeps_starting(monkeypatch):
+    cache = ContainerStatusCache()
+    cache.mark_ready_check("c1")
+    monkeypatch.setattr(cache, "_probe_sshd", lambda name: False)
+    monkeypatch.setattr(cache, "_ensure_sshd_started", lambda name: "transient")
+
+    cache._probe_ready_checks_once()
+
+    assert cache.get_state("c1")["status"] == "starting"
+
+
+def test_cold_start_created_container_marks_failed():
+    # 冷启动 docker "created"（从未运行）= 陈旧半成品（create 中途炸/从未启动）→ FAILED
+    cache = ContainerStatusCache()
+    cache._apply_container(_Container("stale_c", status="created"))
+    assert cache.get_state("stale_c")["status"] == "failed"
+
+
+def test_failed_terminal_guard_not_resurrected_by_reconcile():
+    # FAILED 终态守卫：对账不从 docker running 复活（恢复路径 = 平台操作 restart/删除重建）
+    cache = ContainerStatusCache()
+    cache.update("c1", "failed")
+    cache._apply_container(_Container("c1", status="running"))
+    assert cache.get_state("c1")["status"] == "failed"
+
+
+def test_probe_self_heals_sshd_then_online(monkeypatch):
+    # 保障：ready_check 容器 probe 未就绪 → 尝试拉起 sshd；下一轮就绪 → online
+    cache = ContainerStatusCache()
+    cache.mark_ready_check("c1")
+    calls = []
+
+    def _flaky_probe(name):
+        calls.append("probe")
+        return len(calls) >= 2  # 首轮失败，之后成功
+
+    monkeypatch.setattr(cache, "_probe_sshd", _flaky_probe)
+    monkeypatch.setattr(cache, "_ensure_sshd_started", lambda name: calls.append("fix"))
+
+    cache._probe_ready_checks_once()
+    assert calls == ["probe", "fix"]  # 未就绪 → 拉起被调用，仍 starting
+    assert cache.get_state("c1")["status"] == "starting"
+
+    cache._probe_ready_checks_once()
+    assert cache.get_state("c1")["status"] == "online"  # 拉起后就绪 → online
+
+
 def test_status_cache_state_events_still_update_cache():
     cache = ContainerStatusCache()
     cache.update("c1", "online")
@@ -133,7 +253,8 @@ def test_status_cache_state_events_still_update_cache():
 
 
 def test_status_cache_warm_up_reconcile_populates_cache(monkeypatch):
-    # 数据通路对账契约 C1：启动 warm-up 对账回填缓存 → 首帧快照非空
+    # 数据通路对账契约 C1：启动 warm-up 对账回填缓存 → 首帧快照非空。
+    # running 容器走冷启动复合确认（starting + ready_check），probe 验 :22 后才 online
     cache = ContainerStatusCache()
     monkeypatch.setattr(
         "FuxiYu_NodeKernel.docker_operates.status_cache.docker.from_env",
@@ -143,9 +264,33 @@ def test_status_cache_warm_up_reconcile_populates_cache(monkeypatch):
         ]),
     )
     cache._reconcile_once()
-    assert cache.get_state("warm_c1")["status"] == "online"
+    assert cache.get_state("warm_c1")["status"] == "starting"
+    assert cache.get("warm_c1")["ready_check"] is True
     assert cache.get_state("warm_c2")["status"] == "offline"
     assert cache.get_collect_error() is None
+
+    # probe 就绪 → online（复合确认完成）
+    monkeypatch.setattr(cache, "_probe_sshd", lambda name: True)
+    cache._probe_ready_checks_once()
+    assert cache.get_state("warm_c1")["status"] == "online"
+
+
+def test_cold_start_running_container_waits_for_sshd_probe(monkeypatch):
+    # 崩溃恢复复合确认：冷启动 running 容器不直接 online，probe 验 :22 后才 online；
+    # 已有条目不再重挂 ready_check（无 15s 对账振荡）
+    cache = ContainerStatusCache()
+    cache._apply_container(_Container("cold_c1", status="running"))
+    assert cache.get_state("cold_c1")["status"] == "starting"
+    assert cache.get("cold_c1")["ready_check"] is True
+
+    monkeypatch.setattr(cache, "_probe_sshd", lambda name: True)
+    cache._probe_ready_checks_once()
+    assert cache.get_state("cold_c1")["status"] == "online"
+
+    # 对账再跑：已有 online 条目 → 不重挂 ready_check（振荡防护）
+    cache._apply_container(_Container("cold_c1", status="running"))
+    assert cache.get_state("cold_c1")["status"] == "online"
+    assert cache.get("cold_c1").get("ready_check") is not True
 
 
 def test_status_cache_reconcile_failure_sets_collect_error(monkeypatch):
@@ -174,7 +319,9 @@ def test_status_cache_reconcile_recovers_clears_collect_error(monkeypatch):
     )
     cache._reconcile_once()
     assert cache.get_collect_error() is None
-    assert cache.get_state("recover_c1")["status"] == "online"
+    # 冷启动复合确认：running 容器落 starting + ready_check（probe 通过后才 online）
+    assert cache.get_state("recover_c1")["status"] == "starting"
+    assert cache.get("recover_c1")["ready_check"] is True
 
 
 def test_wss_status_snapshot_sends_collect_error_shape(monkeypatch):
@@ -299,6 +446,79 @@ def test_ctrl_wss_url_appends_uid_to_configured_url(monkeypatch):
     monkeypatch.setenv("NODE_CTRL_WSS_URL", "wss://127.0.0.1:5001/ws/node")
 
     assert wss.ctrl_wss_url(identity) == "wss://127.0.0.1:5001/ws/node?uid=node-url-test"
+
+
+def test_wss_push_loop_sends_full_snapshot_batch_first(monkeypatch):
+    """契约 C1/C7 承诺：真推送循环首帧即全量 snapshot_batch（4 topics），非空、非错误形状。
+
+    用 fake websockets.connect 跑真实 push_snapshots_forever——不绕 build_snapshot_batch。
+    """
+    import websockets as _websockets
+
+    frames = []
+    stop_event = threading.Event()
+
+    class _WS:
+        async def send(self, text):
+            frames.append(json.loads(text))
+            stop_event.set()  # 首帧后停止
+
+    class _Conn:
+        async def __aenter__(self):
+            return _WS()
+
+        async def __aexit__(self, *exc):
+            return False
+
+    monkeypatch.setattr(_websockets, "connect", lambda url, ssl=None: _Conn())
+    monkeypatch.setattr(wss, "load_node_identity", lambda: wss.NodeIdentity(uid="push-test-uid"))
+    monkeypatch.setattr(wss, "build_wss_ssl_context", lambda: None)
+    monkeypatch.setattr(wss, "expected_ctrl_certificate_fingerprint", lambda: None)
+    monkeypatch.setattr(wss, "list_container_status", lambda: {"c1": {"source": "cache", "status": "online"}})
+    monkeypatch.setattr(wss, "list_last_ssh", lambda: {"c1": {"last_ssh_connect_time": "2026-08-21T10:00:00"}})
+    monkeypatch.setattr(wss, "list_disk_usage", lambda: {"machine_disk": {"total_gb": 100}, "containers": {}})
+    monkeypatch.setattr(wss, "list_sys_snapshot", lambda: {"hostname": "node-it-01"})
+    monkeypatch.setattr(extensions.status_cache, "take_deleted", lambda: [])
+
+    asyncio.run(wss.push_snapshots_forever(stop_event, interval_seconds=5.0))
+
+    assert frames, "推送循环应发出至少一帧"
+    first = frames[0]
+    assert first["type"] == "snapshot_batch"
+    assert first["node_uid"] == "push-test-uid"
+    topics = [f["topic"] for f in first["payload"]]
+    assert topics == ["container_status", "last_ssh", "disk_usage", "sys_snapshot"]
+    # 首帧快照非空（warm-up 保证；契约 C1 承诺）
+    assert first["payload"][0]["payload"] != {}
+
+
+def test_lifespan_warms_status_cache_before_wss_pusher(monkeypatch):
+    """契约 C1 时序承诺：status_cache.start()（含同步 warm-up reconcile）先于 start_wss_pusher。
+
+    warm-up 先完成 → 首帧快照非空；若顺序被破坏（pusher 先起），此测试失败。
+    """
+    import FuxiYu_NodeKernel as _pkg
+    from FuxiYu_NodeKernel import lifespan as _lifespan
+
+    calls = []
+    monkeypatch.setattr(extensions.status_cache, "start", lambda: calls.append("warm"))
+    monkeypatch.setattr(extensions.last_ssh_cache, "start", lambda: None)
+    monkeypatch.setattr(extensions.disk_usage_cache, "start", lambda: None)
+    monkeypatch.setattr(extensions.sys_cache, "start", lambda: None)
+    monkeypatch.setattr(extensions.sys_cache, "stop", lambda: None)
+    # lifespan 从包命名空间 import（__init__.py），patch 包属性而非 wss 模块
+    monkeypatch.setattr(_pkg, "start_wss_pusher", lambda stop_event: calls.append("pusher"))
+    monkeypatch.setattr(_pkg, "wait_for_thread_stop", lambda *a, **k: None)
+
+    class _App:
+        state = type("_State", (), {})()
+
+    async def _run():
+        async with _lifespan(_App()):
+            pass
+
+    asyncio.run(_run())
+    assert calls == ["warm", "pusher"]
 
 
 def test_ctrl_ca_trust_file_bootstraps_public_ca(monkeypatch, tmp_path):

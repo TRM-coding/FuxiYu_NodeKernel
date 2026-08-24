@@ -214,6 +214,35 @@ def create_container(owner_name: str, config:Container.Config_info, public_key: 
     else:
         print("No proxy configured for container network setup.")
 
+    # 初始密码为 owner_name + "123"，用户可以登录后再改密码（也可以直接提供公钥登录）
+    _run(container, f"echo 'root:{owner_name}123' | chpasswd")
+    try:
+        _sanitizer.validate_username(owner_name)
+    except Exception as e:
+        raise RuntimeError(f"unsafe owner_name: {e}")
+    # 使得公钥可选 （如果提供了公钥则安装，否则只用密码登录）
+    # 排在 sshd 安装之前：密码/公钥先就位，sshd 安装与启动作为最后一道守门——
+    # create 完成 ⟹ sshd 就绪；安装失败则容器保持未完成态，由 probe 自愈链标记
+    # FAILED（未装 sshd → 终态，人工处置），不会留下"sshd 已起但 key 未装"的半成品。
+    if public_key:
+        try:
+            # Use base64 to avoid shell-quoting issues when writing the key
+            # basic safety check on provided public key text before encoding
+            _sanitizer.validate_shell_arg(public_key)
+            b64 = base64.b64encode(public_key.encode('utf-8')).decode('ascii')
+            cmd = (
+                "mkdir -p /root/.ssh && chmod 700 /root/.ssh && "
+                f"echo '{b64}' | base64 -d > /root/.ssh/authorized_keys && "
+                "chmod 600 /root/.ssh/authorized_keys"
+            )
+            _run(container, cmd)
+        except Exception as e:
+            print(f"Failed to install public_key into container: {e}")
+            logger.warning("create_container public_key install failed: name=%s error=%s", name, e)
+    else:
+        logger.info("create_container no public_key provided: name=%s", name)
+
+    # ── 最后一道守门：sshd 安装 + 配置 + 启动 ──
     ssh_ready = False
     try:
         _run(container, "apt-get update", timeout_sec=300)
@@ -233,12 +262,6 @@ def create_container(owner_name: str, config:Container.Config_info, public_key: 
             ssh_ready = True
         except Exception as e2:
             print(f"Fallback apt-get sequence also failed: {e2}. Continuing without openssh-server; container created but SSH may be unavailable.")
-    # 初始密码为 owner_name + "123"，用户可以登录后再改密码（也可以直接提供公钥登录）
-    _run(container, f"echo 'root:{owner_name}123' | chpasswd")
-    try:
-        _sanitizer.validate_username(owner_name)
-    except Exception as e:
-        raise RuntimeError(f"unsafe owner_name: {e}")
     if ssh_ready:
         _run(container, "sed -i 's/^#*PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config")
         _run(container, "sed -i 's/^#*PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config")
@@ -253,24 +276,6 @@ def create_container(owner_name: str, config:Container.Config_info, public_key: 
         except Exception as e:
             print(f"Failed to start sshd inside container: {e}. SSH may be unavailable.")
             logger.warning("create_container sshd start failed: name=%s error=%s", name, e)
-    # 使得公钥可选 （如果提供了公钥则安装，否则只用密码登录）
-    if public_key:
-        try:
-            # Use base64 to avoid shell-quoting issues when writing the key
-            # basic safety check on provided public key text before encoding
-            _sanitizer.validate_shell_arg(public_key)
-            b64 = base64.b64encode(public_key.encode('utf-8')).decode('ascii')
-            cmd = (
-                "mkdir -p /root/.ssh && chmod 700 /root/.ssh && "
-                f"echo '{b64}' | base64 -d > /root/.ssh/authorized_keys && "
-                "chmod 600 /root/.ssh/authorized_keys"
-            )
-            _run(container, cmd)
-        except Exception as e:
-            print(f"Failed to install public_key into container: {e}")
-            logger.warning("create_container public_key install failed: name=%s error=%s", name, e)
-    else:
-        logger.info("create_container no public_key provided: name=%s", name)
 
     logger.info("create_container service complete: name=%s container_id=%s ssh_ready=%s",
                 name, container.id, ssh_ready)
