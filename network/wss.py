@@ -364,7 +364,21 @@ def issue_uid_api(message: IssueNodeUidRequest) -> dict[str, Any]:
 
 
 def build_status_snapshot() -> dict[str, Any]:
-    """构造容器状态快照帧。"""
+    """构造容器状态快照帧。
+
+    采集异常（docker 卡死，collect_error 置位）→ 发显式 collect_error 形状，
+    Ctrl 侧将该机器全部容器置 FAILED（数据通路对账契约 C1）；正常 → 全量列表。
+    """
+
+    from .. import extensions
+
+    collect_error = extensions.status_cache.get_collect_error()
+    if collect_error:
+        logger.warning(
+            "build_status_snapshot: collect_error=%s (sending error shape)",
+            collect_error,
+        )
+        return {"type": "snapshot", "topic": "container_status", "payload": {"collect_error": collect_error}}
 
     payload = list_container_status()
     logger.debug(

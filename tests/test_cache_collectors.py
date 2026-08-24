@@ -108,6 +108,82 @@ def test_status_cache_applies_events_pending_ready_and_deleted(monkeypatch):
     assert cache.take_deleted() == ["c1", "creating-c", "restarting-c", "vanished-c"]
 
 
+def test_status_cache_noise_events_never_touch_cache():
+    # 数据通路对账契约 C2：噪声事件（attach/top/exec_*/resize/...）绝不落缓存
+    cache = ContainerStatusCache()
+    cache.update("c1", "online")
+    for ev in ["attach", "top", "exec_start", "exec_detach", "resize", "copy", "health_status", "update"]:
+        cache._apply_event({"status": ev, "Actor": {"Attributes": {"name": "c1"}}})
+    assert cache.get_state("c1")["status"] == "online"
+
+
+def test_status_cache_unrecognized_event_ignored_without_pollution():
+    # 数据通路对账契约 C2：不可识别事件 → 忽略（unknown 不再回填缓存）
+    cache = ContainerStatusCache()
+    cache.update("c1", "online")
+    cache._apply_event({"status": "some_future_event", "Actor": {"Attributes": {"name": "c1"}}})
+    assert cache.get_state("c1")["status"] == "online"
+
+
+def test_status_cache_state_events_still_update_cache():
+    cache = ContainerStatusCache()
+    cache.update("c1", "online")
+    cache._apply_event({"status": "die", "Actor": {"Attributes": {"name": "c1"}}})
+    assert cache.get_state("c1")["status"] == "offline"
+
+
+def test_status_cache_warm_up_reconcile_populates_cache(monkeypatch):
+    # 数据通路对账契约 C1：启动 warm-up 对账回填缓存 → 首帧快照非空
+    cache = ContainerStatusCache()
+    monkeypatch.setattr(
+        "FuxiYu_NodeKernel.docker_operates.status_cache.docker.from_env",
+        lambda: _DockerClient([
+            _Container("warm_c1", status="running"),
+            _Container("warm_c2", status="exited"),
+        ]),
+    )
+    cache._reconcile_once()
+    assert cache.get_state("warm_c1")["status"] == "online"
+    assert cache.get_state("warm_c2")["status"] == "offline"
+    assert cache.get_collect_error() is None
+
+
+def test_status_cache_reconcile_failure_sets_collect_error(monkeypatch):
+    # 数据通路对账契约 C1：docker 卡死 → collect_error 置位（快照发显式形状，非空 dict）
+    cache = ContainerStatusCache()
+    monkeypatch.setattr(
+        "FuxiYu_NodeKernel.docker_operates.status_cache.docker.from_env",
+        lambda: (_ for _ in ()).throw(RuntimeError("docker daemon down")),
+    )
+    cache._reconcile_once()
+    assert cache.get_collect_error() == "collect_failed"
+
+
+def test_status_cache_reconcile_recovers_clears_collect_error(monkeypatch):
+    cache = ContainerStatusCache()
+    monkeypatch.setattr(
+        "FuxiYu_NodeKernel.docker_operates.status_cache.docker.from_env",
+        lambda: (_ for _ in ()).throw(RuntimeError("down")),
+    )
+    cache._reconcile_once()
+    assert cache.get_collect_error() == "collect_failed"
+
+    monkeypatch.setattr(
+        "FuxiYu_NodeKernel.docker_operates.status_cache.docker.from_env",
+        lambda: _DockerClient([_Container("recover_c1", status="running")]),
+    )
+    cache._reconcile_once()
+    assert cache.get_collect_error() is None
+    assert cache.get_state("recover_c1")["status"] == "online"
+
+
+def test_wss_status_snapshot_sends_collect_error_shape(monkeypatch):
+    # 数据通路对账契约 C1：collect_error 置位时快照发显式形状（Ctrl 置 FAILED）
+    monkeypatch.setattr(extensions.status_cache, "get_collect_error", lambda: "collect_failed")
+    frame = wss.build_status_snapshot()
+    assert frame["payload"] == {"collect_error": "collect_failed"}
+
+
 def test_disk_usage_cache_collects_overlay_bind_and_snapshot(monkeypatch, tmp_path):
     bind_dir = tmp_path / "root"
     bind_dir.mkdir()
@@ -138,7 +214,7 @@ def test_disk_usage_cache_collects_overlay_bind_and_snapshot(monkeypatch, tmp_pa
     assert snap["machine_disk"]["total_gb"] == 100
 
 
-def test_disk_usage_cache_bind_cache_sources(monkeypatch, tmp_path):
+def test_disk_usage_cache_bind_cache_sources(tmp_path):
     bind_dir = tmp_path / "bind"
     bind_dir.mkdir()
     (bind_dir / "data.txt").write_text("hello", encoding="utf-8")

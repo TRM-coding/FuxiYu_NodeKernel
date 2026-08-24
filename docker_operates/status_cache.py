@@ -61,7 +61,7 @@ _DOCKER_STATUS_TO_APP = {
     "removing": ContainerStatus.OFFLINE.value,
 }
 
-# docker events 的 status 字段 → 应用状态字符串
+# docker events 的 status 字段 → 应用状态字符串（状态事件：改变容器状态）
 _EVENT_STATUS_MAP = {
     "start": ContainerStatus.ONLINE.value,
     "unpause": ContainerStatus.ONLINE.value,
@@ -75,15 +75,33 @@ _EVENT_STATUS_MAP = {
     "restart": ContainerStatus.RESTARTING.value,
 }
 
+# 噪声事件（不改变容器状态，绝不落缓存/event_log；数据通路对账契约 C2）
+_EVENT_NOISE = {
+    "attach", "detach", "top", "exec_create", "exec_start", "exec_detach",
+    "resize", "copy", "export", "import", "update", "rename", "commit",
+    "health_status",
+}
+
+# 采集失败标记：对账/采集异常时置位，WSS 快照以显式 collect_error 形状发出，
+# 绝不发空 dict（避免 Ctrl 误判容器全部消失；数据通路对账契约 C1）。
+COLLECT_ERROR_MARKER = "collect_failed"
+
 
 def _map_container_to_status(container) -> str:
-    """docker 容器对象（c.status）→ 应用状态字符串。"""
-    return _DOCKER_STATUS_TO_APP.get(getattr(container, 'status', '') or '', ContainerStatus.UNKNOWN.value)
+    """docker 容器对象（c.status）→ 应用状态字符串。
 
-
-def _map_event_to_status(event: dict) -> str:
-    """docker events 事件 → 应用状态字符串（事件是"发生了什么"，不是终态）。"""
-    return _EVENT_STATUS_MAP.get(str(event.get("status", "")), ContainerStatus.UNKNOWN.value)
+    docker c.status 枚举 7 项全映射；未映射（理论不可达）→ unknown + warning。
+    """
+    raw = str(getattr(container, 'status', '') or '')
+    status = _DOCKER_STATUS_TO_APP.get(raw)
+    if status is None:
+        logger.warning(
+            "status-cache: unmapped docker container status: name=%s status=%r",
+            getattr(container, 'name', '?'),
+            raw,
+        )
+        return ContainerStatus.UNKNOWN.value
+    return status
 
 
 class ContainerStatusCache:
@@ -91,6 +109,7 @@ class ContainerStatusCache:
         self._cache = {}    # name -> {"status": str, "updated_at": str, "ready_check"?}
         self._pending = {}  # name -> {"action", "status", "error_reason", "started_at"}
         self._deleted = []  # 对账发现的消失容器名（待 WSS pusher 取走推 delete 帧）
+        self._collect_error = None  # 采集失败标记（None=正常；非 None=快照发 collect_error 形状）
         self._lock = threading.Lock()
 
     def take_deleted(self) -> list[str]:
@@ -98,6 +117,11 @@ class ContainerStatusCache:
         with self._lock:
             deleted, self._deleted = self._deleted, []
         return deleted
+
+    def get_collect_error(self) -> str | None:
+        """读采集失败标记（None=采集正常；非 None=快照应发 collect_error 形状）。"""
+        with self._lock:
+            return self._collect_error
 
 
     ##################
@@ -197,13 +221,29 @@ class ContainerStatusCache:
             logger.info("status-cache update: name=%s %s -> %s", name, old, status)
 
     def _apply_event(self, event: dict) -> None:
-        """采集侧：单条 docker event → 状态缓存 + 事件轨迹（event_log）。"""
+        """采集侧：单条 docker event → 状态缓存 + 事件轨迹（event_log）。
+
+        事件按性质分类（数据通路对账契约 C2）：
+        - 状态事件（start/stop/die/...）→ 更新缓存 + 记录 event_log
+        - 噪声事件（attach/top/exec_*/...）→ 忽略，绝不落缓存/event_log
+        - 其余不可识别 → log warning + 忽略（unknown 不再回填缓存）
+        """
         actor = event.get("Actor") or {}
         attrs = actor.get("Attributes") or {}
         name = attrs.get("name")
         if not name:
             return
-        status = _map_event_to_status(event)
+        event_status = str(event.get("status", ""))
+        if event_status in _EVENT_NOISE:
+            return
+        status = _EVENT_STATUS_MAP.get(event_status)
+        if status is None:
+            logger.warning(
+                "status-cache: unrecognized docker event ignored: name=%s event=%s",
+                name,
+                event_status,
+            )
+            return
         keep_ready_check = False
         with self._lock:
             entry = self._cache.get(name)
@@ -213,13 +253,13 @@ class ContainerStatusCache:
             logger.debug("status-cache event kept ready_check: name=%s event=%s", name, event.get("status"))
         else:
             self.update(name, status)
-        # 事件轨迹：同步记录到 event_log（时间轴/告警/推送素材）
+        # 事件轨迹：状态事件同步记录到 event_log（时间轴/告警/推送素材）
         from .. import extensions
         extensions.event_log.record(
             name,
             event.get("status", ""),
             exit_code=attrs.get("exitCode"),
-            reason="oom" if event.get("status") == "oom" else None,
+            reason="oom" if event_status == "oom" else None,
         )
 
     def _apply_container(self, container) -> None:
@@ -282,6 +322,10 @@ class ContainerStatusCache:
     # 循环维护
 
     def start(self):
+        # warm-up（数据通路对账契约 C1）：先同步全量对账一次再起采集线程，
+        # 确保 WSS 首帧不是空快照；docker daemon 挂起时对账失败 → collect_error 置位，
+        # 由 pusher 以显式 collect_error 形状发出，绝不发空 dict。
+        self._reconcile_once()
         threading.Thread(target=self._events_loop, daemon=True, name="status-cache-events").start()
         threading.Thread(target=self._reconcile_loop, daemon=True, name="status-cache-reconcile").start()
         threading.Thread(target=self._probe_loop, daemon=True, name="status-cache-probe").start()
@@ -323,24 +367,36 @@ class ContainerStatusCache:
                 logger.warning("status-cache events loop interrupted (will retry): %s", e)
                 time.sleep(2)  # docker daemon 断连重试
 
+    def _reconcile_once(self) -> None:
+        """单次全量对账（采集兜底 + 幽灵容器感知 + collect_error 置位/清除）。
+
+        成功 → 清除 collect_error（快照恢复正常全量）；异常 → 置位
+        COLLECT_ERROR_MARKER（快照以显式 collect_error 形状发出，Ctrl 置 FAILED）。
+        """
+        try:
+            client = docker.from_env()
+            live = set()
+            for c in client.containers.list(all=True):
+                live.add(c.name)
+                self._apply_container(c)
+            # 消失检测（幽灵容器感知）：缓存/pending 有、docker 无 → 清缓存 + 入队 delete
+            with self._lock:
+                known = set(self._cache) | set(self._pending)
+            vanished = known - live
+            for name in sorted(vanished):
+                with self._lock:
+                    self._cache.pop(name, None)
+                    self._pending.pop(name, None)
+                    self._deleted.append(name)
+                logger.warning("status-cache reconcile: container %r vanished (delete queued)", name)
+            with self._lock:
+                self._collect_error = None
+        except Exception as e:
+            with self._lock:
+                self._collect_error = COLLECT_ERROR_MARKER
+            logger.warning("status-cache reconcile failed (collect_error set): %s", e)
+
     def _reconcile_loop(self):  # 兜底：定时全量对账（poll）
         while True:
             time.sleep(RECONCILE_INTERVAL)
-            try:
-                client = docker.from_env()
-                live = set()
-                for c in client.containers.list(all=True):
-                    live.add(c.name)
-                    self._apply_container(c)
-                # 消失检测（幽灵容器感知）：缓存/pending 有、docker 无 → 清缓存 + 入队 delete
-                with self._lock:
-                    known = set(self._cache) | set(self._pending)
-                vanished = known - live
-                for name in sorted(vanished):
-                    with self._lock:
-                        self._cache.pop(name, None)
-                        self._pending.pop(name, None)
-                        self._deleted.append(name)
-                    logger.warning("status-cache reconcile: container %r vanished (delete queued)", name)
-            except Exception as e:
-                logger.warning("status-cache reconcile failed (will retry): %s", e)
+            self._reconcile_once()
