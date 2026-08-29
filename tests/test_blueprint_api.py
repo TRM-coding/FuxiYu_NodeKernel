@@ -124,14 +124,20 @@ def test_create_container_success(client, monkeypatch):
 
 def test_create_container_with_image_build_reports_building(client, monkeypatch):
     calls = []
+    build_calls = []
 
-    def _stub(owner_name, cfg, public_key=None, build=None, on_status=None):
-        calls.append((owner_name, cfg, public_key, build, on_status))
-        if on_status:
-            on_status("creating")
+    extensions.status_cache.clear_pending(VALID_CFG["name"])
+
+    def _build_stub(build):
+        build_calls.append(build)
+        return build.image_tag
+
+    def _stub(owner_name, cfg, public_key=None):
+        calls.append((owner_name, cfg, public_key))
         return CreateContainerReturn("cid123", cfg.name)
 
     _patched_service(monkeypatch, "container_exists", lambda name: False)
+    _patched_service(monkeypatch, "build_image", _build_stub)
     _patched_service(monkeypatch, "create_container", _stub)
 
     payload = {
@@ -149,9 +155,56 @@ def test_create_container_with_image_build_reports_building(client, monkeypatch)
     assert body["success"] == 1
     assert body["container_status"] == "building"
     time.sleep(0.1)
+    assert len(build_calls) == 1
     assert len(calls) == 1
-    assert calls[0][3] is not None
-    assert callable(calls[0][4])
+    assert calls[0][1].image == payload["image_build"]["image_tag"]
+
+
+def test_create_container_build_failed_is_visible_without_delete(client, monkeypatch):
+    cfg = dict(VALID_CFG)
+    cfg["name"] = "build_failed_c"
+    extensions.status_cache.clear_pending(cfg["name"])
+
+    def _build_stub(build):
+        raise RuntimeError("docker build failed")
+
+    _patched_service(monkeypatch, "container_exists", lambda name: False)
+    _patched_service(monkeypatch, "build_image", _build_stub)
+
+    payload = {
+        "owner_name": "admin",
+        "config": cfg,
+        "image_build": {
+            "dockerfile_text": "FROM scratch\nRUN nope\n",
+            "image_tag": "fuxi/image-1:bad",
+        },
+    }
+    resp = client.post("/api/create_container", json=payload)
+
+    assert resp.status_code == 200
+    assert resp.json()["container_status"] == "building"
+    time.sleep(0.1)
+
+    status_resp = client.post(
+        "/api/container_status",
+        json={"config": {"container_name": cfg["name"]}},
+    )
+    body = status_resp.json()
+    assert body["success"] == 0
+    assert body["container_status"] == "failed"
+    assert body["failed_reason"] == "build_failed"
+    assert body["failed_detail"] == "docker build failed"
+
+    class _NoContainerClient:
+        class _Containers:
+            def list(self, all=True):
+                return []
+
+        containers = _Containers()
+
+    monkeypatch.setattr("FuxiYu_NodeKernel.docker_operates.status_cache.docker.from_env", lambda: _NoContainerClient())
+    extensions.status_cache._reconcile_once()
+    assert cfg["name"] not in extensions.status_cache.take_deleted()
 
 
 def test_create_container_existing_returns_409(client, monkeypatch):

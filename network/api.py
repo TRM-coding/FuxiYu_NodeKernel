@@ -39,6 +39,7 @@ from ..schemas import (
 )
 from ..services.container_service import (
     add_collaborator,
+    build_image,
     clean_mount,
     container_exists,
     create_container,
@@ -129,18 +130,28 @@ def create_container_api(message: CreateContainerMessage):
     initial_status = ContainerStatus.BUILDING.value if message.image_build is not None else ContainerStatus.CREATING.value
 
     def _bg_create(owner_name: str, cfg_obj):
-        def _mark_status(status: str) -> None:
-            extensions.status_cache.begin_action(cfg_obj.name, "create", status)
-
         try:
             logger.info("create_container background started: name=%s owner=%s", cfg_obj.name, owner_name)
-            extensions.status_cache.begin_action(cfg_obj.name, "create", initial_status)
+            if message.image_build is not None:
+                extensions.status_cache.begin_build(cfg_obj.name)
+                try:
+                    image_tag = build_image(message.image_build)
+                except Exception as e:
+                    logger.warning("create_container image build failed: name=%s error=%s", cfg_obj.name, e)
+                    extensions.status_cache.finish_build_failed(
+                        cfg_obj.name,
+                        failed_reason="build_failed",
+                        failed_detail=str(e),
+                    )
+                    return
+                cfg_obj.image = image_tag
+                extensions.status_cache.begin_action(cfg_obj.name, "create", ContainerStatus.CREATING.value)
+            else:
+                extensions.status_cache.begin_action(cfg_obj.name, "create", ContainerStatus.CREATING.value)
             result = create_container(
                 owner_name,
                 cfg_obj,
                 public_key=message.public_key,
-                build=message.image_build,
-                on_status=_mark_status,
             )
             logger.info(
                 "create_container service returned: name=%s container_id=%s",
@@ -151,7 +162,12 @@ def create_container_api(message: CreateContainerMessage):
             logger.info("create_container marked ready_check: name=%s", cfg_obj.name)
         except Exception as e:
             logger.warning("create_container error: %s", e)
-            extensions.status_cache.finish_action(cfg_obj.name, ContainerStatus.FAILED.value, str(e))
+            extensions.status_cache.finish_action(
+                cfg_obj.name,
+                ContainerStatus.FAILED.value,
+                failed_reason="create_failed",
+                failed_detail=str(e),
+            )
 
     try:
         threading.Thread(target=_bg_create, args=(message.owner_name, cfg), daemon=True).start()
@@ -179,15 +195,18 @@ def container_status_api(message: ContainerStatusMessage):
         state = list_container_status().get(container_name)
         if state is None:
             return {"success": 1, "container_status": ContainerStatus.UNKNOWN.value, "container_name": container_name}
-        if state["source"] == "pending":
-            if state["status"] == ContainerStatus.FAILED.value:
-                return {
-                    "success": 0,
-                    "container_status": ContainerStatus.FAILED.value,
-                    "container_name": container_name,
-                    "error": "operation failed",
-                    "error_reason": state.get("error_reason"),
-                }
+        if state["status"] == ContainerStatus.FAILED.value:
+            return {
+                "success": 0,
+                "container_status": ContainerStatus.FAILED.value,
+                "container_name": container_name,
+                "error": "operation failed",
+                "error_reason": state.get("failed_reason") or state.get("error_reason"),
+                "failed_reason": state.get("failed_reason") or state.get("error_reason"),
+                "failed_detail": state.get("failed_detail"),
+                "cache_updated_at": state.get("cache_updated_at"),
+            }
+        if state["source"] in {"pending", "build"}:
             return {"success": 1, "container_status": state["status"], "container_name": container_name}
         return {
             "success": 1,
@@ -292,10 +311,15 @@ def start_container_api(message: StartContainerMessage):
                 # 由 probe 循环验 :22 通过后才 ONLINE（无 init 容器 sshd 不自启的兜底）。
                 extensions.status_cache.mark_ready_check(name, status=ContainerStatus.STARTING.value)
             else:
-                extensions.status_cache.finish_action(name, ContainerStatus.FAILED.value, "start_failed")
+                extensions.status_cache.finish_action(name, ContainerStatus.FAILED.value, failed_reason="start_failed")
         except Exception as e:
             logger.warning("bg start error: %s", e)
-            extensions.status_cache.finish_action(name, ContainerStatus.FAILED.value, str(e))
+            extensions.status_cache.finish_action(
+                name,
+                ContainerStatus.FAILED.value,
+                failed_reason="start_failed",
+                failed_detail=str(e),
+            )
 
     threading.Thread(target=_bg_start, args=(container_name,), daemon=True).start()
     return {"success": 1, "container_status": ContainerStatus.STARTING.value, "container_name": container_name}
@@ -316,11 +340,16 @@ def stop_container_api(message: StopContainerMessage):
             extensions.status_cache.finish_action(
                 name,
                 ContainerStatus.OFFLINE.value if ok else ContainerStatus.FAILED.value,
-                None if ok else "stop_failed",
+                failed_reason=None if ok else "stop_failed",
             )
         except Exception as e:
             logger.warning("bg stop error: %s", e)
-            extensions.status_cache.finish_action(name, ContainerStatus.FAILED.value, str(e))
+            extensions.status_cache.finish_action(
+                name,
+                ContainerStatus.FAILED.value,
+                failed_reason="stop_failed",
+                failed_detail=str(e),
+            )
 
     threading.Thread(target=_bg_stop, args=(container_name,), daemon=True).start()
     return {"success": 1, "container_status": ContainerStatus.STOPPING.value, "container_name": container_name}
@@ -341,10 +370,15 @@ def restart_container_api(message: RestartContainerMessage):
             if ok:
                 extensions.status_cache.mark_ready_check(name, status=ContainerStatus.RESTARTING.value)
             else:
-                extensions.status_cache.finish_action(name, ContainerStatus.FAILED.value, "restart_failed")
+                extensions.status_cache.finish_action(name, ContainerStatus.FAILED.value, failed_reason="restart_failed")
         except Exception as e:
             logger.warning("bg restart error: %s", e)
-            extensions.status_cache.finish_action(name, ContainerStatus.FAILED.value, str(e))
+            extensions.status_cache.finish_action(
+                name,
+                ContainerStatus.FAILED.value,
+                failed_reason="restart_failed",
+                failed_detail=str(e),
+            )
 
     threading.Thread(target=_bg_restart, args=(container_name,), daemon=True).start()
     return {"success": 1, "container_status": ContainerStatus.RESTARTING.value, "container_name": container_name}
@@ -419,10 +453,15 @@ def pause_container_api(message: PauseContainerMessage):
                     ContainerStatus.PAUSED.value if act == "pause" else ContainerStatus.ONLINE.value,
                 )
             else:
-                extensions.status_cache.finish_action(name, ContainerStatus.FAILED.value, f"{act}_failed")
+                extensions.status_cache.finish_action(name, ContainerStatus.FAILED.value, failed_reason=f"{act}_failed")
         except Exception as e:
             logger.warning("bg pause error for %s: %s", name, e)
-            extensions.status_cache.finish_action(name, ContainerStatus.FAILED.value, str(e))
+            extensions.status_cache.finish_action(
+                name,
+                ContainerStatus.FAILED.value,
+                failed_reason=f"{act}_failed",
+                failed_detail=str(e),
+            )
 
     threading.Thread(target=_bg_pause, args=(container_name, action), daemon=True).start()
     return {

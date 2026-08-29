@@ -96,19 +96,20 @@ def test_status_cache_applies_events_pending_ready_and_deleted(monkeypatch):
             cache.update(name, "online")
     assert cache.get_state("creating-c")["status"] == "online"
 
-    cache.begin_action("vanished-c", "stop", "stopping")
+    cache.begin_action("pending-c", "create", "creating")
+    cache.begin_build("building-c")
     cache._cache["live-c"] = {
         "status": "online",
         "updated_at": dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S"),
     }
-    cache._apply_container(_Container("live-c", status="running"))
-    live = {"live-c"}
-    known = set(cache._cache) | set(cache._pending)
-    for name in sorted(known - live):
-        cache._cache.pop(name, None)
-        cache._pending.pop(name, None)
-        cache._deleted.append(name)
-    assert cache.take_deleted() == ["c1", "creating-c", "restarting-c", "vanished-c"]
+    monkeypatch.setattr(
+        "FuxiYu_NodeKernel.docker_operates.status_cache.docker.from_env",
+        lambda: _DockerClient([_Container("live-c", status="running")]),
+    )
+    cache._reconcile_once()
+    assert cache.take_deleted() == ["c1", "creating-c", "restarting-c"]
+    assert cache.get_state("pending-c")["status"] == "creating"
+    assert cache.get_state("building-c")["status"] == "building"
 
 
 def test_status_cache_noise_events_never_touch_cache():
@@ -194,7 +195,9 @@ def test_probe_marks_failed_when_sshd_missing(monkeypatch):
 
     cache._probe_ready_checks_once()
 
-    assert cache.get_state("c1")["status"] == "failed"
+    state = cache.get_state("c1")
+    assert state["status"] == "failed"
+    assert state["failed_reason"] == "sshd_not_installed"
     assert cache.get("c1").get("ready_check") is not True
 
 

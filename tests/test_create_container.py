@@ -5,9 +5,10 @@
 """
 import os
 
+import docker
 import pytest
 
-from FuxiYu_NodeKernel.services.container_service import create_container, CreateContainerReturn
+from FuxiYu_NodeKernel.services.container_service import build_image, create_container, CreateContainerReturn
 from FuxiYu_NodeKernel.utils.Container import Container
 from FuxiYu_NodeKernel import extensions
 
@@ -61,17 +62,37 @@ def test_error_path_container_exist(monkeypatch):
         create_container("admin", Container.Config_info(**VALID_CFG))
 
 
-def test_build_path_uses_prepared_image(monkeypatch):
-    """build payload 存在时，先 build 再 run，并只做 sshd 最终守门。"""
+def test_build_image_builds_missing_tag(monkeypatch):
+    """build_image: tag 不存在时临时写 Dockerfile 并 build。"""
     build_calls = []
-    run_calls = []
-    status_calls = []
-    created = []
 
     class _Images:
+        def get(self, tag):
+            raise docker.errors.ImageNotFound("not found")
+
         def build(self, **kwargs):
             build_calls.append(kwargs)
             return ([], [])
+
+    class _BuildAwareClient:
+        def __init__(self):
+            self.images = _Images()
+
+    monkeypatch.setattr(extensions, "docker_client", _BuildAwareClient())
+    build = {
+        "dockerfile_text": "FROM ubuntu:22.04\nRUN echo hello\n",
+        "image_tag": "fuxi/image-7:20260826T000000Z",
+    }
+
+    assert build_image(build) == build["image_tag"]
+    assert build_calls and build_calls[0]["tag"] == build["image_tag"]
+    assert build_calls[0]["dockerfile"] == "Dockerfile"
+
+
+def test_create_container_uses_prepared_image_and_only_runs_sshd_gate(monkeypatch):
+    """create_container 只接收已准备好的 image tag，不关心 Dockerfile/build。"""
+    run_calls = []
+    created = []
 
     class _BuildAwareContainers(FakeContainers):
         def run(self, *a, **k):
@@ -80,33 +101,17 @@ def test_build_path_uses_prepared_image(monkeypatch):
             created.append(container)
             return container
 
-    class _BuildAwareClient:
-        def __init__(self):
-            self.containers = _BuildAwareContainers()
-            self.images = _Images()
-
-    monkeypatch.setattr(extensions, "docker_client", _BuildAwareClient())
+    monkeypatch.setattr(extensions, "docker_client", FakeDockerClient(_BuildAwareContainers()))
     _patch_fs(monkeypatch)
     monkeypatch.setenv("NODE_CONTAINERS_BASE", "/tmp")
 
-    build = {
-        "dockerfile_text": "FROM ubuntu:22.04\nRUN echo hello\n",
-        "image_tag": "fuxi/image-7:20260826T000000Z",
-    }
-    result = create_container(
-        "admin",
-        Container.Config_info(**VALID_CFG),
-        build=build,
-        on_status=status_calls.append,
-    )
+    cfg_data = dict(VALID_CFG)
+    cfg_data["image"] = "fuxi/image-7:20260826T000000Z"
+    result = create_container("admin", Container.Config_info(**cfg_data))
 
     assert isinstance(result, CreateContainerReturn)
-    assert build_calls and build_calls[0]["tag"] == build["image_tag"]
-    assert build_calls[0]["dockerfile"] == "Dockerfile"
-    assert run_calls and run_calls[0][0][0] == build["image_tag"]
+    assert run_calls and run_calls[0][0][0] == cfg_data["image"]
     assert run_calls[0][1]["ports"] == {"22/tcp": VALID_CFG["port"]}
-    assert status_calls == ["creating"]
-
     exec_commands = [
         call[0][2] for call in created[0].exec_calls
         if isinstance(call[0], list) and len(call[0]) >= 3
@@ -117,6 +122,35 @@ def test_build_path_uses_prepared_image(monkeypatch):
     assert "mkdir -p /run/sshd" in joined
     assert "ssh-keygen -A" in joined
     assert "/usr/sbin/sshd" in joined
+
+
+def test_build_image_uses_cached_image_tag(monkeypatch):
+    """同 tag 已存在时命中 Node 本地缓存：跳过 build，直接返回 tag。"""
+    build_calls = []
+
+    class _Images:
+        def get(self, tag):
+            return object()
+
+        def build(self, **kwargs):
+            build_calls.append(kwargs)
+            return ([], [])
+
+    class _Client:
+        def __init__(self):
+            self.images = _Images()
+
+    monkeypatch.setattr(extensions, "docker_client", _Client())
+
+    build = {
+        "dockerfile_text": "FROM ubuntu:22.04\nRUN echo hello\n",
+        "image_tag": "fuxi/image-7:20260826T010203Z",
+    }
+
+    result = build_image(build)
+
+    assert result == build["image_tag"]
+    assert build_calls == []
 
 
 def test_no_build_path_does_not_install_sshd_in_node(monkeypatch):

@@ -39,9 +39,9 @@ _SSHD_READY_CMD = (
 )
 
 # 转换态超时兜底（秒）：后台任务异常退出时防止永久卡 ing。
-# 必须宽于正常流程耗时上限（创建含镜像 pull + sshd 安装，可达数十分钟），按操作分级：
+# 必须宽于正常流程耗时上限（创建含镜像 build + sshd gate，可达数十分钟），按操作分级：
 _ACTION_TTL = {
-    "create": 1800,   # 镜像 pull + apt 安装 sshd，最长达 30 分钟
+    "create": 1800,   # 镜像构建/创建/sshd gate，最长 30 分钟
     "start": 300,
     "stop": 300,
     "restart": 300,
@@ -107,7 +107,8 @@ def _map_container_to_status(container) -> str:
 class ContainerStatusCache:
     def __init__(self):
         self._cache = {}    # name -> {"status": str, "updated_at": str, "ready_check"?}
-        self._pending = {}  # name -> {"action", "status", "error_reason", "started_at"}
+        self._pending = {}  # name -> {"action", "status", "failed_reason", "failed_detail", "started_at"}
+        self._build_pending = {}  # name -> build 阶段状态；不参与 vanished 检测
         self._deleted = []  # 对账发现的消失容器名（待 WSS pusher 取走推 delete 帧）
         self._collect_error = None  # 采集失败标记（None=正常；非 None=快照发 collect_error 形状）
         self._lock = threading.Lock()
@@ -127,22 +128,79 @@ class ContainerStatusCache:
     ##################
     # 转换态管理
 
+    def begin_build(self, name: str) -> None:
+        """标记镜像构建开始。
+
+        build 阶段还没有 Docker 容器对象，因此只进入读面，不参与 reconcile
+        的 known 集合，避免构建失败被误判为 vanished/delete。
+        """
+        with self._lock:
+            self._build_pending[name] = {
+                "action": "build",
+                "status": ContainerStatus.BUILDING.value,
+                "failed_reason": None,
+                "failed_detail": None,
+                "started_at": datetime.datetime.utcnow(),
+                "ttl": _ACTION_TTL.get("create", PENDING_TTL_SEC),
+            }
+        logger.info("status-cache begin_build: name=%s status=%s", name, ContainerStatus.BUILDING.value)
+
+    def finish_build_failed(
+        self,
+        name: str,
+        failed_reason: str | None = None,
+        failed_detail: str | None = None,
+    ) -> None:
+        """build 阶段失败：保留 failed 给读面，但不参与 vanished。"""
+        with self._lock:
+            entry = self._build_pending.get(name)
+            if entry is None:
+                self._build_pending[name] = {
+                    "action": "build",
+                    "started_at": datetime.datetime.utcnow(),
+                    "ttl": _ACTION_TTL.get("create", PENDING_TTL_SEC),
+                }
+                entry = self._build_pending[name]
+            entry["status"] = ContainerStatus.FAILED.value
+            entry["failed_reason"] = failed_reason
+            entry["failed_detail"] = failed_detail
+        logger.warning(
+            "status-cache finish_build_failed: name=%s reason=%s detail=%s",
+            name,
+            failed_reason,
+            failed_detail,
+        )
+
+    def clear_build(self, name: str) -> None:
+        """清理 build 阶段读面状态。"""
+        with self._lock:
+            self._build_pending.pop(name, None)
+        logger.info("status-cache clear_build: name=%s", name)
+
     def begin_action(self, name: str, action: str, ing_status: str) -> None:
         """标记转换开始：等待返回值期间保持 ing 状态（creating/starting/stopping...）。
 
         *ing_status* 为等待阶段对外暴露的状态（如 'starting'）。
         """
         with self._lock:
+            self._build_pending.pop(name, None)
             self._pending[name] = {
                 "action": action,
                 "status": ing_status,
-                "error_reason": None,
+                "failed_reason": None,
+                "failed_detail": None,
                 "started_at": datetime.datetime.utcnow(),
                 "ttl": _ACTION_TTL.get(action, PENDING_TTL_SEC),
             }
         logger.info("status-cache begin_action: name=%s action=%s status=%s", name, action, ing_status)
 
-    def finish_action(self, name: str, status: str | None, error_reason: str | None = None) -> None:
+    def finish_action(
+        self,
+        name: str,
+        status: str | None,
+        failed_reason: str | None = None,
+        failed_detail: str | None = None,
+    ) -> None:
         """转换结束，按返回值更新状态。
 
         - status=None：仅清 pending（创建完成场景：端点 miss 后走实时+sshd 检查回填）
@@ -154,8 +212,14 @@ class ContainerStatusCache:
                 entry = self._pending.get(name)
                 if entry is not None:
                     entry["status"] = ContainerStatus.FAILED.value
-                    entry["error_reason"] = error_reason
-            logger.warning("status-cache finish_action failed: name=%s reason=%s", name, error_reason)
+                    entry["failed_reason"] = failed_reason
+                    entry["failed_detail"] = failed_detail
+            logger.warning(
+                "status-cache finish_action failed: name=%s reason=%s detail=%s",
+                name,
+                failed_reason,
+                failed_detail,
+            )
             return
         with self._lock:
             self._pending.pop(name, None)
@@ -167,6 +231,7 @@ class ContainerStatusCache:
         """直接清除 pending（如删除容器后清理遗留的 failed 标记）。"""
         with self._lock:
             self._pending.pop(name, None)
+            self._build_pending.pop(name, None)
         logger.info("status-cache clear_pending: name=%s", name)
 
     def mark_ready_check(self, name: str, status: str = ContainerStatus.STARTING.value) -> None:
@@ -202,7 +267,29 @@ class ContainerStatusCache:
                         entry.get("ttl", PENDING_TTL_SEC),
                     )
                     return {"action": entry["action"], "status": ContainerStatus.FAILED.value,
-                            "error_reason": "operation_timeout", "timed_out": True}
+                            "failed_reason": "operation_timeout",
+                            "failed_detail": f"operation timed out after {entry.get('ttl', PENDING_TTL_SEC)} seconds",
+                            "timed_out": True}
+            return dict(entry)
+
+    def get_build_pending(self, name: str) -> dict | None:
+        """读 build 转换态；超时后转 failed，但不进入 vanished 候选。"""
+        with self._lock:
+            entry = self._build_pending.get(name)
+            if entry is None:
+                return None
+            if entry["status"] != ContainerStatus.FAILED.value:
+                age = (datetime.datetime.utcnow() - entry["started_at"]).total_seconds()
+                if age > entry.get("ttl", PENDING_TTL_SEC):
+                    entry["status"] = ContainerStatus.FAILED.value
+                    entry["failed_reason"] = "build_timeout"
+                    entry["failed_detail"] = f"image build timed out after {entry.get('ttl', PENDING_TTL_SEC)} seconds"
+                    logger.warning(
+                        "status-cache build timeout: name=%s age=%s ttl=%s",
+                        name,
+                        round(age, 3),
+                        entry.get("ttl", PENDING_TTL_SEC),
+                    )
             return dict(entry)
 
     ##################
@@ -314,10 +401,21 @@ class ContainerStatusCache:
         pending = self.get_pending(name)
         if pending is not None:
             return {"source": "pending", "status": pending["status"],
-                    "error_reason": pending.get("error_reason")}
+                    "failed_reason": pending.get("failed_reason"),
+                    "failed_detail": pending.get("failed_detail"),
+                    "error_reason": pending.get("failed_reason")}
+        build_pending = self.get_build_pending(name)
+        if build_pending is not None:
+            return {"source": "build", "status": build_pending["status"],
+                    "failed_reason": build_pending.get("failed_reason"),
+                    "failed_detail": build_pending.get("failed_detail"),
+                    "error_reason": build_pending.get("failed_reason")}
         cached = self.get(name)
         if cached is not None:
             return {"source": "cache", "status": cached["status"],
+                    "failed_reason": cached.get("failed_reason"),
+                    "failed_detail": cached.get("failed_detail"),
+                    "error_reason": cached.get("failed_reason"),
                     "cache_updated_at": cached["updated_at"]}
         return {"source": "miss"}
 
@@ -332,7 +430,7 @@ class ContainerStatusCache:
         复用 get_state 语义（含 pending 超时兜底），缓存无条目的容器不进列表。
         """
         with self._lock:
-            names = set(self._cache) | set(self._pending)
+            names = set(self._cache) | set(self._pending) | set(self._build_pending)
         result = {}
         for name in names:
             st = self.get_state(name)
@@ -434,7 +532,13 @@ class ContainerStatusCache:
                             "status-cache: sshd missing in %s; marking FAILED (manual handling)",
                             name,
                         )
-                        self.update(name, ContainerStatus.FAILED.value)
+                        with self._lock:
+                            self._cache[name] = {
+                                "status": ContainerStatus.FAILED.value,
+                                "failed_reason": "sshd_not_installed",
+                                "failed_detail": "container image does not provide /usr/sbin/sshd",
+                                "updated_at": datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%S'),
+                            }
                     else:
                         logger.warning("status-cache sshd probe not ready, trying to start sshd: name=%s", name)
         except Exception as e:
@@ -467,9 +571,10 @@ class ContainerStatusCache:
             for c in client.containers.list(all=True):
                 live.add(c.name)
                 self._apply_container(c)
-            # 消失检测（幽灵容器感知）：缓存/pending 有、docker 无 → 清缓存 + 入队 delete
+            # 消失检测（幽灵容器感知）：只有缓存里出现过的容器才算“已产生过”。
+            # build/pending 是过渡读面，不是 Docker 容器对象存在的证据，不能触发 delete。
             with self._lock:
-                known = set(self._cache) | set(self._pending)
+                known = set(self._cache)
             vanished = known - live
             for name in sorted(vanished):
                 with self._lock:

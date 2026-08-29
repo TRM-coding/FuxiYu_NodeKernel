@@ -39,8 +39,12 @@ def _build_spec_value(build, key: str, default=None):
     return default
 
 
-def _build_image_from_context(build) -> str:
-    """按 Ctrl 发来的最终 Dockerfile 临时构建镜像。"""
+def build_image(build) -> str:
+    """按 Ctrl 发来的最终 Dockerfile 临时构建镜像。
+
+    build 阶段只负责让 image_tag 在本机 Docker 中可用；命中同名 tag
+    直接返回，不产生容器对象，也不写容器状态 cache。
+    """
 
     dockerfile_text = _build_spec_value(build, "dockerfile_text", "") or ""
     image_tag = _build_spec_value(build, "image_tag", "") or ""
@@ -51,6 +55,13 @@ def _build_image_from_context(build) -> str:
 
     if extensions.docker_client is None:
         extensions.init_docker()
+
+    try:
+        extensions.docker_client.images.get(image_tag)
+        logger.info("Image build cache hit: tag=%s", image_tag)
+        return image_tag
+    except docker.errors.ImageNotFound:
+        logger.info("Image build cache miss: tag=%s", image_tag)
 
     with tempfile.TemporaryDirectory(prefix="fuxi-build-") as tmpdir:
         tmp_path = Path(tmpdir)
@@ -88,8 +99,6 @@ def create_container(
     owner_name: str,
     config: Container.Config_info,
     public_key: str | None = None,
-    build=None,
-    on_status=None,
 ) -> CreateContainerReturn:
     if extensions.docker_client is None:
         extensions.init_docker()
@@ -171,17 +180,11 @@ def create_container(
         # good, proceed to create with explicit name
         pass
 
-    image_name = config.image
-    if build is not None:
-        image_name = _build_image_from_context(build)
-        if on_status is not None:
-            on_status(ContainerStatus.CREATING.value)
-
     # Use docker.types.Mount for a more reliable bind mount
     mounts = [Mount(target="/root", source=host_root_mount, type="bind", read_only=False)]
     print(f"DEBUG: Using mounts={mounts}")
     container = extensions.docker_client.containers.run(
-        image_name,
+        config.image,
         "tail -f /dev/null",   # 保证容器一直运行
         detach=True,
         tty=True,
@@ -233,21 +236,15 @@ def create_container(
             raise RuntimeError(f"cmd failed: {cmd}\nexit={exit_code}\noutput={out}")
         
         return r
-    # 下面的命令执行可能会比较慢，所以设置了较长的超时时间（120秒），
-    # 以避免某些环境下 apt-get 卡死导致的问题。apt-get 有时会因为签名/证书
-    # 问题失败（例如镜像环境或时间不同步），因此在失败时尝试一次回退策略，
-    # 但不要因为安装失败就删除已创建的容器——只记录并继续。
-
     # 初始密码为 owner_name + "123"，用户可以登录后再改密码（也可以直接提供公钥登录）
     _run(container, f"echo 'root:{owner_name}123' | chpasswd")
     try:
         _sanitizer.validate_username(owner_name)
     except Exception as e:
         raise RuntimeError(f"unsafe owner_name: {e}")
-    # 使得公钥可选 （如果提供了公钥则安装，否则只用密码登录）
-    # 排在 sshd 安装之前：密码/公钥先就位，sshd 安装与启动作为最后一道守门——
-    # create 完成 ⟹ sshd 就绪；安装失败则容器保持未完成态，由 probe 自愈链标记
-    # FAILED（未装 sshd → 终态，人工处置），不会留下"sshd 已起但 key 未装"的半成品。
+    # 使得公钥可选（如果提供了公钥则写入，否则只用密码登录）。
+    # 密码/公钥先就位，sshd 启动与 :22 探活作为最后一道守门；
+    # sshd 安装责任已前移到镜像构建注入片段。
     if public_key:
         try:
             # Use base64 to avoid shell-quoting issues when writing the key

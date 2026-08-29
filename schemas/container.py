@@ -79,6 +79,8 @@ class ContainerStatusResponse(ContainerOperationAcceptedResponse):
     cache_updated_at: str | None = None
     error: str | None = None
     error_reason: str | None = None
+    failed_reason: str | None = None
+    failed_detail: str | None = None
 
 
 #####################
