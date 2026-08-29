@@ -61,6 +61,127 @@ def test_error_path_container_exist(monkeypatch):
         create_container("admin", Container.Config_info(**VALID_CFG))
 
 
+def test_build_path_uses_prepared_image(monkeypatch):
+    """build payload 存在时，先 build 再 run，并只做 sshd 最终守门。"""
+    build_calls = []
+    run_calls = []
+    status_calls = []
+    created = []
+
+    class _Images:
+        def build(self, **kwargs):
+            build_calls.append(kwargs)
+            return ([], [])
+
+    class _BuildAwareContainers(FakeContainers):
+        def run(self, *a, **k):
+            run_calls.append((a, k))
+            container = FakeContainer(name=k.get("name", "c1"))
+            created.append(container)
+            return container
+
+    class _BuildAwareClient:
+        def __init__(self):
+            self.containers = _BuildAwareContainers()
+            self.images = _Images()
+
+    monkeypatch.setattr(extensions, "docker_client", _BuildAwareClient())
+    _patch_fs(monkeypatch)
+    monkeypatch.setattr("FuxiYu_NodeKernel.services.container_service.subprocess.run", lambda *a, **k: None)
+    monkeypatch.setenv("NODE_CONTAINERS_BASE", "/tmp")
+
+    build = {
+        "dockerfile_text": "FROM ubuntu:22.04\nRUN echo hello\n",
+        "pre_build": "echo pre-build",
+        "image_tag": "fuxi/image-7:20260826T000000Z",
+    }
+    result = create_container(
+        "admin",
+        Container.Config_info(**VALID_CFG),
+        build=build,
+        on_status=status_calls.append,
+    )
+
+    assert isinstance(result, CreateContainerReturn)
+    assert build_calls and build_calls[0]["tag"] == build["image_tag"]
+    assert build_calls[0]["dockerfile"] == "Dockerfile"
+    assert run_calls and run_calls[0][0][0] == build["image_tag"]
+    assert run_calls[0][1]["ports"] == {"22/tcp": VALID_CFG["port"]}
+    assert status_calls == ["creating"]
+
+    exec_commands = [
+        call[0][2] for call in created[0].exec_calls
+        if isinstance(call[0], list) and len(call[0]) >= 3
+    ]
+    joined = "\n".join(exec_commands)
+    assert "apt-get update" not in joined
+    assert "apt-get install" not in joined
+    assert "mkdir -p /run/sshd" in joined
+    assert "ssh-keygen -A" in joined
+    assert "/usr/sbin/sshd" in joined
+
+
+def test_no_build_path_does_not_install_sshd_in_node(monkeypatch):
+    """旧现场安装链路清退：没有 build payload 时也不再由 Node apt 安装 sshd。"""
+    created = []
+
+    class _Containers(FakeContainers):
+        def run(self, *a, **k):
+            container = FakeContainer(name=k.get("name", "c1"))
+            created.append(container)
+            return container
+
+    monkeypatch.setattr(extensions, "docker_client", FakeDockerClient(_Containers()))
+    _patch_fs(monkeypatch)
+    monkeypatch.setenv("NODE_CONTAINERS_BASE", "/tmp")
+
+    result = create_container("admin", Container.Config_info(**VALID_CFG))
+
+    assert isinstance(result, CreateContainerReturn)
+    exec_commands = [
+        call[0][2] for call in created[0].exec_calls
+        if isinstance(call[0], list) and len(call[0]) >= 3
+    ]
+    joined = "\n".join(exec_commands)
+    assert "apt-get update" not in joined
+    assert "apt-get install" not in joined
+    assert "mkdir -p /run/sshd" in joined
+    assert "ssh-keygen -A" in joined
+    assert "/usr/sbin/sshd" in joined
+
+
+def test_create_container_fails_when_sshd_gate_fails(monkeypatch):
+    """22/sshd 是创建终末门禁：启动失败必须让 create_container 失败。"""
+
+    class _SshdFailContainer(FakeContainer):
+        def exec_run(self, cmd, **kw):
+            if isinstance(cmd, list) and len(cmd) >= 3 and "/usr/sbin/sshd" in cmd[2]:
+                self.exec_calls.append((cmd, kw))
+
+                class _Result:
+                    exit_code = 1
+                    output = b"sshd missing"
+
+                    def __getitem__(self, idx: int):
+                        if idx == 0:
+                            return self.exit_code
+                        raise IndexError(idx)
+
+                return _Result()
+            return super().exec_run(cmd, **kw)
+
+    class _Containers(FakeContainers):
+        def run(self, *a, **k):
+            return _SshdFailContainer(name=k.get("name", "c1"))
+
+    monkeypatch.setattr(extensions, "docker_client", FakeDockerClient(_Containers()))
+    _patch_fs(monkeypatch)
+    monkeypatch.setenv("NODE_CONTAINERS_BASE", "/tmp")
+
+    with pytest.raises(RuntimeError, match="sshd gate failed"):
+        create_container("admin", Container.Config_info(**VALID_CFG))
+
+
 @pytest.mark.docker
 def test_happy_path(monkeypatch, tmp_path):
     """真实 docker：创建 → 校验返回 → 校验容器参数 → 校验 sshd 守门 → 清理。"""

@@ -99,7 +99,7 @@ def _model_data(model) -> dict:
 def create_container_api(message: CreateContainerMessage):
     """创建容器请求。
 
-    容器创建耗时较长，接口只负责接收命令并登记 creating 状态，
+    容器创建耗时较长，接口只负责接收命令并登记 building/creating 状态，
     具体 Docker 操作放入后台线程执行。
     """
 
@@ -126,17 +126,28 @@ def create_container_api(message: CreateContainerMessage):
             content={"success": 0, "error": f"docker check failed: {e}", "error_reason": "docker_check_failed"},
         )
 
+    initial_status = ContainerStatus.BUILDING.value if message.image_build is not None else ContainerStatus.CREATING.value
+
     def _bg_create(owner_name: str, cfg_obj):
+        def _mark_status(status: str) -> None:
+            extensions.status_cache.begin_action(cfg_obj.name, "create", status)
+
         try:
             logger.info("create_container background started: name=%s owner=%s", cfg_obj.name, owner_name)
-            extensions.status_cache.begin_action(cfg_obj.name, "create", ContainerStatus.CREATING.value)
-            result = create_container(owner_name, cfg_obj, public_key=message.public_key)
+            extensions.status_cache.begin_action(cfg_obj.name, "create", initial_status)
+            result = create_container(
+                owner_name,
+                cfg_obj,
+                public_key=message.public_key,
+                build=message.image_build,
+                on_status=_mark_status,
+            )
             logger.info(
                 "create_container service returned: name=%s container_id=%s",
                 result.container_name,
                 result.container_id,
             )
-            extensions.status_cache.mark_ready_check(cfg_obj.name)
+            extensions.status_cache.mark_ready_check(cfg_obj.name, status=ContainerStatus.CREATING.value)
             logger.info("create_container marked ready_check: name=%s", cfg_obj.name)
         except Exception as e:
             logger.warning("create_container error: %s", e)
@@ -150,7 +161,7 @@ def create_container_api(message: CreateContainerMessage):
             content={"success": 0, "error": str(e), "error_reason": "background_thread_failed"},
         )
 
-    return {"success": 1, "container_status": ContainerStatus.CREATING.value, "container_name": cfg.name}
+    return {"success": 1, "container_status": initial_status, "container_name": cfg.name}
 
 
 @router.post("/container_status", response_model=ContainerStatusResponse)

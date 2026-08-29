@@ -102,8 +102,8 @@ def test_node_self_signed_certificate_is_valid_pin_anchor(monkeypatch, tmp_path)
 def test_create_container_success(client, monkeypatch):
     calls = []
 
-    def _stub(owner_name, cfg, public_key=None):
-        calls.append((owner_name, cfg, public_key))
+    def _stub(owner_name, cfg, public_key=None, build=None, on_status=None):
+        calls.append((owner_name, cfg, public_key, build, on_status))
         return CreateContainerReturn("cid123", cfg.name)
 
     _patched_service(monkeypatch, "container_exists", lambda name: False)
@@ -120,6 +120,39 @@ def test_create_container_success(client, monkeypatch):
     assert len(calls) == 1
     assert calls[0][0] == "admin"
     assert calls[0][1].name == "c1"
+
+
+def test_create_container_with_image_build_reports_building(client, monkeypatch):
+    calls = []
+
+    def _stub(owner_name, cfg, public_key=None, build=None, on_status=None):
+        calls.append((owner_name, cfg, public_key, build, on_status))
+        if on_status:
+            on_status("creating")
+        return CreateContainerReturn("cid123", cfg.name)
+
+    _patched_service(monkeypatch, "container_exists", lambda name: False)
+    _patched_service(monkeypatch, "create_container", _stub)
+
+    payload = {
+        "owner_name": "admin",
+        "config": VALID_CFG,
+        "image_build": {
+            "dockerfile_text": "FROM ubuntu:22.04\nRUN echo ok\n",
+            "pre_build": "echo pre-build",
+            "image_tag": "fuxi/image-1:20260826T000000Z",
+        },
+    }
+    resp = client.post("/api/create_container", json=payload)
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["success"] == 1
+    assert body["container_status"] == "building"
+    time.sleep(0.1)
+    assert len(calls) == 1
+    assert calls[0][3] is not None
+    assert callable(calls[0][4])
 
 
 def test_create_container_existing_returns_409(client, monkeypatch):

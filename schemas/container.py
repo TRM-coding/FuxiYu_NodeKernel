@@ -6,6 +6,7 @@ from .common import EmptyConfig, SuccessResponse
 
 
 ContainerStatus = Literal[
+    "building",
     "creating",
     "starting",
     "stopping",
@@ -35,6 +36,12 @@ class ContainerConfig(BaseModel):
     image: str
 
 
+class ImageBuildConfig(BaseModel):
+    dockerfile_text: str = Field(default="", description="Ctrl 生成的最终 Dockerfile 文本。")
+    pre_build: str | None = Field(default=None, description="独立 pre_build.sh 内容。")
+    image_tag: str = Field(default="", description="最终 build 后用于 run 的镜像 tag。")
+
+
 class ContainerNameConfig(BaseModel):
     container_name: str | None = None
     name: str | None = Field(default=None, description="Backward-compatible alias for container_name")
@@ -53,10 +60,11 @@ class CreateContainerMessage(BaseModel):
     owner_name: str
     config: ContainerConfig
     public_key: str | None = Field(default=None, description="Optional SSH public key installed into root authorized_keys")
+    image_build: ImageBuildConfig | None = None
 
 
 class CreateContainerResponse(SuccessResponse):
-    container_status: Literal["creating"]
+    container_status: Literal["building", "creating"]
     container_name: str
 
 

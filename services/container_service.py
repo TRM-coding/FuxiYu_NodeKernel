@@ -1,7 +1,6 @@
 # 与他们相关的参数有必要被严格验证和过滤，或者改用更安全的方式（如直接传递参数列表而不是 shell 命令字符串）
 
 from ..constant import *
-from ..config import KeyConfig, NodeProxyConfig
 from ..utils.Container import Container
 from .. import extensions
 # from ..constant import *
@@ -20,12 +19,56 @@ import time
 import logging
 from datetime import datetime
 import shutil
+import tempfile
+from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
 
 
 
+
+
+def _build_spec_value(build, key: str, default=None):
+    if build is None:
+        return default
+    if hasattr(build, key):
+        return getattr(build, key)
+    if isinstance(build, dict):
+        return build.get(key, default)
+    return default
+
+
+def _build_image_from_context(build) -> str:
+    """按 Ctrl 发来的最终 Dockerfile / pre_build.sh 临时构建镜像。"""
+
+    dockerfile_text = _build_spec_value(build, "dockerfile_text", "") or ""
+    image_tag = _build_spec_value(build, "image_tag", "") or ""
+    pre_build = _build_spec_value(build, "pre_build", None)
+    if not dockerfile_text.strip():
+        raise RuntimeError("missing dockerfile_text for image build")
+    if not image_tag.strip():
+        raise RuntimeError("missing image_tag for image build")
+
+    if extensions.docker_client is None:
+        extensions.init_docker()
+
+    with tempfile.TemporaryDirectory(prefix="fuxi-build-") as tmpdir:
+        tmp_path = Path(tmpdir)
+        (tmp_path / "Dockerfile").write_text(dockerfile_text, encoding="utf-8")
+        logger.info("Building image tag=%s in tmp=%s", image_tag, tmpdir)
+        if pre_build:
+            pre_path = tmp_path / "pre_build.sh"
+            pre_path.write_text(str(pre_build), encoding="utf-8")
+            subprocess.run(["/bin/sh", str(pre_path)], cwd=tmpdir, check=True, timeout=600)
+        extensions.docker_client.images.build(
+            path=tmpdir,
+            dockerfile="Dockerfile",
+            tag=image_tag,
+            rm=True,
+            forcerm=True,
+        )
+    return image_tag
 
 
 #Return API Definition
@@ -46,7 +89,13 @@ class RemoveContinaerReturn:
 ####################################################
 
 # 将owner_name作为root，创建port新容器
-def create_container(owner_name: str, config:Container.Config_info, public_key: str | None = None)->CreateContainerReturn:
+def create_container(
+    owner_name: str,
+    config: Container.Config_info,
+    public_key: str | None = None,
+    build=None,
+    on_status=None,
+) -> CreateContainerReturn:
     if extensions.docker_client is None:
         extensions.init_docker()
 
@@ -127,11 +176,17 @@ def create_container(owner_name: str, config:Container.Config_info, public_key: 
         # good, proceed to create with explicit name
         pass
 
+    image_name = config.image
+    if build is not None:
+        image_name = _build_image_from_context(build)
+        if on_status is not None:
+            on_status(ContainerStatus.CREATING.value)
+
     # Use docker.types.Mount for a more reliable bind mount
     mounts = [Mount(target="/root", source=host_root_mount, type="bind", read_only=False)]
     print(f"DEBUG: Using mounts={mounts}")
     container = extensions.docker_client.containers.run(
-        config.image,
+        image_name,
         "tail -f /dev/null",   # 保证容器一直运行
         detach=True,
         tty=True,
@@ -188,32 +243,6 @@ def create_container(owner_name: str, config:Container.Config_info, public_key: 
     # 问题失败（例如镜像环境或时间不同步），因此在失败时尝试一次回退策略，
     # 但不要因为安装失败就删除已创建的容器——只记录并继续。
 
-    # Configure network proxy inside container BEFORE any network operations.
-    # Read proxy from NodeProxyConfig so it can be changed via env/config.
-    PROXY_URL = getattr(NodeProxyConfig, 'PROXY_HOST', None)
-    if PROXY_URL:
-        try:
-            # write environment variables so new processes see the proxy
-            _run(container, (
-                "printf 'http_proxy=\"%s\"\nhttps_proxy=\"%s\"\nHTTP_PROXY=\"%s\"\nHTTPS_PROXY=\"%s\"\n' "
-                % (PROXY_URL, PROXY_URL, PROXY_URL, PROXY_URL)
-                + "> /etc/environment"
-            ))
-            # configure apt to use the proxy before the first apt network access
-            _run(container, (
-                "mkdir -p /etc/apt/apt.conf.d && printf 'Acquire::http::Proxy \"%s\";\nAcquire::https::Proxy \"%s\";\n' "
-                % (PROXY_URL, PROXY_URL)
-                + "> /etc/apt/apt.conf.d/99proxy"
-            ))
-            _run(container, (
-                "grep -i proxy /etc/environment /etc/apt/apt.conf.d/99proxy"
-            ))
-            print(f"Proxy configured inside container: {PROXY_URL}")
-        except Exception as e:
-            print(f"Failed to configure proxy inside container: {e}")
-    else:
-        print("No proxy configured for container network setup.")
-
     # 初始密码为 owner_name + "123"，用户可以登录后再改密码（也可以直接提供公钥登录）
     _run(container, f"echo 'root:{owner_name}123' | chpasswd")
     try:
@@ -242,43 +271,21 @@ def create_container(owner_name: str, config:Container.Config_info, public_key: 
     else:
         logger.info("create_container no public_key provided: name=%s", name)
 
-    # ── 最后一道守门：sshd 安装 + 配置 + 启动 ──
-    ssh_ready = False
+    # ── 最后一道守门：sshd 配置 + 启动 ──
+    # 平台基础设施由最终 Dockerfile 注入；Node 不再现场安装 sshd。
     try:
-        _run(container, "apt-get update", timeout_sec=300)
-        _run(container, "DEBIAN_FRONTEND=noninteractive apt-get install -y openssh-server", timeout_sec=600)
         _run(container, "mkdir -p /run/sshd")
         _run(container, "ssh-keygen -A")
-        ssh_ready = True
-    except Exception as e:
-        print(f"apt-get update/install failed: {e}\nAttempting fallback sequence (clean + relaxed update + allow-unauthenticated install)")
-        try:
-            _run(container, "apt-get clean")
-            _run(container, "rm -rf /var/lib/apt/lists/*")
-            _run(container, "apt-get update -o Acquire::AllowInsecureRepositories=true -o Acquire::Check-Valid-Until=false", timeout_sec=300)
-            _run(container, "DEBIAN_FRONTEND=noninteractive apt-get install -y --allow-unauthenticated openssh-server", timeout_sec=600)
-            _run(container, "mkdir -p /run/sshd")
-            _run(container, "ssh-keygen -A")
-            ssh_ready = True
-        except Exception as e2:
-            print(f"Fallback apt-get sequence also failed: {e2}. Continuing without openssh-server; container created but SSH may be unavailable.")
-    if ssh_ready:
         _run(container, "sed -i 's/^#*PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config")
         _run(container, "sed -i 's/^#*PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config")
-    else:
-        print("Skipping sshd_config edits because openssh-server is not installed.")
+        _run(container, "/usr/sbin/sshd")
+        logger.info("create_container sshd started: name=%s container_id=%s", name, container.id)
+    except Exception as e:
+        logger.error("create_container sshd gate failed: name=%s container_id=%s error=%s", name, container.id, e)
+        raise RuntimeError(f"sshd gate failed: {e}") from e
 
-    # 不用 service（容器里不一定有 init），直接启动 sshd（会后台守护）
-    if ssh_ready:
-        try:
-            _run(container, "/usr/sbin/sshd")
-            logger.info("create_container sshd started: name=%s container_id=%s", name, container.id)
-        except Exception as e:
-            print(f"Failed to start sshd inside container: {e}. SSH may be unavailable.")
-            logger.warning("create_container sshd start failed: name=%s error=%s", name, e)
-
-    logger.info("create_container service complete: name=%s container_id=%s ssh_ready=%s",
-                name, container.id, ssh_ready)
+    logger.info("create_container service complete: name=%s container_id=%s ssh_ready=True",
+                name, container.id)
     return CreateContainerReturn(container.id,container.name)
 
 #删除容器并删除其所有者记录
