@@ -139,7 +139,6 @@ def test_create_container_with_image_build_reports_building(client, monkeypatch)
         "config": VALID_CFG,
         "image_build": {
             "dockerfile_text": "FROM ubuntu:22.04\nRUN echo ok\n",
-            "pre_build": "echo pre-build",
             "image_tag": "fuxi/image-1:20260826T000000Z",
         },
     }

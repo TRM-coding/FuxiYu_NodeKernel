@@ -87,12 +87,10 @@ def test_build_path_uses_prepared_image(monkeypatch):
 
     monkeypatch.setattr(extensions, "docker_client", _BuildAwareClient())
     _patch_fs(monkeypatch)
-    monkeypatch.setattr("FuxiYu_NodeKernel.services.container_service.subprocess.run", lambda *a, **k: None)
     monkeypatch.setenv("NODE_CONTAINERS_BASE", "/tmp")
 
     build = {
         "dockerfile_text": "FROM ubuntu:22.04\nRUN echo hello\n",
-        "pre_build": "echo pre-build",
         "image_tag": "fuxi/image-7:20260826T000000Z",
     }
     result = create_container(

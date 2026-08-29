@@ -40,11 +40,10 @@ def _build_spec_value(build, key: str, default=None):
 
 
 def _build_image_from_context(build) -> str:
-    """按 Ctrl 发来的最终 Dockerfile / pre_build.sh 临时构建镜像。"""
+    """按 Ctrl 发来的最终 Dockerfile 临时构建镜像。"""
 
     dockerfile_text = _build_spec_value(build, "dockerfile_text", "") or ""
     image_tag = _build_spec_value(build, "image_tag", "") or ""
-    pre_build = _build_spec_value(build, "pre_build", None)
     if not dockerfile_text.strip():
         raise RuntimeError("missing dockerfile_text for image build")
     if not image_tag.strip():
@@ -57,10 +56,6 @@ def _build_image_from_context(build) -> str:
         tmp_path = Path(tmpdir)
         (tmp_path / "Dockerfile").write_text(dockerfile_text, encoding="utf-8")
         logger.info("Building image tag=%s in tmp=%s", image_tag, tmpdir)
-        if pre_build:
-            pre_path = tmp_path / "pre_build.sh"
-            pre_path.write_text(str(pre_build), encoding="utf-8")
-            subprocess.run(["/bin/sh", str(pre_path)], cwd=tmpdir, check=True, timeout=600)
         extensions.docker_client.images.build(
             path=tmpdir,
             dockerfile="Dockerfile",

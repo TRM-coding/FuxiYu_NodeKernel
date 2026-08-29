@@ -38,7 +38,6 @@ class ContainerConfig(BaseModel):
 
 class ImageBuildConfig(BaseModel):
     dockerfile_text: str = Field(default="", description="Ctrl 生成的最终 Dockerfile 文本。")
-    pre_build: str | None = Field(default=None, description="独立 pre_build.sh 内容。")
     image_tag: str = Field(default="", description="最终 build 后用于 run 的镜像 tag。")
 
 
