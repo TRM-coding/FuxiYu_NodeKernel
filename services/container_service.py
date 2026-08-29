@@ -128,8 +128,7 @@ def create_container(
     gpu_list = getattr(config, 'gpu_list', None)
     device_requests = None
     if gpu_list is not None and isinstance(gpu_list, (list, tuple)) and len(gpu_list) > 0:
-        # When specific GPU ids are provided, do NOT set 'count' because
-        # Docker rejects DeviceRequest with both Count and DeviceIDs set.
+        # 指定 GPU id 时不要同时设置 count；Docker 会拒绝 Count + DeviceIDs 混用。
         device_requests = [
             docker.types.DeviceRequest(
                 device_ids=[str(x) for x in gpu_list],

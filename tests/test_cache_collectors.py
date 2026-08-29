@@ -112,6 +112,29 @@ def test_status_cache_applies_events_pending_ready_and_deleted(monkeypatch):
     assert cache.get_state("building-c")["status"] == "building"
 
 
+def test_status_cache_forgets_deleted_generation_on_sync_delete_or_new_create():
+    """同步删除闭环/同名新建会作废旧 delete，避免误删新同名 DB 行。"""
+    cache = ContainerStatusCache()
+    now = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+    cache._cache["c1"] = {"status": "online", "updated_at": now}
+    cache._pending["c1"] = {"status": "failed", "started_at": dt.datetime.utcnow()}
+    cache._build_pending["c1"] = {"status": "building", "started_at": dt.datetime.utcnow()}
+    cache._deleted = ["old", "c1", "c1"]
+
+    cache.forget_container_generation("c1")
+
+    assert cache.get_state("c1")["source"] == "miss"
+    assert cache.take_deleted() == ["old"]
+
+    cache._deleted = ["c2"]
+    cache.begin_build("c2")
+    assert cache.take_deleted() == []
+
+    cache._deleted = ["c3"]
+    cache.begin_action("c3", "create", "creating")
+    assert cache.take_deleted() == []
+
+
 def test_status_cache_noise_events_never_touch_cache():
     # 数据通路对账契约 C2：噪声事件（attach/top/exec_*/resize/...）绝不落缓存
     cache = ContainerStatusCache()

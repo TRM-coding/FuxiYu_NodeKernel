@@ -223,10 +223,13 @@ def test_create_container_invalid_config_422(client):
 
 
 def test_remove_container_success(client, monkeypatch):
+    forgotten = []
     _patched_service(monkeypatch, "remove_container", lambda name: 0)
+    monkeypatch.setattr(extensions.status_cache, "forget_container_generation", lambda name: forgotten.append(name))
     resp = client.post("/api/remove_container", json={"config": {"container_name": "c1"}})
     assert resp.status_code == 200
     assert resp.json()["success"] == 1
+    assert forgotten == ["c1"]
 
 
 def test_remove_container_not_found_404(client, monkeypatch):

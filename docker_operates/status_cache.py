@@ -119,6 +119,19 @@ class ContainerStatusCache:
             deleted, self._deleted = self._deleted, []
         return deleted
 
+    def forget_container_generation(self, name: str) -> None:
+        """同名容器代际失效：清理旧 cache/pending 与待推 delete。
+
+        Ctrl 同步删除成功或同名新建开始时调用。delete 队列只表达外部消失；
+        同步链路已闭环后，旧 delete 不应跨代作用到新同名容器。
+        """
+        with self._lock:
+            self._cache.pop(name, None)
+            self._pending.pop(name, None)
+            self._build_pending.pop(name, None)
+            self._deleted = [item for item in self._deleted if item != name]
+        logger.info("status-cache forget_container_generation: name=%s", name)
+
     def get_collect_error(self) -> str | None:
         """读采集失败标记（None=采集正常；非 None=快照应发 collect_error 形状）。"""
         with self._lock:
@@ -135,6 +148,7 @@ class ContainerStatusCache:
         的 known 集合，避免构建失败被误判为 vanished/delete。
         """
         with self._lock:
+            self._deleted = [item for item in self._deleted if item != name]
             self._build_pending[name] = {
                 "action": "build",
                 "status": ContainerStatus.BUILDING.value,
@@ -183,6 +197,7 @@ class ContainerStatusCache:
         *ing_status* 为等待阶段对外暴露的状态（如 'starting'）。
         """
         with self._lock:
+            self._deleted = [item for item in self._deleted if item != name]
             self._build_pending.pop(name, None)
             self._pending[name] = {
                 "action": action,

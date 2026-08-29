@@ -124,6 +124,40 @@ def test_create_container_uses_prepared_image_and_only_runs_sshd_gate(monkeypatc
     assert "/usr/sbin/sshd" in joined
 
 
+def test_create_container_gpu_request_uses_device_ids_without_driver(monkeypatch):
+    """GPU 容器请求只指定设备 ID 和能力，保持旧部署链路的 Docker runtime 适配面。"""
+    device_request_calls = []
+    run_calls = []
+
+    def _device_request_stub(**kwargs):
+        device_request_calls.append(kwargs)
+        return kwargs
+
+    class _Containers(FakeContainers):
+        def run(self, *a, **k):
+            run_calls.append((a, k))
+            return FakeContainer(name=k.get("name", "c1"))
+
+    monkeypatch.setattr(docker.types, "DeviceRequest", _device_request_stub)
+    monkeypatch.setattr(extensions, "docker_client", FakeDockerClient(_Containers()))
+    _patch_fs(monkeypatch)
+    monkeypatch.setenv("NODE_CONTAINERS_BASE", "/tmp")
+
+    cfg_data = dict(VALID_CFG)
+    cfg_data["gpu_list"] = [0, 2]
+
+    result = create_container("admin", Container.Config_info(**cfg_data))
+
+    assert isinstance(result, CreateContainerReturn)
+    assert device_request_calls == [
+        {
+            "device_ids": ["0", "2"],
+            "capabilities": [["gpu"]],
+        }
+    ]
+    assert run_calls[0][1]["device_requests"] == device_request_calls
+
+
 def test_build_image_uses_cached_image_tag(monkeypatch):
     """同 tag 已存在时命中 Node 本地缓存：跳过 build，直接返回 tag。"""
     build_calls = []

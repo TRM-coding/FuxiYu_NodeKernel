@@ -277,6 +277,7 @@ def remove_container_api(message: RemoveContainerMessage):
         return JSONResponse(status_code=500, content={"success": 0, "error": str(e)})
 
     if success == 0:
+        extensions.status_cache.forget_container_generation(container_name)
         return {"success": 1}
     if success == 1:
         return JSONResponse(status_code=404, content={"success": 0, "error": "container not found", "error_reason": "not_found"})
