@@ -67,7 +67,11 @@ def _gpu_info() -> list[dict]:
     """
     try:
         r = subprocess.run(
-            ["nvidia-smi", "--query-gpu=index,name,memory.total", "--format=csv,noheader,nounits"],
+            [
+                "nvidia-smi",
+                "--query-gpu=index,name,memory.used,memory.total,utilization.gpu",
+                "--format=csv,noheader,nounits",
+            ],
             capture_output=True, text=True, timeout=5,
         )
         if r.returncode != 0 or not r.stdout.strip():
@@ -75,14 +79,27 @@ def _gpu_info() -> list[dict]:
         gpus = []
         for line in r.stdout.strip().splitlines():
             parts = [p.strip() for p in line.split(",")]
-            if len(parts) < 3:
+            if len(parts) < 4:
                 continue
             try:
                 idx = int(parts[0])
-                mem_gb = round(float(parts[2]) / 1024, 1)
+                used_mb = float(parts[2])
+                total_mb = float(parts[3])
+                util = float(parts[4]) if len(parts) >= 5 and parts[4] != "[N/A]" else None
             except ValueError:
                 continue
-            gpus.append({"vendor": "nvidia", "index": idx, "name": parts[1], "memory_gb": mem_gb})
+            item = {
+                "vendor": "nvidia",
+                "index": idx,
+                "name": parts[1],
+                "memory_used_gb": round(used_mb / 1024, 1),
+                "memory_gb": round(total_mb / 1024, 1),
+            }
+            if util is not None:
+                item["utilization_gpu_percent"] = round(util, 1)
+            if total_mb > 0:
+                item["memory_usage_percent"] = round((used_mb / total_mb) * 100, 1)
+            gpus.append(item)
         return gpus
     except Exception:
         return []
@@ -121,13 +138,38 @@ class SysSnapshotCache:
         return snap
 
     @staticmethod
-    def _collect_disk() -> dict:
-        """磁盘：复用 disk_usage_cache 的宿主机磁盘采集（shutil，一次调用）。"""
+    def _mount_disk_usage(path: str) -> dict | None:
+        """单个挂载点的磁盘用量；路径不可用 → None。"""
         try:
-            from .. import extensions
-            return extensions.disk_usage_cache.collect_machine_disk()
-        except Exception as e:
-            return {"error": str(e)}
+            import shutil
+            usage = shutil.disk_usage(path)
+            total_gb = usage.total / (1024 ** 3)
+            used_gb = usage.used / (1024 ** 3)
+            free_gb = usage.free / (1024 ** 3)
+            return {
+                "path": path,
+                "total_gb": round(total_gb, 1),
+                "used_gb": round(used_gb, 1),
+                "free_gb": round(free_gb, 1),
+                "percent": round((usage.used / usage.total * 100) if usage.total > 0 else 0.0, 1),
+            }
+        except Exception:
+            return None
+
+    @classmethod
+    def _collect_disk(cls) -> dict:
+        """磁盘：采容器数据落盘相关的两个挂载点（纯显示用，不参与任何决策）。
+
+        - bind_mount：容器 /root 绑定目录所在分区（NODE_CONTAINERS_BASE）
+        - docker_data：docker 数据目录所在分区（overlay 层，NODE_DOCKER_DATA_ROOT）
+        home 与 overlay 可能不在同一块盘，故分别采集。
+        """
+        bind_mount = cls._mount_disk_usage(os.getenv("NODE_CONTAINERS_BASE", "/home"))
+        docker_data = cls._mount_disk_usage(os.getenv("NODE_DOCKER_DATA_ROOT", "/var/lib/docker"))
+        return {
+            "bind_mount": bind_mount or {},
+            "docker_data": docker_data or {},
+        }
 
     def collect_static(self) -> dict:
         """静态硬件快照（首连 enrollment_profile 用）：缓存未过期直接返回，否则采集一次。"""
@@ -146,7 +188,8 @@ class SysSnapshotCache:
             "cpu": {"cores": (snap.get("cpu") or {}).get("cores", 0)},
             "memory": {"total_gb": (snap.get("memory") or {}).get("total_gb")},
             "gpu": snap.get("gpu", []),
-            "disk": {"total_gb": (snap.get("disk") or {}).get("total_gb")},
+            # 建档初始 disk_size_gb = bind_mount 分区容量（容器数据主分区）
+            "disk": {"total_gb": (snap.get("disk") or {}).get("bind_mount", {}).get("total_gb")},
         }
 
     ##################

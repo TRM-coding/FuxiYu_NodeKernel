@@ -20,7 +20,17 @@ from FuxiYu_NodeKernel.network import wss
 
 
 class _Container:
-    def __init__(self, name="c1", status="running", *, size_rw=1024, mount_source="/tmp/c1-root", exec_exit_code=0):
+    def __init__(
+        self,
+        name="c1",
+        status="running",
+        *,
+        size_rw=1024,
+        mount_source="/tmp/c1-root",
+        exec_exit_code=0,
+        stats_payload=None,
+        device_requests=None,
+    ):
         self.name = name
         self.id = f"id-{name}"
         self.status = status
@@ -28,8 +38,11 @@ class _Container:
             "SizeRw": size_rw,
             "State": {"Status": status},
             "Mounts": [{"Type": "bind", "Destination": "/root", "Source": mount_source}],
+            "HostConfig": {"DeviceRequests": device_requests or []},
         }
         self._exec_exit_code = exec_exit_code
+        self._stats_payload = stats_payload
+        self.stats_kwargs = None
 
     def exec_run(self, *args, **kwargs):
         class _Result:
@@ -41,6 +54,14 @@ class _Container:
                 raise IndexError(index)
 
         return _Result()
+
+    def stats(self, *args, **kwargs):
+        self.stats_kwargs = dict(kwargs)
+        if kwargs.get("decode") is True and kwargs.get("stream") is False:
+            raise RuntimeError("decode is only available in conjunction with stream=True")
+        if self._stats_payload is None:
+            raise RuntimeError("stats not available")
+        return self._stats_payload
 
 
 class _Containers:
@@ -133,6 +154,88 @@ def test_status_cache_forgets_deleted_generation_on_sync_delete_or_new_create():
     cache._deleted = ["c3"]
     cache.begin_action("c3", "create", "creating")
     assert cache.take_deleted() == []
+
+
+def test_status_cache_snapshot_includes_runtime_metrics(monkeypatch):
+    cache = ContainerStatusCache()
+    stats_payload = {
+        "cpu_stats": {
+            "cpu_usage": {"total_usage": 300, "percpu_usage": [1, 1]},
+            "system_cpu_usage": 3000,
+            "online_cpus": 2,
+        },
+        "precpu_stats": {
+            "cpu_usage": {"total_usage": 100},
+            "system_cpu_usage": 1000,
+        },
+        "memory_stats": {
+            "usage": 300 * 1024 * 1024,
+            "limit": 1024 * 1024 * 1024,
+            "stats": {"cache": 44 * 1024 * 1024},
+        },
+        "networks": {
+            "eth0": {"rx_bytes": 2 * 1024 * 1024, "tx_bytes": 3 * 1024 * 1024},
+        },
+        "blkio_stats": {
+            "io_service_bytes_recursive": [
+                {"op": "Read", "value": 4 * 1024 * 1024},
+                {"op": "Write", "value": 5 * 1024 * 1024},
+            ],
+        },
+    }
+    container = _Container(
+        "metrics-c",
+        status="running",
+        stats_payload=stats_payload,
+        device_requests=[{"DeviceIDs": ["0", "2"], "Capabilities": [["gpu"]]}],
+    )
+    monkeypatch.setattr(
+        "FuxiYu_NodeKernel.docker_operates.status_cache.docker.from_env",
+        lambda: _DockerClient([container]),
+    )
+    monkeypatch.setattr(
+        "FuxiYu_NodeKernel.docker_operates.status_cache.subprocess.run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(
+            args[0],
+            0,
+            stdout="0, RTX 4090, 33, 1024, 24576\n1, RTX 4090, 0, 0, 24576\n2, RTX 4090, 66, 2048, 24576\n",
+            stderr="",
+        ),
+    )
+
+    cache._reconcile_once()
+    state = cache.list_states()["metrics-c"]
+
+    assert container.stats_kwargs == {"stream": False}
+    assert state["status"] == ContainerStatus.STARTING.value
+    assert state["runtime_metrics"]["cpu_usage_percent"] == 20.0
+    assert state["runtime_metrics"]["memory_usage_mb"] == 256.0
+    assert state["runtime_metrics"]["memory_usage_percent"] == 25.0
+    assert state["runtime_metrics"]["network_rx_mb"] == 2.0
+    assert state["runtime_metrics"]["network_tx_mb"] == 3.0
+    assert state["runtime_metrics"]["block_read_mb"] == 4.0
+    assert state["runtime_metrics"]["block_write_mb"] == 5.0
+    assert state["runtime_metrics"]["gpu"]["device_ids"] == ["0", "2"]
+    assert state["runtime_metrics"]["gpu"]["devices"] == [
+        {
+            "vendor": "nvidia",
+            "index": 0,
+            "name": "RTX 4090",
+            "utilization_gpu_percent": 33.0,
+            "memory_used_mb": 1024.0,
+            "memory_total_mb": 24576.0,
+            "memory_usage_percent": 4.2,
+        },
+        {
+            "vendor": "nvidia",
+            "index": 2,
+            "name": "RTX 4090",
+            "utilization_gpu_percent": 66.0,
+            "memory_used_mb": 2048.0,
+            "memory_total_mb": 24576.0,
+            "memory_usage_percent": 8.3,
+        },
+    ]
 
 
 def test_status_cache_noise_events_never_touch_cache():
@@ -269,6 +372,43 @@ def test_probe_self_heals_sshd_then_online(monkeypatch):
 
     cache._probe_ready_checks_once()
     assert cache.get_state("c1")["status"] == "online"  # 拉起后就绪 → online
+
+
+def test_probe_ready_refreshes_runtime_metrics(monkeypatch):
+    # probe 将 ready_check 升 online 时同步补一份 docker stats，避免首个 online 快照只有 GPU 壳。
+    cache = ContainerStatusCache()
+    stats_payload = {
+        "cpu_stats": {
+            "cpu_usage": {"total_usage": 300, "percpu_usage": [1, 1]},
+            "system_cpu_usage": 3000,
+            "online_cpus": 2,
+        },
+        "precpu_stats": {
+            "cpu_usage": {"total_usage": 100},
+            "system_cpu_usage": 1000,
+        },
+        "memory_stats": {
+            "usage": 300 * 1024 * 1024,
+            "limit": 1024 * 1024 * 1024,
+            "stats": {"cache": 44 * 1024 * 1024},
+        },
+    }
+    container = _Container("c1", status="running", stats_payload=stats_payload)
+    cache.mark_ready_check("c1")
+    monkeypatch.setattr(cache, "_probe_sshd", lambda name: True)
+    monkeypatch.setattr(extensions, "docker_client", _fake_docker_client(container))
+    monkeypatch.setattr(
+        "FuxiYu_NodeKernel.docker_operates.status_cache._nvidia_gpu_runtime_by_index",
+        lambda: {},
+    )
+
+    cache._probe_ready_checks_once()
+
+    state = cache.get_state("c1")
+    assert state["status"] == "online"
+    assert state["runtime_metrics"]["cpu_usage_percent"] == 20.0
+    assert state["runtime_metrics"]["memory_usage_mb"] == 256.0
+    assert state["runtime_metrics"]["memory_usage_percent"] == 25.0
 
 
 def test_status_cache_state_events_still_update_cache():
@@ -417,9 +557,9 @@ def test_sys_snapshot_cache_collects_vendor_aware_gpu(monkeypatch):
     monkeypatch.setattr("FuxiYu_NodeKernel.docker_operates.sys_cache.psutil.virtual_memory", lambda: _Memory())
     monkeypatch.setattr(
         "FuxiYu_NodeKernel.docker_operates.sys_cache.subprocess.run",
-        lambda *args, **kwargs: subprocess.CompletedProcess(args[0], 0, stdout="0, RTX 4090, 24576\n", stderr=""),
+        lambda *args, **kwargs: subprocess.CompletedProcess(args[0], 0, stdout="0, RTX 4090, 1024, 24576, 33\n", stderr=""),
     )
-    monkeypatch.setattr(cache, "_collect_disk", lambda: {"total_gb": 200, "used_gb": 50, "percent": 25})
+    monkeypatch.setattr(cache, "_collect_disk", lambda: {"bind_mount": {"path": "/home", "total_gb": 200, "used_gb": 50, "percent": 25}, "docker_data": {"path": "/var/lib/docker", "total_gb": 100, "used_gb": 20, "percent": 20}})
 
     snap = cache.collect()
     static = cache.collect_static()
@@ -427,7 +567,15 @@ def test_sys_snapshot_cache_collects_vendor_aware_gpu(monkeypatch):
     assert snap["cpu"]["cores"] == 16
     assert snap["cpu"]["physical_cores"] == 8
     assert snap["memory"]["total_gb"] == 32
-    assert snap["gpu"] == [{"vendor": "nvidia", "index": 0, "name": "RTX 4090", "memory_gb": 24.0}]
+    assert snap["gpu"] == [{
+        "vendor": "nvidia",
+        "index": 0,
+        "name": "RTX 4090",
+        "memory_used_gb": 1.0,
+        "memory_gb": 24.0,
+        "utilization_gpu_percent": 33.0,
+        "memory_usage_percent": 4.2,
+    }]
     assert static["cpu"] == {"cores": 16}
     assert static["gpu"][0]["vendor"] == "nvidia"
 

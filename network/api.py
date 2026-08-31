@@ -158,6 +158,12 @@ def create_container_api(message: CreateContainerMessage):
                 result.container_name,
                 result.container_id,
             )
+            # 端口映射（docker 自动分配结果）回填 status_cache，随快照推 Ctrl 落库
+            extensions.status_cache.set_port_info(
+                cfg_obj.name,
+                getattr(result, "port", None),
+                getattr(result, "port_mappings", None),
+            )
             extensions.status_cache.mark_ready_check(cfg_obj.name, status=ContainerStatus.CREATING.value)
             logger.info("create_container marked ready_check: name=%s", cfg_obj.name)
         except Exception as e:
@@ -204,14 +210,21 @@ def container_status_api(message: ContainerStatusMessage):
                 "error_reason": state.get("failed_reason") or state.get("error_reason"),
                 "failed_reason": state.get("failed_reason") or state.get("error_reason"),
                 "failed_detail": state.get("failed_detail"),
+                "runtime_metrics": state.get("runtime_metrics"),
                 "cache_updated_at": state.get("cache_updated_at"),
             }
         if state["source"] in {"pending", "build"}:
-            return {"success": 1, "container_status": state["status"], "container_name": container_name}
+            return {
+                "success": 1,
+                "container_status": state["status"],
+                "container_name": container_name,
+                "runtime_metrics": state.get("runtime_metrics"),
+            }
         return {
             "success": 1,
             "container_status": state["status"],
             "container_name": container_name,
+            "runtime_metrics": state.get("runtime_metrics"),
             "cache_updated_at": state.get("cache_updated_at"),
         }
     except Exception as e:

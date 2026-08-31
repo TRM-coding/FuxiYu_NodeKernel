@@ -81,6 +81,7 @@ class ContainerStatusResponse(ContainerOperationAcceptedResponse):
     error_reason: str | None = None
     failed_reason: str | None = None
     failed_detail: str | None = None
+    runtime_metrics: dict[str, Any] | None = None
 
 
 #####################

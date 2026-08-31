@@ -14,6 +14,7 @@ docker 状态映射到应用枚举语义与 blueprints/__init__.py 的 /containe
 """
 import datetime
 import logging
+import subprocess
 import threading
 import time
 
@@ -102,6 +103,164 @@ def _map_container_to_status(container) -> str:
         )
         return ContainerStatus.UNKNOWN.value
     return status
+
+
+def _round_or_none(value, digits: int = 1):
+    """数值展示统一保留一位；异常值不进快照。"""
+
+    try:
+        return round(float(value), digits)
+    except (TypeError, ValueError):
+        return None
+
+
+def _sum_blkio_bytes(stats: dict, op_name: str) -> int:
+    total = 0
+    for item in ((stats.get("blkio_stats") or {}).get("io_service_bytes_recursive") or []):
+        if str(item.get("op", "")).lower() == op_name:
+            total += int(item.get("value") or 0)
+    return total
+
+
+def _allocated_gpu_devices(container) -> list[str]:
+    """从 Docker HostConfig 读取容器声明挂载的 GPU id。"""
+
+    try:
+        attrs = getattr(container, "attrs", {}) or {}
+        requests = ((attrs.get("HostConfig") or {}).get("DeviceRequests") or [])
+    except Exception:
+        return []
+    devices: list[str] = []
+    for req in requests:
+        ids = req.get("DeviceIDs") or req.get("device_ids") or []
+        if isinstance(ids, (list, tuple)):
+            devices.extend(str(item) for item in ids)
+    return devices
+
+
+def _nvidia_gpu_runtime_by_index() -> dict[str, dict]:
+    """采集宿主机 NVIDIA GPU 动态指标，按 index 建表。
+
+    这是一轮 reconcile 共享的一次性采集；无 nvidia-smi/无 GPU 时返回空表。
+    """
+
+    try:
+        r = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-gpu=index,name,utilization.gpu,memory.used,memory.total",
+                "--format=csv,noheader,nounits",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except Exception as e:
+        logger.debug("status-cache nvidia-smi runtime skipped: %s", e)
+        return {}
+    if r.returncode != 0 or not r.stdout.strip():
+        return {}
+
+    result: dict[str, dict] = {}
+    for line in r.stdout.strip().splitlines():
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) < 5:
+            continue
+        try:
+            index = int(parts[0])
+            utilization = float(parts[2])
+            memory_used = float(parts[3])
+            memory_total = float(parts[4])
+        except ValueError:
+            continue
+        item = {
+            "vendor": "nvidia",
+            "index": index,
+            "name": parts[1],
+            "utilization_gpu_percent": _round_or_none(utilization),
+            "memory_used_mb": _round_or_none(memory_used),
+            "memory_total_mb": _round_or_none(memory_total),
+        }
+        if memory_total > 0:
+            item["memory_usage_percent"] = _round_or_none((memory_used / memory_total) * 100)
+        result[str(index)] = item
+    return result
+
+
+def _container_runtime_metrics(container, gpu_runtime_by_index: dict[str, dict] | None = None) -> dict:
+    """采集 Docker daemon 可直接提供的容器运行指标。
+
+    Docker stats 不包含 GPU 利用率；GPU 动态值由本轮 reconcile 预采的
+    nvidia-smi map 按容器 DeviceIDs 切片。
+    """
+
+    gpu_device_ids = _allocated_gpu_devices(container)
+    gpu_runtime_by_index = gpu_runtime_by_index or {}
+    metrics = {
+        "collected_at": datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%S'),
+        "gpu": {
+            "device_ids": gpu_device_ids,
+            "devices": [
+                gpu_runtime_by_index[device_id]
+                for device_id in gpu_device_ids
+                if device_id in gpu_runtime_by_index
+            ],
+        },
+    }
+    if str(getattr(container, "status", "") or "") != "running":
+        logger.debug(
+            "status-cache runtime metrics skipped: name=%s status=%s",
+            getattr(container, "name", "?"),
+            getattr(container, "status", None),
+        )
+        return metrics
+    try:
+        stats = container.stats(stream=False) or {}
+    except Exception as e:
+        logger.warning(
+            "status-cache runtime metrics skipped: name=%s err=%s",
+            getattr(container, "name", "?"),
+            e,
+        )
+        return metrics
+
+    cpu_stats = stats.get("cpu_stats") or {}
+    precpu_stats = stats.get("precpu_stats") or {}
+    cpu_delta = (
+        ((cpu_stats.get("cpu_usage") or {}).get("total_usage") or 0)
+        - ((precpu_stats.get("cpu_usage") or {}).get("total_usage") or 0)
+    )
+    system_delta = (cpu_stats.get("system_cpu_usage") or 0) - (precpu_stats.get("system_cpu_usage") or 0)
+    online_cpus = cpu_stats.get("online_cpus") or len((cpu_stats.get("cpu_usage") or {}).get("percpu_usage") or []) or 1
+    if cpu_delta > 0 and system_delta > 0:
+        metrics["cpu_usage_percent"] = _round_or_none((cpu_delta / system_delta) * online_cpus * 100)
+
+    memory_stats = stats.get("memory_stats") or {}
+    memory_usage = memory_stats.get("usage")
+    memory_limit = memory_stats.get("limit")
+    cache_bytes = (memory_stats.get("stats") or {}).get("cache") or 0
+    if memory_usage is not None:
+        effective_usage = max(0, int(memory_usage) - int(cache_bytes))
+        metrics["memory_usage_mb"] = _round_or_none(effective_usage / (1024 ** 2))
+    if memory_limit:
+        metrics["memory_limit_mb"] = _round_or_none(int(memory_limit) / (1024 ** 2))
+        if memory_usage is not None:
+            metrics["memory_usage_percent"] = _round_or_none((max(0, int(memory_usage) - int(cache_bytes)) / int(memory_limit)) * 100)
+
+    rx = tx = 0
+    for net in (stats.get("networks") or {}).values():
+        rx += int(net.get("rx_bytes") or 0)
+        tx += int(net.get("tx_bytes") or 0)
+    if rx or tx:
+        metrics["network_rx_mb"] = _round_or_none(rx / (1024 ** 2))
+        metrics["network_tx_mb"] = _round_or_none(tx / (1024 ** 2))
+
+    read_bytes = _sum_blkio_bytes(stats, "read")
+    write_bytes = _sum_blkio_bytes(stats, "write")
+    if read_bytes or write_bytes:
+        metrics["block_read_mb"] = _round_or_none(read_bytes / (1024 ** 2))
+        metrics["block_write_mb"] = _round_or_none(write_bytes / (1024 ** 2))
+    return metrics
 
 
 class ContainerStatusCache:
@@ -256,12 +415,19 @@ class ContainerStatusCache:
         （exec 检查 :22 监听，就绪后升 online 并清标记）。
         """
         with self._lock:
+            old_entry = self._cache.get(name, {})
             self._pending.pop(name, None)
-            self._cache[name] = {
+            entry = {
                 "status": status,
                 "ready_check": True,
                 "updated_at": datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%S'),
             }
+            # 端口信息（创建后 inspect 回填）随就绪确认保留
+            if old_entry.get("port") is not None:
+                entry["port"] = old_entry.get("port")
+            if old_entry.get("port_mappings") is not None:
+                entry["port_mappings"] = old_entry.get("port_mappings")
+            self._cache[name] = entry
         logger.info("status-cache mark_ready_check: name=%s status=%s ready_check=true", name, status)
 
     def get_pending(self, name: str) -> dict | None:
@@ -310,17 +476,47 @@ class ContainerStatusCache:
     ##################
     # 采集侧（docker 事件/对账 → 缓存回填；API 层不可调用）
 
-    def update(self, name: str, status: str) -> None:
+    def update(self, name: str, status: str, runtime_metrics: dict | None = None) -> None:
         """采集回填口（events/对账/转换态终态共用）：
         存在则更新、不存在则创建（填充器语义：events/对账发现新容器也要能落缓存）。"""
         with self._lock:
-            old = self._cache.get(name, {}).get("status")
-            self._cache[name] = {
+            old_entry = self._cache.get(name, {})
+            old = old_entry.get("status")
+            entry = {
                 "status": status,
                 "updated_at": datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%S'),
             }
+            if runtime_metrics is not None:
+                entry["runtime_metrics"] = runtime_metrics
+            elif old_entry.get("runtime_metrics") is not None:
+                entry["runtime_metrics"] = old_entry.get("runtime_metrics")
+            # 端口信息（创建后 inspect 回填）随状态推进保留
+            if old_entry.get("port") is not None:
+                entry["port"] = old_entry.get("port")
+            if old_entry.get("port_mappings") is not None:
+                entry["port_mappings"] = old_entry.get("port_mappings")
+            self._cache[name] = entry
         if old != status:
             logger.info("status-cache update: name=%s %s -> %s", name, old, status)
+
+    def set_port_info(self, name: str, port: int | None, port_mappings: list | None) -> None:
+        """创建完成后回填端口映射（docker 自动分配结果），随快照推给 Ctrl。"""
+        with self._lock:
+            entry = self._cache.setdefault(name, {"status": ContainerStatus.UNKNOWN.value})
+            if port is not None:
+                entry["port"] = port
+            if port_mappings is not None:
+                entry["port_mappings"] = port_mappings
+        logger.info("status-cache set_port_info: name=%s port=%s mappings=%s", name, port, port_mappings)
+
+    def update_runtime_metrics(self, name: str, runtime_metrics: dict) -> None:
+        """只更新运行指标，不改变当前状态。"""
+
+        with self._lock:
+            if name not in self._cache:
+                return
+            self._cache[name]["runtime_metrics"] = runtime_metrics
+            self._cache[name]["updated_at"] = datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%S')
 
     def _apply_event(self, event: dict) -> None:
         """采集侧：单条 docker event → 状态缓存 + 事件轨迹（event_log）。
@@ -364,7 +560,7 @@ class ContainerStatusCache:
             reason="oom" if event_status == "oom" else None,
         )
 
-    def _apply_container(self, container) -> None:
+    def _apply_container(self, container, gpu_runtime_by_index: dict[str, dict] | None = None) -> None:
         """采集侧：单容器对账 → 状态缓存。
 
         - 就绪确认中（ready_check）+ docker running → 保持 starting（等 probe 确认 sshd）
@@ -376,15 +572,21 @@ class ContainerStatusCache:
         - 已有 FAILED 条目 → 终态守卫：不被对账从 docker 状态复活（恢复路径 = 平台操作 restart/删除重建）
         - 其余：按 docker 状态覆盖（update 整条目覆盖，自动清标记）
         """
+        keep_ready_check = False
         with self._lock:
             entry = self._cache.get(container.name)
             if entry is not None and entry.get("ready_check") \
                     and str(getattr(container, 'status', '') or '') == 'running':
-                return  # 保持 starting + ready_check，等 probe 升 online
+                keep_ready_check = True
+        runtime_metrics = _container_runtime_metrics(container, gpu_runtime_by_index)
+        if keep_ready_check:
+            self.update_runtime_metrics(container.name, runtime_metrics)
+            return  # 保持 starting + ready_check，等 probe 升 online
         if entry is None:
             raw = _map_container_to_status(container)
             if raw == ContainerStatus.ONLINE.value:
                 self.mark_ready_check(container.name)
+                self.update_runtime_metrics(container.name, runtime_metrics)
                 return
             if raw == ContainerStatus.STARTING.value:
                 # docker "created"：从未运行的陈旧半成品，终态 FAILED（恢复 = 删除重建/平台操作）
@@ -392,12 +594,13 @@ class ContainerStatusCache:
                     "status-cache: cold-start container %r is docker 'created' (stale half-create); marking FAILED",
                     container.name,
                 )
-                self.update(container.name, ContainerStatus.FAILED.value)
+                self.update(container.name, ContainerStatus.FAILED.value, runtime_metrics=runtime_metrics)
                 return
         elif entry.get("status") == ContainerStatus.FAILED.value:
             # 终态守卫：FAILED 不被对账复活（操作/事件路径仍可恢复：restart → ready_check 门禁）
+            self.update_runtime_metrics(container.name, runtime_metrics)
             return
-        self.update(container.name, _map_container_to_status(container))
+        self.update(container.name, _map_container_to_status(container), runtime_metrics=runtime_metrics)
 
     ##################
     # 读缓存
@@ -415,9 +618,13 @@ class ContainerStatusCache:
         """
         pending = self.get_pending(name)
         if pending is not None:
+            cached = self.get(name) or {}
             return {"source": "pending", "status": pending["status"],
                     "failed_reason": pending.get("failed_reason"),
                     "failed_detail": pending.get("failed_detail"),
+                    "runtime_metrics": cached.get("runtime_metrics"),
+                    "port": cached.get("port"),
+                    "port_mappings": cached.get("port_mappings"),
                     "error_reason": pending.get("failed_reason")}
         build_pending = self.get_build_pending(name)
         if build_pending is not None:
@@ -430,6 +637,9 @@ class ContainerStatusCache:
             return {"source": "cache", "status": cached["status"],
                     "failed_reason": cached.get("failed_reason"),
                     "failed_detail": cached.get("failed_detail"),
+                    "runtime_metrics": cached.get("runtime_metrics"),
+                    "port": cached.get("port"),
+                    "port_mappings": cached.get("port_mappings"),
                     "error_reason": cached.get("failed_reason"),
                     "cache_updated_at": cached["updated_at"]}
         return {"source": "miss"}
@@ -476,6 +686,21 @@ class ContainerStatusCache:
             return getattr(r, 'exit_code', r[0]) == 0
         except Exception:
             return False
+
+    def _runtime_metrics_for_name(self, name: str, gpu_runtime_by_index: dict[str, dict] | None = None) -> dict | None:
+        """按容器名采集一次运行指标；probe 升 online 时补齐首个可用快照。"""
+
+        try:
+            from .. import extensions
+            if extensions.docker_client is None:
+                extensions.init_docker()
+            container = extensions.docker_client.containers.get(name)
+            if hasattr(container, "reload"):
+                container.reload()
+            return _container_runtime_metrics(container, gpu_runtime_by_index)
+        except Exception as e:
+            logger.debug("status-cache runtime metrics refresh failed: name=%s err=%s", name, e)
+            return None
 
     def _ensure_sshd_started(self, name: str) -> str:
         """保障：exec 拉起容器内 sshd（无 init 容器下 /usr/sbin/sshd 是唯一可靠入口，create 同款）。
@@ -533,10 +758,17 @@ class ContainerStatusCache:
         try:
             with self._lock:
                 targets = [name for name, e in self._cache.items() if e.get("ready_check")]
+            gpu_runtime_by_index = None
             for name in targets:
                 if self._probe_sshd(name):
                     logger.info("status-cache sshd probe ready: name=%s", name)
-                    self.update(name, ContainerStatus.ONLINE.value)
+                    if gpu_runtime_by_index is None:
+                        gpu_runtime_by_index = _nvidia_gpu_runtime_by_index()
+                    self.update(
+                        name,
+                        ContainerStatus.ONLINE.value,
+                        runtime_metrics=self._runtime_metrics_for_name(name, gpu_runtime_by_index),
+                    )
                 else:
                     # 自愈（保障）：sshd 未就绪 → 尝试拉起。无 init 容器下 /usr/sbin/sshd
                     # 是唯一可靠入口（create 同款启动方式）；幂等，已在运行时报错但无害。
@@ -583,9 +815,10 @@ class ContainerStatusCache:
         try:
             client = docker.from_env()
             live = set()
+            gpu_runtime_by_index = _nvidia_gpu_runtime_by_index()
             for c in client.containers.list(all=True):
                 live.add(c.name)
-                self._apply_container(c)
+                self._apply_container(c, gpu_runtime_by_index)
             # 消失检测（幽灵容器感知）：只有缓存里出现过的容器才算“已产生过”。
             # build/pending 是过渡读面，不是 Docker 容器对象存在的证据，不能触发 delete。
             with self._lock:

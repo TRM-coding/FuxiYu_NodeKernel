@@ -82,6 +82,8 @@ def build_image(build) -> str:
 class CreateContainerReturn(NamedTuple):
     container_id:str
     container_name:str
+    port: int | None = None
+    port_mappings: list | None = None
 
 class RemoveContinaerReturn:
     SUCCESS=0
@@ -189,7 +191,10 @@ def create_container(
         tty=True,
         name=name,
         
-        ports={"22/tcp": config.port},   # ssh端口映射
+        # 端口发布交给 docker（2026-08 决策）：22 与 EXPOSE 端口全部自动分配宿主端口，
+        # 创建后 inspect 回填实际映射；Ctrl 不再分配端口（get_the_first_free_port 退役）。
+        ports={"22/tcp": None},
+        publish_all_ports=True,   # 等价 docker run -P：自动发布 Dockerfile EXPOSE 的端口
         mem_limit=mem_limit,
         cpuset_cpus=cpuset_cpus,
         device_requests=device_requests,
@@ -275,9 +280,38 @@ def create_container(
         logger.error("create_container sshd gate failed: name=%s container_id=%s error=%s", name, container.id, e)
         raise RuntimeError(f"sshd gate failed: {e}") from e
 
-    logger.info("create_container service complete: name=%s container_id=%s ssh_ready=True",
-                name, container.id)
-    return CreateContainerReturn(container.id,container.name)
+    # ── 端口映射回填（docker 自动分配）：inspect NetworkSettings.Ports 提取实际宿主端口 ──
+    port = None
+    port_mappings = []
+    try:
+        container.reload()
+        net_ports = (container.attrs.get("NetworkSettings") or {}).get("Ports") or {}
+        for container_port_key, bindings in net_ports.items():
+            cport_str, _, proto = container_port_key.partition("/")
+            proto = proto or "tcp"
+            for binding in bindings or []:
+                host_port = binding.get("HostPort")
+                if not host_port:
+                    continue
+                try:
+                    host_port = int(host_port)
+                    cport = int(cport_str)
+                except (TypeError, ValueError):
+                    continue
+                port_mappings.append({
+                    "container_port": cport,
+                    "host_port": host_port,
+                    "protocol": proto,
+                })
+                if cport == 22 and port is None:
+                    port = host_port
+    except Exception as e:
+        print(f"port mapping inspect failed: {e}")
+        logger.warning("create_container port inspect failed: name=%s error=%s", name, e)
+
+    logger.info("create_container service complete: name=%s container_id=%s ssh_ready=True port=%s",
+                name, container.id, port)
+    return CreateContainerReturn(container.id, container.name, port, port_mappings)
 
 #删除容器并删除其所有者记录
 def remove_container(container_name: str) -> int:

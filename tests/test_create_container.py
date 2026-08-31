@@ -111,7 +111,9 @@ def test_create_container_uses_prepared_image_and_only_runs_sshd_gate(monkeypatc
 
     assert isinstance(result, CreateContainerReturn)
     assert run_calls and run_calls[0][0][0] == cfg_data["image"]
-    assert run_calls[0][1]["ports"] == {"22/tcp": VALID_CFG["port"]}
+    # 端口发布交给 docker（2026-08 决策）：22 与 EXPOSE 全部自动分配宿主端口
+    assert run_calls[0][1]["ports"] == {"22/tcp": None}
+    assert run_calls[0][1]["publish_all_ports"] is True
     exec_commands = [
         call[0][2] for call in created[0].exec_calls
         if isinstance(call[0], list) and len(call[0]) >= 3
