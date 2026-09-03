@@ -329,6 +329,18 @@ def test_remove_collaborator_success(client, monkeypatch):
     assert resp.json()["success"] == 1
 
 
+def test_remove_collaborator_failure_returns_500(client, monkeypatch):
+    """服务层返回 False（容器内 userdel 失败）→ 500 失败体。
+    固定回 success:1 曾让 Ctrl 误判成功删 DB 绑定，造成容器内权限漂移。"""
+    _patched_service(monkeypatch, "remove_collaborator", lambda *a: False)
+    payload = {"config": {"container_name": "c1", "user_name": "u1"}}
+    resp = client.post("/api/remove_collaborator", json=payload)
+    assert resp.status_code == 500
+    body = resp.json()
+    assert body["success"] == 0
+    assert body["error_reason"] == "remove_failed"
+
+
 def test_update_role_success(client, monkeypatch):
     _patched_service(monkeypatch, "update_role", lambda *a: True)
     payload = {"config": {"container_name": "c1", "user_name": "u1", "updated_role": "root"}}
@@ -463,3 +475,25 @@ def test_clean_mount_success(client, monkeypatch):
     assert resp.status_code == 200
     assert resp.json()["success"] == 1
     assert calls == ["/home/u/containers/c1"]
+
+
+def test_clean_mount_invalid_path_400(client, monkeypatch):
+    """service 层安全校验拒绝（路径穿越等）→ 400 invalid_path，绝不执行删除。"""
+    def _reject(path):
+        raise ValueError("invalid mount_path")
+
+    _patched_service(monkeypatch, "clean_mount", _reject)
+    resp = client.post("/api/clean_mount", json={"config": {"mount_path": "/home/a/containers/../../etc"}})
+    assert resp.status_code == 400
+    assert resp.json()["error_reason"] == "invalid_path"
+
+
+def test_clean_mount_rm_failure_500(client, monkeypatch):
+    """rm 删除失败（service 抛 RuntimeError）→ 500，不得报成功（假成功会让 Ctrl 误标 cleaned_at）。"""
+    def _fail(path):
+        raise RuntimeError("rm -rf failed")
+
+    _patched_service(monkeypatch, "clean_mount", _fail)
+    resp = client.post("/api/clean_mount", json={"config": {"mount_path": "/home/u/containers/c1"}})
+    assert resp.status_code == 500
+    assert resp.json()["success"] == 0

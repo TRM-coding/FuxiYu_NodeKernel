@@ -207,7 +207,10 @@ def test_status_cache_snapshot_includes_runtime_metrics(monkeypatch):
     state = cache.list_states()["metrics-c"]
 
     assert container.stats_kwargs == {"stream": False}
-    assert state["status"] == ContainerStatus.STARTING.value
+    # 冷启动契约（2026-09）：docker running 但 cache 无记录 → ready_check(cold_verify)
+    # 先推 unknown + cold_start_verify，probe 通过后才转 online——不再直接暴露 starting
+    assert state["status"] == ContainerStatus.UNKNOWN.value
+    assert state["status_source"] == "cold_start_verify"
     assert state["runtime_metrics"]["cpu_usage_percent"] == 20.0
     assert state["runtime_metrics"]["memory_usage_mb"] == 256.0
     assert state["runtime_metrics"]["memory_usage_percent"] == 25.0

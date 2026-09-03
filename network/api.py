@@ -405,12 +405,21 @@ def restart_container_api(message: RestartContainerMessage):
 
 @router.post("/remove_collaborator", response_model=RemoveCollaboratorResponse)
 def remove_collaborator_api(message: RemoveCollaboratorMessage):
-    """移除容器内协作者账号。"""
+    """移除容器内协作者账号。
+
+    服务层返回 False（容器内 userdel 失败）→ 500 失败体；固定回 success:1
+    曾让 Ctrl 误判成功而删除 DB 绑定，造成容器内权限与 DB 漂移。
+    """
 
     try:
-        remove_collaborator(message.config.container_name, message.config.user_name)
+        success = remove_collaborator(message.config.container_name, message.config.user_name)
     except Exception as e:
         return JSONResponse(status_code=500, content={"success": 0, "error": str(e), "error_reason": "internal_error"})
+    if not success:
+        return JSONResponse(
+            status_code=500,
+            content={"success": 0, "error": "failed to remove collaborator inside container", "error_reason": "remove_failed"},
+        )
     return {"success": 1}
 
 
