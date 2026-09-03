@@ -413,8 +413,10 @@ def remove_collaborator(container_name: str, user_name: str) -> bool:
             f"mkdir -p /root/.collaborators && "
             f"mv /home/{user_name} /root/.collaborators/.legacy_{user_name}_$ts.home 2>/dev/null || true; "
             f"fi; "
-            f"userdel {user_name} || deluser {user_name}; "
-            f"rm -f /home/{user_name}"
+            f"rm -f /home/{user_name}; "
+            # 账号本来就不存在（历史假成功残留 / 重复移除）→ 目标态已达成，幂等成功；
+            # userdel 真失败（如账号被占用）→ 非 0 退出，由调用方转失败，避免 Ctrl 误删绑定。
+            f"if id -u {user_name} >/dev/null 2>&1; then userdel {user_name} || deluser {user_name}; else exit 0; fi"
         )
 
         result = container.exec_run(["/bin/sh", "-c", cmd], user="root")
@@ -453,14 +455,22 @@ def update_role(container_name: str, user_name: str, updated_role: ROLE) -> bool
         elif updated_role == ROLE.COLLABORATOR: # 直接从sudo组里删除用户（如果存在的话），但不删除用户账号
             _sanitizer.validate_username(container_name)
             _sanitizer.validate_username(user_name)
-            cmd = f"deluser {user_name} sudo || deluser {user_name} wheel"
+            # 两个特权组都摘除（分号串行，不短路）：旧 `deluser sudo || deluser wheel`
+            # 在用户同属 sudo+wheel 时只摘第一个组，降级后仍保留另一组管理员权限。
+            # 摘掉任一组即成功（rc=0）；两组都不在 → 退出 1，沿用旧语义由调用方判失败。
+            cmd = (
+                f"rc=1; "
+                f"deluser {user_name} sudo && rc=0; "
+                f"deluser {user_name} wheel && rc=0; "
+                f"exit $rc"
+            )
         elif updated_role == ROLE.ROOT:
             # 直接让root的密码为user_name123
             _sanitizer.validate_username(container_name)
             _sanitizer.validate_username(user_name)
             cmd = (
                 f"echo 'root:{user_name}123' | chpasswd && "
-                f"(deluser {user_name} sudo || deluser {user_name} wheel) && "
+                f"(rc=1; deluser {user_name} sudo && rc=0; deluser {user_name} wheel && rc=0; exit $rc) && "
                 f"ts=$(date +%Y%m%d%H%M%S); "
                 f"mv /root/.collaborators/{user_name} /root/.collaborators/.legacy_{user_name}_$ts 2>/dev/null || true; "
                 f"userdel {user_name} || deluser {user_name}; "
@@ -563,13 +573,17 @@ def clean_mount(mount_path: str) -> bool:
     """清理已删除容器的宿主机 mount 目录（校验 + 执行都在 service 层）。
 
     安全检查：路径必须位于 NODE_CONTAINERS_BASE 下且包含 /containers/，
-    realpath 规范化防止 ../ 路径穿越绕过检查。超时抛 subprocess.TimeoutExpired。
+    realpath 规范化防止 ../ 路径穿越绕过检查。超时抛 subprocess.TimeoutExpired；
+    rm 删除失败抛 RuntimeError（幂等：路径不存在 rm -rf 仍返回 0）。
     """
     base = os.path.realpath(os.getenv("NODE_CONTAINERS_BASE", "/home"))
     real = os.path.realpath(str(mount_path))
     if not real.startswith(base + os.sep) or "/containers/" not in real:
         raise ValueError("invalid mount_path")
-    subprocess.run(["rm", "-rf", real], timeout=30, check=False)
+    # 删除失败抛 RuntimeError（端点转 500），不再假成功 → Ctrl 不会误标 cleaned_at，可重试
+    r = subprocess.run(["rm", "-rf", real], timeout=30, check=False)
+    if r.returncode != 0:
+        raise RuntimeError(f"rm -rf failed (rc={r.returncode}): {real}")
     return True
 
 
