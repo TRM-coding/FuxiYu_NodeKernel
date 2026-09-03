@@ -65,7 +65,7 @@ def mark_restart_status(container_name: str, status: str, error_reason: str | No
 			"gpu_list":[0,1,2,...], #字段为空就是CPU机器
 			"cpu_number":20,
 			"memory":16,#GB
-			"swap_memory":32,#GB
+			"shared_memory":32,#GB
 			"name":'example',
 			"port":0,
 			"image":"ubuntu24.04"
@@ -220,7 +220,7 @@ def Container_status():
 		if state is None:
 			status_out = "unknown"
 		elif state.lower() == 'running':
-			# additional readiness checks: ensure sshd is listening and authorized_keys exists
+			# additional readiness checks: ensure sshd is listening (one exec to avoid multiple roundtrips)
 			def _exec_check(cmd: str) -> bool:
 				try:
 					r = container.exec_run(["/bin/sh", "-c", cmd], user="root")
@@ -228,12 +228,13 @@ def Container_status():
 				except Exception:
 					return False
 
-			# try multiple ways to detect ssh listening (ss/netstat/ps/pgrep)
-			ssh_listening = False
-			for c in ["ss -ltn | grep :22", "netstat -ltn | grep :22", "pgrep -f sshd", "ps aux | grep [s]shd"]:
-				if _exec_check(c):
-					ssh_listening = True
-					break
+			# merge four ssh-detection checks into a single exec_run call
+			ssh_listening = _exec_check(
+				"ss -ltn 2>/dev/null | grep -q :22 || "
+				"netstat -ltn 2>/dev/null | grep -q :22 || "
+				"pgrep -f sshd >/dev/null 2>&1 || "
+				"ps aux 2>/dev/null | grep -q [s]shd"
+			)
 
 			# check authorized_keys exists and is non-empty
 			#auth_ok = _exec_check("test -s /root/.ssh/authorized_keys")
@@ -245,6 +246,8 @@ def Container_status():
 				status_out = "starting"
 		elif state.lower() in ('created', 'restarting', 'starting'):
 			status_out = "starting"
+		elif state.lower() == 'paused':
+			status_out = "paused"
 		elif state.lower() in ('exited', 'dead'):
 			status_out = "offline"
 		else:
@@ -327,10 +330,8 @@ def Machine_status():
 		if extensions.docker_client is None:
 			extensions.init_docker()
 	except Exception as e:
-		# return success but indicate docker init failed
 		return jsonify({"success": 0, "error": f"docker init failed: {e}", "error_reason": "docker_init_failed"}), 500
 
-	# If everything looks OK, report online. Keep response minimal to be fast.
 	return jsonify({"success": 1, "machine_status": "online"}), 200
 
 '''
@@ -354,6 +355,7 @@ def Machine_status():
 @api_bp.post("/remove_container")
 def Remove_container():
 	recived_data = request.get_json(silent=True)
+	print("Remove container called.")
 	if not recived_data:
 		return jsonify({"error":"invalid json", "error_reason": "invalid_json"}), 400
 	
@@ -372,14 +374,9 @@ def Remove_container():
 	try:
 		# 防止失败后删不掉
 		status_info = creation_status.get(container_name)
-		if status_info is not None and status_info.get("status") == "failed":
-			# clear the recorded failed state and return success
-			creation_status.pop(container_name, None)
-			return jsonify({
-				"success": 1
-			}), 200
-		
 		success = remove_container(container_name)
+		if status_info is not None and status_info.get("status") == "failed" and success == 0:
+			creation_status.pop(container_name, None)
 	except Exception as e:
 		print(e)
 		return jsonify({"success": 0, "error": str(e)}), 500
@@ -764,6 +761,163 @@ def Update_role():
 		"success": success,
 		"decrypted_message": verified_msg
 	}), 200
+
+
+'''
+通信数据格式：
+发送格式：
+{
+    "message":{
+        "config":
+        {
+            "container_name":"xxxx"
+        }
+    },
+    "signature":"xxxxxx"
+}
+返回格式：
+{
+    "success": [0|1],
+    "machine_disk": { "total_gb": ..., "used_gb": ..., "free_gb": ..., "percent": ... },
+    "container": { "overlay_rw_bytes": ..., "bind_mount_bytes": ..., "bind_mount_path": ..., "total_bytes": ... }
+}
+'''
+@api_bp.post("/check_disk_usage")
+def Check_disk_usage():
+	recived_data = request.get_json(silent=True)
+	if not recived_data:
+		return jsonify({"success": 0, "error": "invalid json", "error_reason": "invalid_json"}), 400
+
+	verified_msg = get_verified_msg(recived_data)
+	if not verified_msg:
+		return jsonify({"success": 0, "error": "invalid_signature or decryption failed",
+						"error_reason": "invalid_signature"}), 401
+
+	config = verified_msg.get("config") or {}
+	container_name = config.get("container_name")
+	if not container_name:
+		return jsonify({"success": 0, "error": "missing container_name",
+						"error_reason": "missing_container_name"}), 400
+
+	try:
+		if extensions.docker_client is None:
+			extensions.init_docker()
+	except Exception as e:
+		return jsonify({"success": 0, "error": f"docker init failed: {e}",
+						"error_reason": "docker_init_failed"}), 500
+
+	from ..services.container_service import get_disk_usage
+	try:
+		result = get_disk_usage(container_name)
+	except Exception as e:
+		return jsonify({"success": 0, "error": str(e),
+						"error_reason": "internal_error"}), 500
+
+	return jsonify({"success": 1, **result}), 200
+
+
+'''
+通信数据格式：
+发送格式：
+{
+    "message":{
+        "config":
+        {
+            "container_name":"xxxx",
+            "action":"pause"|"unpause"
+        }
+    },
+    "signature":"xxxxxx"
+}
+返回格式：
+{
+    "success": [0|1]
+}
+'''
+@api_bp.post("/pause_container")
+def Pause_container():
+	recived_data = request.get_json(silent=True)
+	if not recived_data:
+		return jsonify({"success": 0, "error": "invalid json", "error_reason": "invalid_json"}), 400
+
+	verified_msg = get_verified_msg(recived_data)
+	if not verified_msg:
+		return jsonify({"success": 0, "error": "invalid_signature or decryption failed",
+						"error_reason": "invalid_signature"}), 401
+
+	config = verified_msg.get("config") or {}
+	container_name = config.get("container_name")
+	if not container_name:
+		return jsonify({"success": 0, "error": "missing container_name",
+						"error_reason": "missing_container_name"}), 400
+
+	action = config.get("action", "pause")
+	if action not in ("pause", "unpause"):
+		return jsonify({"success": 0, "error": "invalid action, must be 'pause' or 'unpause'",
+						"error_reason": "invalid_action"}), 400
+
+	try:
+		if extensions.docker_client is None:
+			extensions.init_docker()
+	except Exception as e:
+		return jsonify({"success": 0, "error": f"docker init failed: {e}",
+						"error_reason": "docker_init_failed"}), 500
+
+	try:
+		container = extensions.docker_client.containers.get(container_name)
+		if action == "pause":
+			container.pause()
+			print(f"Container {container_name} paused.")
+		else:
+			container.unpause()
+			print(f"Container {container_name} unpaused.")
+	except docker.errors.NotFound:
+		return jsonify({"success": 0, "error": "container not found",
+						"error_reason": "not_found"}), 404
+	except Exception as e:
+		return jsonify({"success": 0, "error": str(e),
+						"error_reason": "internal_error"}), 500
+
+	return jsonify({"success": 1}), 200
+
+
+@api_bp.post("/clean_mount")
+def Clean_mount():
+	"""清理已删除容器的宿主机 mount 目录。
+
+	安全检查：路径必须以 /home/ 开头且包含 /containers/。
+	"""
+	recived_data = request.get_json(silent=True)
+	if not recived_data:
+		return jsonify({"success": 0, "error": "invalid json", "error_reason": "invalid_json"}), 400
+
+	verified_msg = get_verified_msg(recived_data)
+	if not verified_msg:
+		return jsonify({"success": 0, "error": "invalid_signature or decryption failed",
+						"error_reason": "invalid_signature"}), 401
+
+	config = verified_msg.get("config") or {}
+	mount_path = config.get("mount_path")
+	if not mount_path:
+		return jsonify({"success": 0, "error": "missing mount_path",
+						"error_reason": "missing_mount_path"}), 400
+
+	# 安全检查：路径必须在 /home/*/containers/ 下
+	if not str(mount_path).startswith("/home/") or "/containers/" not in str(mount_path):
+		return jsonify({"success": 0, "error": "invalid mount_path",
+						"error_reason": "invalid_path"}), 400
+
+	import subprocess
+	try:
+		subprocess.run(["rm", "-rf", str(mount_path)], timeout=30, check=False)
+		print(f"Mount cleaned: {mount_path}")
+		return jsonify({"success": 1}), 200
+	except subprocess.TimeoutExpired:
+		return jsonify({"success": 0, "error": "rm timeout",
+						"error_reason": "timeout"}), 500
+	except Exception as e:
+		return jsonify({"success": 0, "error": str(e),
+						"error_reason": "internal_error"}), 500
 
 
 def register_blueprints(app):

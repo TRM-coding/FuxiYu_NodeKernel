@@ -1,15 +1,29 @@
 """应用配置模块
 
 提供不同环境的配置类，支持通过环境变量覆盖默认值。
+网络配置采用三仓库统一键名：只填裸 IP 与端口，其余自动组装。
 """
 
 import os
 
-class SqlConfig:
-    SQLNAME='fuxi'
-    SQLURL='127.0.0.1'
-    SQLPORT='3306'
-    SQLUSER='root'
+
+def _env_int(name: str, default: int) -> int:
+    """读取整数型环境变量，空值/非法值回退默认。"""
+    raw = os.getenv(name, "")
+    if raw == "":
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
+
+class NetConfig:
+    """三仓库统一网络键名。分发时只改这几个值。"""
+    NODE_PORT = _env_int("NODE_PORT", 5789)
+    # WSS 迁移后 Node 主动连 server 时使用（当前 HTTP 接收模式下预留不消费）
+    CTRL_IP = os.getenv("CTRL_IP", "127.0.0.1")
+    CTRL_PORT = _env_int("CTRL_PORT", 5000)
 
 
 class KeyConfig:
@@ -17,20 +31,15 @@ class KeyConfig:
     PRIVATE_KEY_PATH='private_A.pem'
     PUBLIC_KEY_CONTROL='public_control.pem'
 
-# 新增：统一的 AppConfig 和 get_config
-class AppConfig(SqlConfig, KeyConfig):
-    # 允许通过环境变量覆盖
-    SQLNAME = os.getenv("SQLNAME", SqlConfig.SQLNAME)
-    SQLURL = os.getenv("SQLURL", SqlConfig.SQLURL)
-    SQLPORT = os.getenv("SQLPORT", SqlConfig.SQLPORT)
-    SQLUSER = os.getenv("SQLUSER", SqlConfig.SQLUSER)
+
+class AppConfig(KeyConfig):
     PUBLIC_KEY_PATH = os.getenv("PUBLIC_KEY_PATH", KeyConfig.PUBLIC_KEY_PATH)
     PRIVATE_KEY_PATH = os.getenv("PRIVATE_KEY_PATH", KeyConfig.PRIVATE_KEY_PATH)
-
-    # 使用本地 MySQL（root 无密码）
-    SQLALCHEMY_DATABASE_URI = f"mysql+pymysql://{SQLUSER}@{SQLURL}:{SQLPORT}/{SQLNAME}?charset=utf8mb4"
-    SQLALCHEMY_TRACK_MODIFICATIONS = False
     SECRET_KEY = os.getenv("SECRET_KEY", "dev")
+
+class NodeProxyConfig(AppConfig):
+    # 代理服务器配置
+    PROXY_HOST = os.getenv("PROXY_HOST", "http://202.205.102.121:8091")
 
 
 def get_config(env: str | None = None):

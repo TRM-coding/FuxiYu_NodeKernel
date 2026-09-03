@@ -3,3 +3,7 @@
 */.pytest_cache/
 */__pycache__/
 *.log
+
+/logs/*
+!/logs/.gitkeep
+.env

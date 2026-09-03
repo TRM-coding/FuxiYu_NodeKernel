@@ -1,7 +1,7 @@
 # 与他们相关的参数有必要被严格验证和过滤，或者改用更安全的方式（如直接传递参数列表而不是 shell 命令字符串）
 
 from ..constant import *
-from ..config import KeyConfig
+from ..config import KeyConfig, NodeProxyConfig
 from ..utils.Container import Container
 from .. import extensions
 from ..utils.CheckKeys import load_keys
@@ -21,6 +21,11 @@ from docker.types import Mount
 import os
 from typing import NamedTuple
 from ..utils import sanitizer as _sanitizer
+import subprocess
+import threading
+import time
+from datetime import datetime
+import shutil
 
 
 
@@ -61,10 +66,13 @@ def create_container(owner_name: str, config:Container.Config_info, public_key: 
     cpuset_cpus = ",".join(str(x) for x in cpu_list) if cpu_list else None
     mem_limit = f"{config.memory}g"
     
-    # 构建 memswap_limit 参数，如果 swap_memory 大于0，则 memswap_limit = memory + swap_memory；如果 swap_memory 不大于0，则不设置 memswap_limit（默认为和 memory 一样，禁止使用 swap）
-    swap_amt = int(getattr(config, 'swap_memory', 0) or 0)
-    memswap_limit = f"{config.memory + swap_amt}g" if swap_amt and swap_amt >= 0 else None
-    
+    # Do NOT set memswap_limit here; keep kernel swap behavior default.
+    # Instead, when provided, use `shared_memory` to set container's IPC shared memory size via `shm_size`.
+    shared_amt = int(getattr(config, 'shared_memory', 0) or 0)
+    # Docker SDK expects `shm_size` as an int (bytes) or a string like '64m'.
+    # Use bytes for clarity: convert GB -> bytes.
+    shm_size_bytes = int(shared_amt) * 1024 * 1024 * 1024 if shared_amt > 0 else None
+
     # GPU LIST为空则是CPU机器，不接受GPU请求。device_requests只用于GPU资源分配
     gpu_list = getattr(config, 'gpu_list', None)
     device_requests = None
@@ -78,10 +86,12 @@ def create_container(owner_name: str, config:Container.Config_info, public_key: 
             )
         ]
 
-    print(f"DEBUG: cpu_list={cpu_list}, gpu_list={gpu_list}, mem_limit={mem_limit}, memswap_limit={memswap_limit}, device_requests={device_requests}")
+    print(f"DEBUG: cpu_list={cpu_list}, gpu_list={gpu_list}, mem_limit={mem_limit}, shm_size_bytes={shm_size_bytes}, device_requests={device_requests}")
     name = f"{config.name}" # 名字自定义
-    # 将container的/root目录挂载到宿主机的/home/owner_name/containers/name目录，方便后续调试和数据持久化（虽然现在设计上容器是临时的，但以防万一）。这个路径也要确保合法和安全，避免注入攻击或路径遍历等问题。
-    host_root_mount = os.path.join("/home", owner_name, "containers", name)
+    # 将container的/root目录挂载到宿主机的{NODE_CONTAINERS_BASE}/owner_name/containers/name目录，方便后续调试和数据持久化（虽然现在设计上容器是临时的，但以防万一）。这个路径也要确保合法和安全，避免注入攻击或路径遍历等问题。
+    # 挂载根目录可配置：生产默认 /home（Node 以 root 运行）；开发环境指向可写路径，避免非 root 无权建 /home 下的目录。
+    containers_base = os.getenv("NODE_CONTAINERS_BASE", "/home")
+    host_root_mount = os.path.join(containers_base, owner_name, "containers", name)
         
     try:
         try: 
@@ -131,10 +141,10 @@ def create_container(owner_name: str, config:Container.Config_info, public_key: 
         
         ports={"22/tcp": config.port},   # ssh端口映射
         mem_limit=mem_limit,
-        memswap_limit=memswap_limit,
         cpuset_cpus=cpuset_cpus,
         device_requests=device_requests,
-        mounts=mounts
+        mounts=mounts,
+        **({"shm_size": shm_size_bytes} if shm_size_bytes is not None else {})
     )
     print(f"Container created with ID={container.id} and name={name}")
 
@@ -179,20 +189,50 @@ def create_container(owner_name: str, config:Container.Config_info, public_key: 
     # 以避免某些环境下 apt-get 卡死导致的问题。apt-get 有时会因为签名/证书
     # 问题失败（例如镜像环境或时间不同步），因此在失败时尝试一次回退策略，
     # 但不要因为安装失败就删除已创建的容器——只记录并继续。
+
+    # Configure network proxy inside container BEFORE any network operations.
+    # Read proxy from NodeProxyConfig so it can be changed via env/config.
+    PROXY_URL = getattr(NodeProxyConfig, 'PROXY_HOST', None)
+    if PROXY_URL:
+        try:
+            # write environment variables so new processes see the proxy
+            _run(container, (
+                "printf 'http_proxy=\"%s\"\nhttps_proxy=\"%s\"\nHTTP_PROXY=\"%s\"\nHTTPS_PROXY=\"%s\"\n' "
+                % (PROXY_URL, PROXY_URL, PROXY_URL, PROXY_URL)
+                + "> /etc/environment"
+            ))
+            # configure apt to use the proxy before the first apt network access
+            _run(container, (
+                "mkdir -p /etc/apt/apt.conf.d && printf 'Acquire::http::Proxy \"%s\";\nAcquire::https::Proxy \"%s\";\n' "
+                % (PROXY_URL, PROXY_URL)
+                + "> /etc/apt/apt.conf.d/99proxy"
+            ))
+            _run(container, (
+                "grep -i proxy /etc/environment /etc/apt/apt.conf.d/99proxy"
+            ))
+            print(f"Proxy configured inside container: {PROXY_URL}")
+        except Exception as e:
+            print(f"Failed to configure proxy inside container: {e}")
+    else:
+        print("No proxy configured for container network setup.")
+
+    ssh_ready = False
     try:
-        _run(container, "apt-get update")
-        _run(container, "DEBIAN_FRONTEND=noninteractive apt-get install -y openssh-server")
+        _run(container, "apt-get update", timeout_sec=300)
+        _run(container, "DEBIAN_FRONTEND=noninteractive apt-get install -y openssh-server", timeout_sec=600)
         _run(container, "mkdir -p /run/sshd")
         _run(container, "ssh-keygen -A")
+        ssh_ready = True
     except Exception as e:
         print(f"apt-get update/install failed: {e}\nAttempting fallback sequence (clean + relaxed update + allow-unauthenticated install)")
         try:
             _run(container, "apt-get clean")
             _run(container, "rm -rf /var/lib/apt/lists/*")
-            _run(container, "apt-get update -o Acquire::AllowInsecureRepositories=true -o Acquire::Check-Valid-Until=false")
-            _run(container, "DEBIAN_FRONTEND=noninteractive apt-get install -y --allow-unauthenticated openssh-server")
+            _run(container, "apt-get update -o Acquire::AllowInsecureRepositories=true -o Acquire::Check-Valid-Until=false", timeout_sec=300)
+            _run(container, "DEBIAN_FRONTEND=noninteractive apt-get install -y --allow-unauthenticated openssh-server", timeout_sec=600)
             _run(container, "mkdir -p /run/sshd")
             _run(container, "ssh-keygen -A")
+            ssh_ready = True
         except Exception as e2:
             print(f"Fallback apt-get sequence also failed: {e2}. Continuing without openssh-server; container created but SSH may be unavailable.")
     # 初始密码为 owner_name + "123"，用户可以登录后再改密码（也可以直接提供公钥登录）
@@ -201,14 +241,18 @@ def create_container(owner_name: str, config:Container.Config_info, public_key: 
         _sanitizer.validate_username(owner_name)
     except Exception as e:
         raise RuntimeError(f"unsafe owner_name: {e}")
-    _run(container, "sed -i 's/^#*PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config")
-    _run(container, "sed -i 's/^#*PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config")
+    if ssh_ready:
+        _run(container, "sed -i 's/^#*PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config")
+        _run(container, "sed -i 's/^#*PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config")
+    else:
+        print("Skipping sshd_config edits because openssh-server is not installed.")
 
     # 不用 service（容器里不一定有 init），直接启动 sshd（会后台守护）
-    try:
-        _run(container, "/usr/sbin/sshd")
-    except Exception as e:
-        print(f"Failed to start sshd inside container: {e}. SSH may be unavailable.")
+    if ssh_ready:
+        try:
+            _run(container, "/usr/sbin/sshd")
+        except Exception as e:
+            print(f"Failed to start sshd inside container: {e}. SSH may be unavailable.")
     # 使得公钥可选 （如果提供了公钥则安装，否则只用密码登录）
     if public_key:
         try:
@@ -236,10 +280,17 @@ def remove_container(container_name: str) -> int:
             except Exception as e:
                 print(f"Failed to init docker client: {e}")
                 raise RuntimeError(f"docker init failed: {e}")
-
+        print("Attempting to remove container with name:", container_name)
         container = extensions.docker_client.containers.get(container_name)
         container.remove(force=True)  # force=True 避免容器在运行时报错
-        return RemoveContinaerReturn.SUCCESS
+        # 验证容器确实被删除了        try:
+        try:
+            extensions.docker_client.containers.get(container_name)
+        except docker.errors.NotFound:
+            print(f"Container {container_name} successfully removed.")
+            return RemoveContinaerReturn.SUCCESS
+        print(f"Container {container_name} still exists after removal attempt.")
+        return RemoveContinaerReturn.FAILED
     except docker.errors.NotFound:
         print(f"Container {container_name} not found.")
         return RemoveContinaerReturn.NOTFOUND
@@ -258,7 +309,14 @@ def add_collaborator(container_name: str, user_name: str, role: ROLE) -> bool:
         # validate inputs to reduce injection risk
         _sanitizer.validate_username(container_name)
         _sanitizer.validate_username(user_name)
-        cmd = f"useradd -m -s /bin/bash {user_name} && echo '{user_name}:{user_name}123' | chpasswd"
+        cmd = (
+            f"mkdir -p /root/.collaborators && "
+            f"mkdir -p /root/.collaborators/{user_name} && "
+            f"useradd -M -d /root/.collaborators/{user_name} -s /bin/bash {user_name} && "
+            f"echo '{user_name}:{user_name}123' | chpasswd && "
+            f"ln -s /root/.collaborators/{user_name} /home/{user_name} && "
+            f"chown -R {user_name}:{user_name} /root/.collaborators/{user_name}"
+        )
         if role == ROLE.ADMIN:
             cmd += f" && (usermod -aG sudo {user_name} || usermod -aG wheel {user_name})"
         result = container.exec_run(["/bin/sh", "-c", cmd], user="root")
@@ -276,10 +334,21 @@ def remove_collaborator(container_name: str, user_name: str) -> bool:
             extensions.init_docker()
         container = extensions.docker_client.containers.get(container_name)
 
-        # 删除用户，并且一并删除home目录 (-r)
+        # 删除用户，数据改名存档到 .legacy_ 避免数据丢失
         _sanitizer.validate_username(container_name)
         _sanitizer.validate_username(user_name)
-        cmd = f"userdel -r {user_name} || deluser {user_name}"
+        cmd = (
+            f"ts=$(date +%Y%m%d%H%M%S); "
+            f"mv /root/.collaborators/{user_name} /root/.collaborators/.legacy_{user_name}_$ts 2>/dev/null || true; "
+            # 兼容历史容器：/home/用户名 可能是真实目录（旧 update_role 的 useradd -m 产物），
+            # 同样归档进持久化挂载，避免 rm 删不掉真实目录导致操作报错、数据无法找回。
+            f"if [ -d /home/{user_name} ] && [ ! -L /home/{user_name} ]; then "
+            f"mkdir -p /root/.collaborators && "
+            f"mv /home/{user_name} /root/.collaborators/.legacy_{user_name}_$ts.home 2>/dev/null || true; "
+            f"fi; "
+            f"userdel {user_name} || deluser {user_name}; "
+            f"rm -f /home/{user_name}"
+        )
 
         result = container.exec_run(["/bin/sh", "-c", cmd], user="root")
         print(f"Executed command to remove collaborator: {cmd}\nExit code: {result.exit_code}\nOutput: {result.output.decode('utf-8', errors='ignore')}")
@@ -300,7 +369,19 @@ def update_role(container_name: str, user_name: str, updated_role: ROLE) -> bool
             #先验证用户存在（如果不存在就创建），再添加到sudo组
             _sanitizer.validate_username(container_name)
             _sanitizer.validate_username(user_name)
-            cmd = f"id -u {user_name} || useradd -m -s /bin/bash {user_name} && echo '{user_name}:{user_name}123' | chpasswd"
+            # 新建账号必须与 add_collaborator 保持同一家目录模式：
+            # 家目录放 /root/.collaborators/用户名（宿主机持久化挂载内），/home 下只放软链。
+            # 若用 useradd -m，家目录会落在容器 overlay2 可写层，容器删除即丢数据，
+            # 且后续移除时 mv 归档找不到目录、rm 删不掉真实目录（操作报错且数据不归档）。
+            cmd = (
+                f"id -u {user_name} || ("
+                f"mkdir -p /root/.collaborators/{user_name} && "
+                f"useradd -M -d /root/.collaborators/{user_name} -s /bin/bash {user_name} && "
+                f"echo '{user_name}:{user_name}123' | chpasswd && "
+                f"ln -s /root/.collaborators/{user_name} /home/{user_name} && "
+                f"chown -R {user_name}:{user_name} /root/.collaborators/{user_name}"
+                f")"
+            )
             cmd += f" && (usermod -aG sudo {user_name} || usermod -aG wheel {user_name})"
         elif updated_role == ROLE.COLLABORATOR: # 直接从sudo组里删除用户（如果存在的话），但不删除用户账号
             _sanitizer.validate_username(container_name)
@@ -310,12 +391,14 @@ def update_role(container_name: str, user_name: str, updated_role: ROLE) -> bool
             # 直接让root的密码为user_name123
             _sanitizer.validate_username(container_name)
             _sanitizer.validate_username(user_name)
-            cmd = f"echo 'root:{user_name}123' | chpasswd"
-            # 不论是collaborator还是admin都要把原来的权限去掉，避免出现权限叠加的情况（虽然现在设计上collaborator和admin是互斥的，但以防万一）
-            #   先删sudo/wheel
-            cmd += f" && deluser {user_name} sudo || deluser {user_name} wheel"
-            #   再删掉用户（如果存在的话），避免出现同名用户导致的权限问题
-            cmd += f" && userdel -r {user_name} || deluser {user_name}"
+            cmd = (
+                f"echo 'root:{user_name}123' | chpasswd && "
+                f"(deluser {user_name} sudo || deluser {user_name} wheel) && "
+                f"ts=$(date +%Y%m%d%H%M%S); "
+                f"mv /root/.collaborators/{user_name} /root/.collaborators/.legacy_{user_name}_$ts 2>/dev/null || true; "
+                f"userdel {user_name} || deluser {user_name}; "
+                f"rm -f /home/{user_name}"
+            )
 
         else:
             raise ValueError(f"Unknown role: {updated_role}")
@@ -347,6 +430,11 @@ def start_container(container_name: str) -> bool:
             return True
         container.start()
         container.reload()
+        # 容器无 init，手动起 sshd
+        try:
+            container.exec_run(["/usr/sbin/sshd"], user="root")
+        except Exception:
+            pass
         print(f"Started container {container_name}, new status={getattr(container, 'status', None)}")
         return True
     except docker.errors.NotFound:
@@ -393,7 +481,7 @@ def restart_container(container_name: str, timeout: int = 10) -> bool:
         container = extensions.docker_client.containers.get(container_name)
         container.restart(timeout=timeout)
         container.reload()
-        container.exec_run("service ssh restart", user="root")
+        container.exec_run(["/usr/sbin/sshd"], user="root")
         print(f"Restarted container {container_name}, new status={getattr(container, 'status', None)}")
         return True
     except docker.errors.NotFound:
@@ -416,10 +504,19 @@ def get_last_ssh_connect_time(container_name: str) -> str | None:
         _sanitizer.validate_username(container_name)
         container = extensions.docker_client.containers.get(container_name)
 
+        # 容器未运行则跳过 exec_run，避免等待 Docker 返回 409 耗时
+        try:
+            _state = (container.attrs.get('State') or {}).get('Status', '')
+        except Exception:
+            _state = ''
+        if str(_state).lower() in ('exited', 'dead', 'created', 'paused', 'removing'):
+            return None
+
         # Prefer `last` for authoritative login sessions, then fallback to sshd logs.
+        # TZ=UTC 强制 last 输出 UTC 时间，Ctrl 侧全程 UTC 无需转换。
         cmd = r"""
 if command -v last >/dev/null 2>&1; then
-  v="$(last -w -i 2>/dev/null | awk '$1!="wtmp" && $1!="reboot" && $1!="btmp" && $1!="runlevel" {print; exit}')"
+  v="$(TZ=UTC last -w -i 2>/dev/null | awk '$1!="wtmp" && $1!="reboot" && $1!="btmp" && $1!="runlevel" {print; exit}')"
   if [ -n "$v" ]; then
     echo "$v"
     exit 0
@@ -448,6 +545,198 @@ echo "$line"
     except Exception as e:
         print(f"Failed to get last ssh connect time for {container_name}: {e}")
         return None
+
+
+# bind mount 磁盘用量缓存: {path: {"bytes": int, "updated_at": datetime, "running": bool}}
+_bind_disk_cache: dict[str, dict] = {}
+_bind_cache_lock = threading.Lock()
+_BIND_CACHE_TTL_SEC = 900  # 15 分钟
+
+
+def _du_background(bind_path: str) -> None:
+    """在后台线程中跑 du -sb，完成后写入缓存。"""
+    try:
+        r = subprocess.run(
+            ["du", "-sb", bind_path],
+            capture_output=True, text=True, timeout=300,  # 大目录最多等 5 分钟
+        )
+        out = r.stdout.strip()
+        if out:
+            size = int(out.split()[0])
+            with _bind_cache_lock:
+                _bind_disk_cache[bind_path] = {
+                    "bytes": size,
+                    "running": False,
+                    "updated_at": datetime.utcnow(),
+                }
+            return
+    except subprocess.TimeoutExpired:
+        pass
+    except Exception:
+        pass
+    # 失败: 标记 running=False，下次请求会重试
+    with _bind_cache_lock:
+        entry = _bind_disk_cache.get(bind_path)
+        if entry:
+            entry["running"] = False
+
+
+def _resolve_bind_disk(bind_path: str) -> dict:
+    """
+    解析 bind mount 磁盘用量（缓存 + 异步后台 du）。
+    返回: {"bind_mount_bytes": int|None, "bind_mount_source": str, "bind_mount_path": str}
+    """
+    with _bind_cache_lock:
+        entry = _bind_disk_cache.get(bind_path)
+
+    if entry and entry.get("bytes") is not None:
+        age = (datetime.utcnow() - entry["updated_at"]).total_seconds()
+        if age < _BIND_CACHE_TTL_SEC:
+            # 新鲜缓存，直接返回
+            return {
+                "bind_mount_bytes": entry["bytes"],
+                "bind_mount_source": "fresh" if not entry.get("running") else "cached",
+                "bind_mount_path": bind_path,
+            }
+        # 过期: 返回旧值，触发后台刷新
+        if not entry.get("running"):
+            with _bind_cache_lock:
+                entry["running"] = True
+            threading.Thread(target=_du_background, args=(bind_path,), daemon=True).start()
+        return {
+            "bind_mount_bytes": entry["bytes"],
+            "bind_mount_source": "stale",
+            "bind_mount_path": bind_path,
+        }
+
+    # 无缓存: 触发后台 du，先返回 None
+    if not entry:
+        with _bind_cache_lock:
+            _bind_disk_cache[bind_path] = {"bytes": None, "running": True, "updated_at": datetime.utcnow()}
+        threading.Thread(target=_du_background, args=(bind_path,), daemon=True).start()
+        return {
+            "bind_mount_bytes": None,
+            "bind_mount_source": "measuring",
+            "bind_mount_path": bind_path,
+        }
+
+    # 正在跑 du（entry 存在但 bytes=None 且 running=True）
+    if entry.get("running"):
+        return {
+            "bind_mount_bytes": None,
+            "bind_mount_source": "measuring",
+            "bind_mount_path": bind_path,
+        }
+
+    # 上一轮 du 失败（entry 存在，bytes=None，running=False），重试
+    with _bind_cache_lock:
+        entry["running"] = True
+    threading.Thread(target=_du_background, args=(bind_path,), daemon=True).start()
+    return {
+        "bind_mount_bytes": None,
+        "bind_mount_source": "measuring",
+        "bind_mount_path": bind_path,
+    }
+
+
+def get_disk_usage(container_name: str) -> dict:
+    """
+    获取单个容器的磁盘使用情况（只读，两路求和）。
+    - overlay2 可写层: Docker SDK container.attrs['SizeRw']
+    - bind mount 目录: du -sb <Source> (从 attrs['Mounts'] 取 /root 的 Source)
+    - 宿主机磁盘: shutil.disk_usage("/home")
+
+    两路互斥（bind mount 把 /root 从 overlay2 抽离），直接相加即总占用。
+    函数不抛异常，所有错误都 swallowing 到返回 dict 中。
+    """
+    result = {
+        "machine_disk": {"total_gb": 0.0, "used_gb": 0.0, "free_gb": 0.0, "percent": 0.0},
+        "container": {
+            "container_name": container_name,
+            "overlay_rw_bytes": None,
+            "bind_mount_bytes": None,
+            "bind_mount_path": None,
+            "bind_mount_source": "none",
+            "total_bytes": 0,
+        },
+    }
+
+    # --- 宿主机磁盘 ---
+    try:
+        usage = shutil.disk_usage(os.getenv("NODE_CONTAINERS_BASE", "/home"))
+        total_gb = usage.total / (1024**3)
+        used_gb = usage.used / (1024**3)
+        free_gb = usage.free / (1024**3)
+        percent = (usage.used / usage.total * 100) if usage.total > 0 else 0.0
+        result["machine_disk"] = {
+            "total_gb": round(total_gb, 1),
+            "used_gb": round(used_gb, 1),
+            "free_gb": round(free_gb, 1),
+            "percent": round(percent, 1),
+        }
+    except Exception as e:
+        result["machine_disk"]["error"] = str(e)
+
+    # --- 容器 ---
+    try:
+        if extensions.docker_client is None:
+            extensions.init_docker()
+        container = extensions.docker_client.containers.get(container_name)
+    except docker.errors.NotFound:
+        result["container"]["error"] = "container_not_found"
+        return result
+    except Exception as e:
+        result["container"]["error"] = f"docker_access_failed: {e}"
+        return result
+
+    # 第一路: overlay2 可写层
+    try:
+        size_rw = (container.attrs.get('SizeRw') or 0)
+        if size_rw <= 0:
+            try:
+                df = extensions.docker_client.df()
+                for c_df in df.get('Containers', []) or []:
+                    names = c_df.get('Names', []) or []
+                    if f"/{container_name}" in names:
+                        size_rw = c_df.get('SizeRw', 0) or 0
+                        break
+            except Exception:
+                pass
+                size_rw = 0
+        result["container"]["overlay_rw_bytes"] = int(size_rw)
+    except Exception as e:
+        result["container"]["overlay_rw_bytes"] = None
+        result["container"]["overlay_rw_error"] = str(e)
+
+    # 第二路: bind mount 目录 (Destination == "/root")，使用缓存 + 异步后台 du
+    try:
+        mounts = container.attrs.get('Mounts', []) or []
+        bind_root_source = None
+        for m in mounts:
+            if m.get('Destination') == '/root' and m.get('Type') == 'bind':
+                bind_root_source = m.get('Source')
+                break
+        if bind_root_source:
+            resolved = _resolve_bind_disk(bind_root_source)
+            result["container"]["bind_mount_path"] = resolved["bind_mount_path"]
+            result["container"]["bind_mount_bytes"] = resolved["bind_mount_bytes"]
+            result["container"]["bind_mount_source"] = resolved["bind_mount_source"]
+        else:
+            result["container"]["bind_mount_bytes"] = None
+            result["container"]["bind_mount_error"] = "no_bind_mount_for_root"
+    except Exception as e:
+        result["container"]["bind_mount_bytes"] = None
+        result["container"]["bind_mount_error"] = str(e)
+
+    # 总和
+    rw = result["container"]["overlay_rw_bytes"] or 0
+    bm = result["container"]["bind_mount_bytes"] or 0
+    result["container"]["total_bytes"] = rw + bm
+
+    def _h(b): return f"{b/1024/1024:.0f}M" if b >= 1024*1024 else f"{b/1024:.0f}K" if b >= 1024 else f"{b}B"
+    src = result["container"].get("bind_mount_source", "none")
+    print(f"[disk-check] {container_name} overlay={_h(rw)} bind={_h(bm)} bind_src={src} total={_h(rw + bm)}")
+    return result
 
 
 ####################################################
