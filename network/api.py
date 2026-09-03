@@ -152,7 +152,12 @@ def create_container_api(message: CreateContainerMessage):
                 owner_name,
                 cfg_obj,
                 public_key=message.public_key,
+                restore_mount_path=message.restore_mount_path,
             )
+            for account in message.restore_accounts or []:
+                ok = add_collaborator(result.container_name, account.user_name, _role_value(account.role))
+                if not ok:
+                    raise RuntimeError(f"failed to restore collaborator {account.user_name}")
             logger.info(
                 "create_container service returned: name=%s container_id=%s",
                 result.container_name,

@@ -160,6 +160,44 @@ def test_create_container_gpu_request_uses_device_ids_without_driver(monkeypatch
     assert run_calls[0][1]["device_requests"] == device_request_calls
 
 
+def test_create_container_restore_reuses_existing_mount(monkeypatch):
+    run_calls = []
+
+    class _Containers(FakeContainers):
+        def run(self, *a, **k):
+            run_calls.append((a, k))
+            return FakeContainer(name=k.get("name", "c1"))
+
+    monkeypatch.setattr(extensions, "docker_client", FakeDockerClient(_Containers()))
+    _patch_fs(monkeypatch)
+    monkeypatch.setenv("NODE_CONTAINERS_BASE", "/tmp")
+    monkeypatch.setattr(os.path, "isdir", lambda path: path == os.path.realpath("/tmp/admin/containers/old_c"))
+
+    result = create_container(
+        "admin",
+        Container.Config_info(**VALID_CFG),
+        restore_mount_path="/tmp/admin/containers/old_c",
+    )
+
+    assert isinstance(result, CreateContainerReturn)
+    assert result.bind_mount_path.replace("\\", "/").endswith("/tmp/admin/containers/old_c")
+    assert run_calls[0][1]["mounts"][0]["Source"].replace("\\", "/").endswith("/tmp/admin/containers/old_c")
+
+
+def test_create_container_restore_rejects_mount_outside_base(monkeypatch):
+    monkeypatch.setattr(extensions, "docker_client", FakeDockerClient())
+    _patch_fs(monkeypatch)
+    monkeypatch.setenv("NODE_CONTAINERS_BASE", "/tmp")
+    monkeypatch.setattr(os.path, "isdir", lambda path: True)
+
+    with pytest.raises(RuntimeError, match="unsafe restore mount path"):
+        create_container(
+            "admin",
+            Container.Config_info(**VALID_CFG),
+            restore_mount_path="/etc/fuxi-leak",
+        )
+
+
 def test_build_image_uses_cached_image_tag(monkeypatch):
     """同 tag 已存在时命中 Node 本地缓存：跳过 build，直接返回 tag。"""
     build_calls = []

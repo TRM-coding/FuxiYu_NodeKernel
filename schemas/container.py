@@ -51,6 +51,11 @@ class ContainerOperationAcceptedResponse(SuccessResponse):
     container_name: str
 
 
+class RestoreAccountConfig(BaseModel):
+    user_name: str
+    role: CollaboratorRole = "collaborator"
+
+
 #####################
 # 创建容器
 
@@ -60,6 +65,8 @@ class CreateContainerMessage(BaseModel):
     config: ContainerConfig
     public_key: str | None = Field(default=None, description="Optional SSH public key installed into root authorized_keys")
     image_build: ImageBuildConfig | None = None
+    restore_mount_path: str | None = Field(default=None, description="Existing host mount path reused during container resurrection")
+    restore_accounts: list[RestoreAccountConfig] = Field(default_factory=list)
 
 
 class CreateContainerResponse(SuccessResponse):

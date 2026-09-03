@@ -84,6 +84,7 @@ class CreateContainerReturn(NamedTuple):
     container_name:str
     port: int | None = None
     port_mappings: list | None = None
+    bind_mount_path: str | None = None
 
 class RemoveContinaerReturn:
     SUCCESS=0
@@ -101,6 +102,7 @@ def create_container(
     owner_name: str,
     config: Container.Config_info,
     public_key: str | None = None,
+    restore_mount_path: str | None = None,
 ) -> CreateContainerReturn:
     if extensions.docker_client is None:
         extensions.init_docker()
@@ -113,6 +115,15 @@ def create_container(
         _sanitizer.validate_username(owner_name)
     except Exception as e:
         raise RuntimeError(f"unsafe owner_name: {e}")
+    # 容器名与 Ctrl 侧创建校验同规则（docker 要求 ≥2 字符，平台字符集限字母/数字/下划线）。
+    # 在 docker create 400 前尽早失败，避免脏错误形态 + 创建残留（2026-09 单字符 "2" 复盘）。
+    import re
+
+    _create_name = str(getattr(config, "name", "") or "")
+    if not (2 <= len(_create_name) <= 115) or not re.fullmatch(r"[A-Za-z0-9_]{2,}", _create_name):
+        raise RuntimeError(
+            f"invalid container name: '{_create_name}' (need 2-115 chars of A-Z a-z 0-9 _)"
+        )
     # 补CPU LIST 从 0 开始编号，如果 cpu_number=4 就是 [0,1,2,3]
     cpu_count = int(getattr(config, 'cpu_number', 0) or 0)
     cpu_list = list(range(cpu_count)) if cpu_count > 0 else []
@@ -146,17 +157,31 @@ def create_container(
     host_root_mount = os.path.join(containers_base, owner_name, "containers", name)
         
     try:
-        try: 
-            os.makedirs(host_root_mount, exist_ok=False)
-        except FileExistsError:
-            # 如果目录已经存在了，加上一个随机后缀避免冲突
-            import random
-            suffix = random.randint(10000, 99999)
-            host_root_mount += f"_{suffix}"
+        if restore_mount_path:
+            base_real = os.path.realpath(containers_base)
+            mount_real = os.path.realpath(restore_mount_path)
+            base_norm = base_real.replace("\\", "/").rstrip("/")
+            mount_norm = mount_real.replace("\\", "/").rstrip("/")
+            if not (mount_norm == base_norm or mount_norm.startswith(base_norm + "/")):
+                raise RuntimeError(f"unsafe restore mount path outside containers base: {restore_mount_path}")
+            parts = set(mount_norm.split("/"))
+            if "containers" not in parts:
+                raise RuntimeError(f"unsafe restore mount path without containers segment: {restore_mount_path}")
+            if not os.path.isdir(mount_real):
+                raise RuntimeError(f"restore mount path does not exist: {restore_mount_path}")
+            host_root_mount = mount_real
+        else:
             try:
                 os.makedirs(host_root_mount, exist_ok=False)
             except FileExistsError:
-                raise RuntimeError(f"failed to create host mount path {host_root_mount}: directory already exists")
+                # 如果目录已经存在了，加上一个随机后缀避免冲突
+                import random
+                suffix = random.randint(10000, 99999)
+                host_root_mount += f"_{suffix}"
+                try:
+                    os.makedirs(host_root_mount, exist_ok=False)
+                except FileExistsError:
+                    raise RuntimeError(f"failed to create host mount path {host_root_mount}: directory already exists")
         # 设置权限
         current_uid = os.getuid()
         current_gid = os.getgid()
@@ -311,7 +336,7 @@ def create_container(
 
     logger.info("create_container service complete: name=%s container_id=%s ssh_ready=True port=%s",
                 name, container.id, port)
-    return CreateContainerReturn(container.id, container.name, port, port_mappings)
+    return CreateContainerReturn(container.id, container.name, port, port_mappings, host_root_mount)
 
 #删除容器并删除其所有者记录
 def remove_container(container_name: str) -> int:

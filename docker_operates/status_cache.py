@@ -408,11 +408,16 @@ class ContainerStatusCache:
             self._build_pending.pop(name, None)
         logger.info("status-cache clear_pending: name=%s", name)
 
-    def mark_ready_check(self, name: str, status: str = ContainerStatus.STARTING.value) -> None:
+    def mark_ready_check(self, name: str, status: str = ContainerStatus.STARTING.value, *, cold_verify: bool = False) -> None:
         """创建完成入口：清 pending + 落 starting + 标记 sshd 就绪确认中。
 
         docker 层看到 running 早于 sshd 就绪，就绪确认由采集侧 probe 循环负责
         （exec 检查 :22 监听，就绪后升 online 并清标记）。
+
+        *cold_verify*：node 重启/首连后的冷启动复核（容器非"刚被操作启动"而是
+        cache 丢失后的复查）。此时对外推送 unknown + status_source=cold_start_verify，
+        由 Ctrl 落容器轴 unknown 标记（不污染最后已知状态）；probe 通过升 online 时
+        update() 整条重建自然清除该标记。
         """
         with self._lock:
             old_entry = self._cache.get(name, {})
@@ -422,6 +427,8 @@ class ContainerStatusCache:
                 "ready_check": True,
                 "updated_at": datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%S'),
             }
+            if cold_verify:
+                entry["cold_verify_since"] = entry["updated_at"]
             # 端口信息（创建后 inspect 回填）随就绪确认保留
             if old_entry.get("port") is not None:
                 entry["port"] = old_entry.get("port")
@@ -585,7 +592,8 @@ class ContainerStatusCache:
         if entry is None:
             raw = _map_container_to_status(container)
             if raw == ContainerStatus.ONLINE.value:
-                self.mark_ready_check(container.name)
+                # 冷启动复核：不直接 ONLINE（见 mark_ready_check cold_verify 说明）
+                self.mark_ready_check(container.name, cold_verify=True)
                 self.update_runtime_metrics(container.name, runtime_metrics)
                 return
             if raw == ContainerStatus.STARTING.value:
@@ -660,6 +668,14 @@ class ContainerStatusCache:
         for name in names:
             st = self.get_state(name)
             if st["source"] != "miss":
+                if st["source"] == "cache":
+                    with self._lock:
+                        cache_entry = self._cache.get(name)
+                    if cache_entry and cache_entry.get("cold_verify_since"):
+                        # 冷启动复核中：对外状态 unknown + 触发源，Ctrl 落容器轴 unknown 标记
+                        st["status"] = ContainerStatus.UNKNOWN.value
+                        st["status_source"] = "cold_start_verify"
+                        st["unknown_since"] = cache_entry["cold_verify_since"]
                 result[name] = st
         return result
 

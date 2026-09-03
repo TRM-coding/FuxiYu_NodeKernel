@@ -102,8 +102,8 @@ def test_node_self_signed_certificate_is_valid_pin_anchor(monkeypatch, tmp_path)
 def test_create_container_success(client, monkeypatch):
     calls = []
 
-    def _stub(owner_name, cfg, public_key=None, build=None, on_status=None):
-        calls.append((owner_name, cfg, public_key, build, on_status))
+    def _stub(owner_name, cfg, public_key=None, restore_mount_path=None):
+        calls.append((owner_name, cfg, public_key, restore_mount_path))
         return CreateContainerReturn("cid123", cfg.name)
 
     _patched_service(monkeypatch, "container_exists", lambda name: False)
@@ -132,8 +132,8 @@ def test_create_container_with_image_build_reports_building(client, monkeypatch)
         build_calls.append(build)
         return build.image_tag
 
-    def _stub(owner_name, cfg, public_key=None):
-        calls.append((owner_name, cfg, public_key))
+    def _stub(owner_name, cfg, public_key=None, restore_mount_path=None):
+        calls.append((owner_name, cfg, public_key, restore_mount_path))
         return CreateContainerReturn("cid123", cfg.name)
 
     _patched_service(monkeypatch, "container_exists", lambda name: False)
@@ -158,6 +158,36 @@ def test_create_container_with_image_build_reports_building(client, monkeypatch)
     assert len(build_calls) == 1
     assert len(calls) == 1
     assert calls[0][1].image == payload["image_build"]["image_tag"]
+
+
+def test_create_container_restore_payload_passes_mount_and_accounts(client, monkeypatch):
+    calls = []
+    collaborator_calls = []
+
+    def _stub(owner_name, cfg, public_key=None, restore_mount_path=None):
+        calls.append((owner_name, cfg, public_key, restore_mount_path))
+        return CreateContainerReturn("cid123", cfg.name)
+
+    def _add_collaborator(container_name, user_name, role):
+        collaborator_calls.append((container_name, user_name, role))
+        return True
+
+    _patched_service(monkeypatch, "container_exists", lambda name: False)
+    _patched_service(monkeypatch, "create_container", _stub)
+    _patched_service(monkeypatch, "add_collaborator", _add_collaborator)
+
+    payload = {
+        "owner_name": "admin",
+        "config": VALID_CFG,
+        "restore_mount_path": "/tmp/admin/containers/c1_old",
+        "restore_accounts": [{"user_name": "alice", "role": "collaborator"}],
+    }
+    resp = client.post("/api/create_container", json=payload)
+
+    assert resp.status_code == 200
+    time.sleep(0.1)
+    assert calls[0][3] == "/tmp/admin/containers/c1_old"
+    assert collaborator_calls == [("c1", "alice", api_module.ROLE.COLLABORATOR)]
 
 
 def test_create_container_build_failed_is_visible_without_delete(client, monkeypatch):
