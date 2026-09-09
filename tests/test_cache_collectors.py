@@ -13,7 +13,7 @@ import threading
 
 from FuxiYu_NodeKernel import extensions
 from FuxiYu_NodeKernel.constant import ContainerStatus
-from FuxiYu_NodeKernel.docker_operates.disk_usage_cache import DiskUsageCache
+from FuxiYu_NodeKernel.docker_operates.disk_usage_cache import BIND_DU_TIMEOUT_SEC, DiskUsageCache
 from FuxiYu_NodeKernel.docker_operates.status_cache import ContainerStatusCache
 from FuxiYu_NodeKernel.docker_operates.sys_cache import SysSnapshotCache
 from FuxiYu_NodeKernel.network import wss
@@ -81,10 +81,25 @@ class _Containers:
 
 
 class _DockerClient:
-    def __init__(self, containers):
+    def __init__(self, containers, inspect_size_rw=2048):
         self.containers = _Containers(containers)
+        self.api = self
+        self.inspect_size_rw = inspect_size_rw
+        self.inspect_calls = []
+        self.df_called = False
+
+    def _url(self, path, *args):
+        return path.format(*args)
+
+    def _get(self, url, params=None):
+        self.inspect_calls.append((url, params))
+        return {"url": url, "params": params}
+
+    def _result(self, response, json=False):
+        return {"SizeRw": self.inspect_size_rw}
 
     def df(self):
+        self.df_called = True
         return {"Containers": [{"Names": ["/c1"], "SizeRw": 2048}]}
 
 
@@ -524,10 +539,51 @@ def test_disk_usage_cache_collects_overlay_bind_and_snapshot(monkeypatch, tmp_pa
 
     usage = snap["containers"]["c1"]
     assert usage["overlay_rw_bytes"] == 4096
+    assert usage["overlay_rw_source"] == "attrs"
     assert usage["bind_mount_bytes"] == 8192
     assert usage["bind_mount_source"] == "fresh"
     assert usage["total_bytes"] == 12288
     assert snap["machine_disk"]["total_gb"] == 100
+
+
+def test_disk_usage_cache_collects_overlay_from_single_container_inspect_when_attrs_missing(monkeypatch):
+    container = _Container("c1", status="running", size_rw=4096)
+    del container.attrs["SizeRw"]
+    client = _DockerClient([container], inspect_size_rw=2048)
+    monkeypatch.setattr(extensions, "docker_client", client)
+
+    cache = DiskUsageCache()
+    result = cache.collect_overlay_rw("c1")
+
+    assert result == {"overlay_rw_bytes": 2048, "overlay_rw_source": "inspect_size"}
+    assert client.inspect_calls == [(f"/containers/{container.id}/json", {"size": 1})]
+    assert client.df_called is False
+
+
+def test_disk_usage_cache_overlay_failure_keeps_total_pending(monkeypatch):
+    container = _Container("c1", status="running", size_rw=4096)
+    monkeypatch.setattr(extensions, "docker_client", _DockerClient([container]))
+
+    cache = DiskUsageCache()
+    monkeypatch.setattr(cache, "collect_overlay_rw", lambda name: {
+        "overlay_rw_bytes": None,
+        "overlay_rw_source": "error",
+        "overlay_rw_error": "inspect_size_failed",
+    })
+    monkeypatch.setattr(cache, "get_bind", lambda path: {
+        "bind_mount_bytes": 8192,
+        "bind_mount_source": "fresh",
+        "bind_mount_path": path,
+    })
+
+    cache.collect_container("c1")
+    usage = cache.snapshot()["containers"]["c1"]
+
+    assert usage["overlay_rw_bytes"] is None
+    assert usage["overlay_rw_source"] == "error"
+    assert usage["overlay_rw_error"] == "inspect_size_failed"
+    assert usage["bind_mount_bytes"] == 8192
+    assert usage["total_bytes"] is None
 
 
 def test_disk_usage_cache_bind_cache_sources(tmp_path):
@@ -543,6 +599,26 @@ def test_disk_usage_cache_bind_cache_sources(tmp_path):
     fresh = cache.get_bind(str(bind_dir))
     assert fresh["bind_mount_source"] == "fresh"
     assert fresh["bind_mount_bytes"] > 0
+
+
+def test_disk_usage_cache_collect_bind_uses_extended_du_timeout(monkeypatch, tmp_path):
+    bind_dir = tmp_path / "bind"
+    bind_dir.mkdir()
+    calls = []
+
+    def _run(*args, **kwargs):
+        calls.append({"args": args, "kwargs": kwargs})
+        return subprocess.CompletedProcess(args[0], 0, stdout="5\t/path\n", stderr="")
+
+    monkeypatch.setattr(
+        "FuxiYu_NodeKernel.docker_operates.disk_usage_cache.subprocess.run",
+        _run,
+    )
+
+    cache = DiskUsageCache()
+    cache.collect_bind(str(bind_dir))
+
+    assert calls[0]["kwargs"]["timeout"] == BIND_DU_TIMEOUT_SEC == 600
 
 
 def test_sys_snapshot_cache_collects_vendor_aware_gpu(monkeypatch):

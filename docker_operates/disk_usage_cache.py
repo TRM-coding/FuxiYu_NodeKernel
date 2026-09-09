@@ -22,6 +22,7 @@ logger = logging.getLogger(__name__)
 
 # bind mount 缓存 TTL（秒）：15 分钟
 BIND_CACHE_TTL_SEC = 900
+BIND_DU_TIMEOUT_SEC = 600
 # 容器级用量滚动采集 TTL（秒）与流水线步进：与 last_ssh_cache 同构的滚动自驱
 DISK_SWEEP_TTL_SEC = 900
 DISK_SWEEP_STEP_SLEEP = 2
@@ -42,7 +43,7 @@ class DiskUsageCache:
         try:
             r = subprocess.run(
                 ["du", "-sb", bind_path],
-                capture_output=True, text=True, timeout=300,  # 大目录最多等 5 分钟
+                capture_output=True, text=True, timeout=BIND_DU_TIMEOUT_SEC,
             )
             out = r.stdout.strip()
             if out:
@@ -64,30 +65,40 @@ class DiskUsageCache:
             if entry:
                 entry["running"] = False
 
-    def collect_overlay_rw(self, container_name: str) -> int | None:
-        """overlay2 可写层：attrs SizeRw，<=0 时 df 兜底。返回字节数或 None。"""
+    def collect_overlay_rw(self, container_name: str) -> dict:
+        """overlay2 writable layer with explicit source/error state."""
         import docker as _docker
         try:
             from .. import extensions
             if extensions.docker_client is None:
                 extensions.init_docker()
             container = extensions.docker_client.containers.get(container_name)
-            size_rw = (container.attrs.get('SizeRw') or 0)
-            if size_rw <= 0:
-                try:
-                    df = extensions.docker_client.df()
-                    for c_df in df.get('Containers', []) or []:
-                        names = c_df.get('Names', []) or []
-                        if f"/{container_name}" in names:
-                            size_rw = c_df.get('SizeRw', 0) or 0
-                            break
-                except Exception:
-                    size_rw = 0
-            return int(size_rw)
+            size_rw = container.attrs.get('SizeRw')
+            if size_rw is not None:
+                return {"overlay_rw_bytes": int(size_rw or 0), "overlay_rw_source": "attrs"}
+
+            try:
+                api = extensions.docker_client.api
+                res = api._get(api._url("/containers/{0}/json", container.id), params={"size": 1})
+                detail = api._result(res, True)
+                inspect_size_rw = detail.get('SizeRw')
+                if inspect_size_rw is not None:
+                    return {"overlay_rw_bytes": int(inspect_size_rw or 0), "overlay_rw_source": "inspect_size"}
+                return {
+                    "overlay_rw_bytes": None,
+                    "overlay_rw_source": "missing",
+                    "overlay_rw_error": "inspect_size_missing",
+                }
+            except Exception as e:
+                return {
+                    "overlay_rw_bytes": None,
+                    "overlay_rw_source": "error",
+                    "overlay_rw_error": str(e),
+                }
         except _docker.errors.NotFound:
-            return None
-        except Exception:
-            return None
+            return {"overlay_rw_bytes": None, "overlay_rw_source": "not_found", "overlay_rw_error": "not_found"}
+        except Exception as e:
+            return {"overlay_rw_bytes": None, "overlay_rw_source": "error", "overlay_rw_error": str(e)}
 
     def collect_machine_disk(self) -> dict:
         """宿主机磁盘（轻量实时调用）。"""
@@ -122,19 +133,23 @@ class DiskUsageCache:
             usage = {
                 "container_name": container_name,
                 "overlay_rw_bytes": None,
+                "overlay_rw_source": "missing",
                 "bind_mount_bytes": None,
                 "bind_mount_path": None,
                 "bind_mount_source": "none",
-                "total_bytes": 0,
+                "total_bytes": None,
             }
 
             # 第一路: overlay2 可写层（实时 attrs，轻量）
             try:
-                size_rw = self.collect_overlay_rw(container_name)
-                if size_rw is not None:
-                    usage["overlay_rw_bytes"] = size_rw
+                overlay = self.collect_overlay_rw(container_name)
+                usage["overlay_rw_bytes"] = overlay.get("overlay_rw_bytes")
+                usage["overlay_rw_source"] = overlay.get("overlay_rw_source", "missing")
+                if overlay.get("overlay_rw_error"):
+                    usage["overlay_rw_error"] = overlay["overlay_rw_error"]
             except Exception:
-                pass
+                usage["overlay_rw_source"] = "error"
+                usage["overlay_rw_error"] = "overlay_collect_failed"
 
             # 第二路: bind mount 目录 (Destination == "/root")，缓存 + 异步后台 du
             try:
@@ -152,9 +167,12 @@ class DiskUsageCache:
             except Exception:
                 pass
 
-            rw = usage["overlay_rw_bytes"] or 0
-            bm = usage["bind_mount_bytes"] or 0
-            usage["total_bytes"] = rw + bm
+            rw = usage["overlay_rw_bytes"]
+            bm = usage["bind_mount_bytes"]
+            if rw is None or (usage["bind_mount_path"] and bm is None):
+                usage["total_bytes"] = None
+            else:
+                usage["total_bytes"] = rw + (bm or 0)
 
             with self._lock:
                 self._container_cache[container_name] = {
