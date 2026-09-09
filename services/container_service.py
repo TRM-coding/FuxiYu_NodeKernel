@@ -558,7 +558,7 @@ def _du_background(bind_path: str) -> None:
     try:
         r = subprocess.run(
             ["du", "-sb", bind_path],
-            capture_output=True, text=True, timeout=300,  # 大目录最多等 5 分钟
+            capture_output=True, text=True, timeout=600,  # 大目录最多等 10 分钟
         )
         out = r.stdout.strip()
         if out:
@@ -730,8 +730,11 @@ def get_disk_usage(container_name: str) -> dict:
 
     # 总和
     rw = result["container"]["overlay_rw_bytes"] or 0
-    bm = result["container"]["bind_mount_bytes"] or 0
-    result["container"]["total_bytes"] = rw + bm
+    bm = result["container"]["bind_mount_bytes"]
+    if bm is None and result["container"].get("bind_mount_path"):
+        result["container"]["total_bytes"] = None
+    else:
+        result["container"]["total_bytes"] = rw + (bm or 0)
 
     def _h(b): return f"{b/1024/1024:.0f}M" if b >= 1024*1024 else f"{b/1024:.0f}K" if b >= 1024 else f"{b}B"
     src = result["container"].get("bind_mount_source", "none")
