@@ -691,17 +691,15 @@ def get_disk_usage(container_name: str) -> dict:
 
     # 第一路: overlay2 可写层
     try:
-        size_rw = (container.attrs.get('SizeRw') or 0)
-        if size_rw <= 0:
+        size_rw = container.attrs.get('SizeRw')
+        if size_rw is None:
             try:
-                df = extensions.docker_client.df()
-                for c_df in df.get('Containers', []) or []:
-                    names = c_df.get('Names', []) or []
-                    if f"/{container_name}" in names:
-                        size_rw = c_df.get('SizeRw', 0) or 0
-                        break
-            except Exception:
-                pass
+                api = extensions.docker_client.api
+                res = api._get(api._url("/containers/{0}/json", container.id), params={"size": 1})
+                detail = api._result(res, True)
+                size_rw = detail.get('SizeRw', 0) or 0
+            except Exception as e:
+                result["container"]["overlay_rw_error"] = str(e)
                 size_rw = 0
         result["container"]["overlay_rw_bytes"] = int(size_rw)
     except Exception as e:
@@ -736,9 +734,15 @@ def get_disk_usage(container_name: str) -> dict:
     else:
         result["container"]["total_bytes"] = rw + (bm or 0)
 
-    def _h(b): return f"{b/1024/1024:.0f}M" if b >= 1024*1024 else f"{b/1024:.0f}K" if b >= 1024 else f"{b}B"
+    def _h(b):
+        if b is None:
+            return "NoneB"
+        return f"{b/1024/1024:.0f}M" if b >= 1024*1024 else f"{b/1024:.0f}K" if b >= 1024 else f"{b}B"
     src = result["container"].get("bind_mount_source", "none")
-    print(f"[disk-check] {container_name} overlay={_h(rw)} bind={_h(bm)} bind_src={src} total={_h(rw + bm)}")
+    print(
+        f"[disk-check] {container_name} overlay={_h(rw)} bind={_h(bm)} "
+        f"bind_src={src} total={_h(result['container']['total_bytes'])}"
+    )
     return result
 
 
