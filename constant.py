@@ -14,10 +14,14 @@ class MachineTypes(Enum):
 class ContainerStatus(Enum):
     ONLINE = "online"
     OFFLINE = "offline"
+    BUILDING = "building"
     CREATING = "creating"
     STARTING = "starting"
+    RESTARTING = "restarting"
     STOPPING = "stopping"
     FAILED = "failed"
+    PAUSED = "paused"
+    UNKNOWN = "unknown"
 
 
 class ROLE(Enum):
