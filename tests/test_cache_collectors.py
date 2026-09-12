@@ -9,7 +9,6 @@ import asyncio
 import datetime as dt
 import json
 import subprocess
-import threading
 
 from FuxiYu_NodeKernel import extensions
 from FuxiYu_NodeKernel.constant import ContainerStatus
@@ -17,6 +16,35 @@ from FuxiYu_NodeKernel.docker_operates.disk_usage_cache import BIND_DU_TIMEOUT_S
 from FuxiYu_NodeKernel.docker_operates.status_cache import ContainerStatusCache
 from FuxiYu_NodeKernel.docker_operates.sys_cache import SysSnapshotCache
 from FuxiYu_NodeKernel.network import wss
+
+
+class _FakeCtrlLink:
+    """Ctrl 拨入侧的最小替身：记录 accept / close / 发出的帧。
+
+    receive 立即返回断开 → 推送循环发完一轮即退出，测试不会空转到下一个周期。
+    被测的是真 `handle_ctrl_ws` 与真帧构造，不绕 build_snapshot_batch。
+    """
+
+    def __init__(self, uid: str | None):
+        scope = {"query_string": f"uid={uid}".encode()} if uid else {"query_string": b""}
+        self.scope = scope
+        self.accepted = False
+        self.close_calls = []
+        self.frames = []
+
+    async def accept(self):
+        self.accepted = True
+
+    async def close(self, code=None):
+        self.close_calls.append(code)
+
+    async def send_text(self, text):
+        # 对齐 Starlette WebSocket 的真实 API：send() 收的是 ASGI 消息字典，
+        # 字符串帧走 send_text()——替身按真接口命名，用错名字即报错。
+        self.frames.append(json.loads(text))
+
+    async def receive(self):
+        return {"type": "websocket.disconnect", "code": 1000}
 
 
 class _Container:
@@ -674,83 +702,86 @@ def test_wss_snapshot_batch_reads_all_cache_views(monkeypatch):
     assert topics == ["container_status", "last_ssh", "disk_usage", "sys_snapshot"]
 
 
-def test_ctrl_wss_url_defaults_to_wss_receiver_port(monkeypatch):
-    identity = wss.NodeIdentity(uid="node-url-test")
-    monkeypatch.delenv("NODE_CTRL_WSS_URL", raising=False)
-    monkeypatch.delenv("NODE_CTRL_WSS_PORT", raising=False)
-    monkeypatch.delenv("CTRL_WSS_PORT", raising=False)
-    monkeypatch.setattr(wss.NetConfig, "CTRL_IP", "10.0.0.1")
-    monkeypatch.setattr(wss.NetConfig, "CTRL_PORT", 5000)
+def test_ctrl_link_accepts_matching_uid_and_pushes_snapshot(monkeypatch):
+    """Ctrl 拨入且 uid 匹配 → 接受连接，首帧即全量 snapshot_batch（4 topics）。
 
-    assert wss.ctrl_wss_url(identity) == "wss://10.0.0.1:5001/ws/node?uid=node-url-test"
-
-
-def test_ctrl_wss_url_accepts_explicit_wss_port(monkeypatch):
-    identity = wss.NodeIdentity(uid="node-url-test")
-    monkeypatch.delenv("NODE_CTRL_WSS_URL", raising=False)
-    monkeypatch.setenv("CTRL_WSS_PORT", "5011")
-    monkeypatch.setattr(wss.NetConfig, "CTRL_IP", "10.0.0.1")
-
-    assert wss.ctrl_wss_url(identity) == "wss://10.0.0.1:5011/ws/node?uid=node-url-test"
-
-
-def test_ctrl_wss_url_appends_uid_to_configured_url(monkeypatch):
-    identity = wss.NodeIdentity(uid="node-url-test")
-    monkeypatch.setenv("NODE_CTRL_WSS_URL", "wss://127.0.0.1:5001/ws/node")
-
-    assert wss.ctrl_wss_url(identity) == "wss://127.0.0.1:5001/ws/node?uid=node-url-test"
-
-
-def test_wss_push_loop_sends_full_snapshot_batch_first(monkeypatch):
-    """契约 C1/C7 承诺：真推送循环首帧即全量 snapshot_batch（4 topics），非空、非错误形状。
-
-    用 fake websockets.connect 跑真实 push_snapshots_forever——不绕 build_snapshot_batch。
+    契约 C1/C7 承诺：真推送循环首帧非空、非错误形状，不绕 build_snapshot_batch。
     """
-    import websockets as _websockets
-
-    frames = []
-    stop_event = threading.Event()
-
-    class _WS:
-        async def send(self, text):
-            frames.append(json.loads(text))
-            stop_event.set()  # 首帧后停止
-
-    class _Conn:
-        async def __aenter__(self):
-            return _WS()
-
-        async def __aexit__(self, *exc):
-            return False
-
-    monkeypatch.setattr(_websockets, "connect", lambda url, ssl=None: _Conn())
-    monkeypatch.setattr(wss, "load_node_identity", lambda: wss.NodeIdentity(uid="push-test-uid"))
-    monkeypatch.setattr(wss, "build_wss_ssl_context", lambda: None)
-    monkeypatch.setattr(wss, "expected_ctrl_certificate_fingerprint", lambda: None)
+    ws = _FakeCtrlLink(uid="link-uid-ok")
+    monkeypatch.setattr(wss, "load_node_identity", lambda: wss.NodeIdentity(uid="link-uid-ok"))
     monkeypatch.setattr(wss, "list_container_status", lambda: {"c1": {"source": "cache", "status": "online"}})
     monkeypatch.setattr(wss, "list_last_ssh", lambda: {"c1": {"last_ssh_connect_time": "2026-08-21T10:00:00"}})
     monkeypatch.setattr(wss, "list_disk_usage", lambda: {"machine_disk": {"total_gb": 100}, "containers": {}})
     monkeypatch.setattr(wss, "list_sys_snapshot", lambda: {"hostname": "node-it-01"})
     monkeypatch.setattr(extensions.status_cache, "take_deleted", lambda: [])
 
-    asyncio.run(wss.push_snapshots_forever(stop_event, interval_seconds=5.0))
+    asyncio.run(wss.handle_ctrl_ws(ws))
 
-    assert frames, "推送循环应发出至少一帧"
-    first = frames[0]
+    assert ws.accepted is True
+    assert ws.close_calls == []
+    first = ws.frames[0]
     assert first["type"] == "snapshot_batch"
-    assert first["node_uid"] == "push-test-uid"
+    assert first["node_uid"] == "link-uid-ok"
     topics = [f["topic"] for f in first["payload"]]
     assert topics == ["container_status", "last_ssh", "disk_usage", "sys_snapshot"]
     # 首帧快照非空（warm-up 保证；契约 C1 承诺）
     assert first["payload"][0]["payload"] != {}
 
 
-def test_lifespan_warms_status_cache_before_wss_pusher(monkeypatch):
-    """契约 C1 时序承诺：status_cache.start()（含同步 warm-up reconcile）先于 start_wss_pusher。
+def test_ctrl_link_sends_deleted_frames_before_snapshot(monkeypatch):
+    """幽灵容器感知：本轮推送前先发 delete 帧，再发快照。"""
+    ws = _FakeCtrlLink(uid="link-uid-del")
+    monkeypatch.setattr(wss, "load_node_identity", lambda: wss.NodeIdentity(uid="link-uid-del"))
+    monkeypatch.setattr(wss, "list_container_status", lambda: {})
+    monkeypatch.setattr(wss, "list_last_ssh", lambda: {})
+    monkeypatch.setattr(wss, "list_disk_usage", lambda: {"containers": {}})
+    monkeypatch.setattr(wss, "list_sys_snapshot", lambda: {})
+    monkeypatch.setattr(extensions.status_cache, "take_deleted", lambda: ["ghost-1"])
 
-    warm-up 先完成 → 首帧快照非空；若顺序被破坏（pusher 先起），此测试失败。
-    """
-    import FuxiYu_NodeKernel as _pkg
+    asyncio.run(wss.handle_ctrl_ws(ws))
+
+    assert ws.frames[0] == {"type": "delete", "container_name": "ghost-1"}
+    assert ws.frames[1]["type"] == "snapshot_batch"
+
+
+def test_ctrl_link_rejects_uid_mismatch(monkeypatch):
+    """uid 与本机身份牌不一致 → 拒绝连接，不推任何帧。"""
+    ws = _FakeCtrlLink(uid="wrong-uid")
+    monkeypatch.setattr(wss, "load_node_identity", lambda: wss.NodeIdentity(uid="link-uid-real"))
+
+    asyncio.run(wss.handle_ctrl_ws(ws))
+
+    assert ws.accepted is False
+    assert ws.close_calls == [4403]
+    assert ws.frames == []
+
+
+def test_ctrl_link_rejects_missing_uid(monkeypatch):
+    """连接未携带 uid → 拒绝连接。"""
+    ws = _FakeCtrlLink(uid=None)
+    monkeypatch.setattr(wss, "load_node_identity", lambda: wss.NodeIdentity(uid="link-uid-real"))
+
+    asyncio.run(wss.handle_ctrl_ws(ws))
+
+    assert ws.accepted is False
+    assert ws.close_calls == [4403]
+    assert ws.frames == []
+
+
+def test_ctrl_link_rejects_when_identity_not_initialized(monkeypatch):
+    """身份牌未就绪 → 不开推送循环，等待 Ctrl 注册后重拨。"""
+    ws = _FakeCtrlLink(uid="any-uid")
+    monkeypatch.setattr(wss, "load_node_identity", lambda: None)
+
+    asyncio.run(wss.handle_ctrl_ws(ws))
+
+    assert ws.accepted is False
+    assert ws.close_calls == [4404]
+    assert ws.frames == []
+
+
+def test_lifespan_starts_caches_without_outbound_pusher(monkeypatch):
+    """换向后 Node 不再出站：lifespan 只启停采集缓存，不建立到 Ctrl 的连接。"""
     from FuxiYu_NodeKernel import lifespan as _lifespan
 
     calls = []
@@ -758,10 +789,7 @@ def test_lifespan_warms_status_cache_before_wss_pusher(monkeypatch):
     monkeypatch.setattr(extensions.last_ssh_cache, "start", lambda: None)
     monkeypatch.setattr(extensions.disk_usage_cache, "start", lambda: None)
     monkeypatch.setattr(extensions.sys_cache, "start", lambda: None)
-    monkeypatch.setattr(extensions.sys_cache, "stop", lambda: None)
-    # lifespan 从包命名空间 import（__init__.py），patch 包属性而非 wss 模块
-    monkeypatch.setattr(_pkg, "start_wss_pusher", lambda stop_event: calls.append("pusher"))
-    monkeypatch.setattr(_pkg, "wait_for_thread_stop", lambda *a, **k: None)
+    monkeypatch.setattr(extensions.sys_cache, "stop", lambda: calls.append("stop"))
 
     class _App:
         state = type("_State", (), {})()
@@ -771,7 +799,7 @@ def test_lifespan_warms_status_cache_before_wss_pusher(monkeypatch):
             pass
 
     asyncio.run(_run())
-    assert calls == ["warm", "pusher"]
+    assert calls == ["warm", "stop"]
 
 
 def test_ctrl_ca_trust_file_bootstraps_public_ca(monkeypatch, tmp_path):

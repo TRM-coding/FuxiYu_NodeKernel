@@ -1,5 +1,4 @@
 import time
-import ssl
 import ipaddress
 
 import pytest
@@ -68,18 +67,39 @@ def test_node_identity_enrollment_and_issue_uid(client, monkeypatch, tmp_path):
     assert "certificate_fingerprint" not in issued
 
 
-def test_wss_ssl_context_loads_node_client_certificate(monkeypatch, tmp_path):
+def _iter_route_paths(routes):
+    """递归展开 FastAPI 的 included-router 包装，取出全部路由 path。"""
+
+    for route in routes:
+        nested = getattr(getattr(route, "original_router", None), "routes", None)
+        if nested is not None:
+            yield from _iter_route_paths(nested)
+            continue
+        path = getattr(route, "path", None)
+        if path is not None:
+            yield path
+
+
+def test_ctrl_link_endpoint_registered_on_same_app(client):
+    """换向后 Node 只提供被动端点：/ws/ctrl 挂在操作通道同一张 app 上。"""
+    paths = set(_iter_route_paths(client.app.routes))
+
+    assert wss_module.CTRL_LINK_PATH == "/ws/ctrl"
+    assert wss_module.CTRL_LINK_PATH in paths
+    # 操作通道与身份端点仍在同一张 app 上，未被换向挤掉
+    assert "/api/node_identity/enrollment_profile" in paths
+    assert "/api/node_identity/issue_uid" in paths
+
+
+def test_enrollment_profile_advertises_snapshot_endpoint(monkeypatch, tmp_path):
     monkeypatch.setenv("NODE_TLS_CERT_FILE", str(tmp_path / "node_cert.pem"))
     monkeypatch.setenv("NODE_TLS_KEY_FILE", str(tmp_path / "node_key.pem"))
-    monkeypatch.setenv("NODE_CTRL_TLS_INSECURE", "1")
-    monkeypatch.setenv("NODE_WSS_CLIENT_CERT_ENABLED", "1")
+    monkeypatch.setenv("NODE_IDENTITY_FILE", str(tmp_path / "identity.json"))
 
-    context = wss_module.build_wss_ssl_context()
+    profile = wss_module.build_enrollment_profile()
 
-    assert isinstance(context, ssl.SSLContext)
-    assert (tmp_path / "node_cert.pem").exists()
-    assert (tmp_path / "node_key.pem").exists()
-    assert context.verify_mode == ssl.CERT_NONE
+    assert profile["snapshot_endpoint"] == wss_module.CTRL_LINK_PATH
+    assert "wss_enabled" not in profile
 
 
 def test_node_self_signed_certificate_is_valid_pin_anchor(monkeypatch, tmp_path):

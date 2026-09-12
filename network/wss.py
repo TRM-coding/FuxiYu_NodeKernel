@@ -6,15 +6,12 @@ import logging
 import os
 import shutil
 import socket
-import ssl
-import threading
-import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+from urllib.parse import parse_qs
 
-from fastapi import APIRouter
+from fastapi import APIRouter, WebSocket
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
@@ -22,7 +19,6 @@ from cryptography.x509.oid import NameOID
 from cryptography.x509.oid import ExtendedKeyUsageOID
 from pydantic import BaseModel
 
-from ..config import NetConfig
 from ..services.container_service import (
     list_container_status,
     list_disk_usage,
@@ -33,8 +29,10 @@ from ..services.container_service import (
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/node_identity", tags=["node_identity"])
+ctrl_link_router = APIRouter(tags=["ctrl_link"])
 
-_TRUE_ENV_VALUES = {"1", "true", "yes", "on"}
+# Ctrl 主动拨入的快照端点；与操作通道共用同一个 HTTPS 监听、同一张 Node 证书。
+CTRL_LINK_PATH = "/ws/ctrl"
 _NODE_ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -137,28 +135,6 @@ def ensure_ctrl_ca_trust_file(configured_path: str | None = None) -> Path | None
 
     logger.warning("Ctrl CA trust file is missing: expected=%s", target)
     return None
-
-
-def _truthy_env(name: str, default: str = "0") -> bool:
-    """读取布尔型环境变量，兼容部署脚本里的常见写法。"""
-
-    return os.getenv(name, default).lower() in _TRUE_ENV_VALUES
-
-
-def _normalise_fingerprint(value: str | None) -> str | None:
-    """统一证书指纹格式，便于和 TLS 层计算结果比较。"""
-
-    if not value:
-        return None
-    return value.replace(":", "").strip().lower()
-
-
-def _sha256_fingerprint_der(cert_der: bytes) -> str:
-    """计算 DER 证书 SHA-256 指纹；用于校验 Ctrl 服务端证书 pin。"""
-
-    digest = hashes.Hash(hashes.SHA256())
-    digest.update(cert_der)
-    return digest.finalize().hex()
 
 
 def _node_certificate_alt_names() -> list[x509.GeneralName]:
@@ -336,7 +312,7 @@ def build_enrollment_profile() -> dict[str, Any]:
     return {
         "uid": identity.uid if identity else None,
         "identity_initialized": identity is not None,
-        "wss_enabled": os.getenv("NODE_WSS_ENABLED", "0").lower() in {"1", "true", "yes", "on"},
+        "snapshot_endpoint": CTRL_LINK_PATH,
         "hardware": static_sys_snapshot(),
     }
 
@@ -425,154 +401,85 @@ def build_snapshot_batch(identity: NodeIdentity) -> dict[str, Any]:
     }
 
 
-def ctrl_wss_url(identity: NodeIdentity) -> str:
-    """生成 Node 主动连接 Ctrl 的 WSS 地址。"""
+############################################################
+# Ctrl 链路端点（Ctrl 主动拨入）
+############################################################
 
-    configured = os.getenv("NODE_CTRL_WSS_URL")
-    if configured:
-        parts = urlsplit(configured)
-        query = dict(parse_qsl(parts.query, keep_blank_values=True))
-        query.setdefault("uid", identity.uid)
-        return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query), parts.fragment))
-    scheme = os.getenv("NODE_CTRL_WSS_SCHEME", "wss")
-    port = os.getenv("NODE_CTRL_WSS_PORT") or os.getenv("CTRL_WSS_PORT") or "5001"
-    return (
-        f"{scheme}://{NetConfig.CTRL_IP}:{port}/ws/node"
-        f"?uid={identity.uid}"
-    )
+def _snapshot_push_interval() -> float:
+    """快照推送周期（秒）；Ctrl 断线重连的节奏也由它决定。"""
+
+    return float(os.getenv("NODE_WSS_PUSH_INTERVAL", "5"))
 
 
-def expected_ctrl_certificate_fingerprint() -> str | None:
-    """返回 Node 侧配置的 Ctrl 证书指纹。
+def _resolve_link_uid(websocket) -> str | None:
+    """读取 Ctrl 在连接查询参数里出示的 uid。"""
 
-    该值可作为没有 CA 文件时的轻量 pin；有 CA 文件时也可做额外防线。
-    指纹来源应由部署侧人工写入，不由 Ctrl 在线下发。
+    scope = getattr(websocket, "scope", {}) or {}
+    query = parse_qs(scope.get("query_string", b"").decode("utf-8", errors="ignore"))
+    return (query.get("uid") or [None])[0]
+
+
+async def _wait_for_next_tick(websocket, interval: float) -> bool:
+    """等到下一个推送周期；对端提前断开则立即返回 True。
+
+    Ctrl 在这条通道上只收不发，所以 receive 的唯一用途是感知断开——
+    没有它，handler 会在 Ctrl 消失后继续空转到本周期结束才由 send 失败退出。
     """
 
-    return _normalise_fingerprint(os.getenv("NODE_CTRL_CERT_FINGERPRINT"))
-
-
-def build_wss_ssl_context() -> ssl.SSLContext:
-    """构造 Node -> Ctrl WSS 的 TLS 上下文。
-
-    方案一要求 Node 主动连接 Ctrl WSS 时带上自己的 Node 证书/私钥，
-    Ctrl 从 TLS 层校验该证书是否已 pin。Node 侧则通过 Ctrl CA 文件、
-    Ctrl 证书文件或显式指纹 pin 校验 Ctrl 身份。
-    """
-
-    configured_ctrl_ca_file = os.getenv("NODE_CTRL_CA_FILE") or os.getenv("NODE_CTRL_CERT_FILE")
-    ctrl_ca_file = ensure_ctrl_ca_trust_file(configured_ctrl_ca_file)
-    expected_fingerprint = expected_ctrl_certificate_fingerprint()
-    tls_insecure = _truthy_env("NODE_CTRL_TLS_INSECURE", "0")
-
-    if ctrl_ca_file:
-        context = ssl.create_default_context(cafile=str(ctrl_ca_file))
-    else:
-        logger.warning("Ctrl CA trust file is not configured/found; WSS will use system trust store")
-        context = ssl.create_default_context()
-
-    if tls_insecure or (expected_fingerprint and not ctrl_ca_file):
-        context.check_hostname = False
-        context.verify_mode = ssl.CERT_NONE
-
-    if _truthy_env("NODE_WSS_CLIENT_CERT_ENABLED", "1"):
-        files = ensure_self_signed_certificate()
-        context.load_cert_chain(certfile=str(files.cert_file), keyfile=str(files.key_file))
-
-    return context
-
-
-def verify_ctrl_peer_certificate(websocket, expected_fingerprint: str | None = None) -> None:
-    """连接建立后校验 Ctrl 服务端证书指纹。
-
-    这是 CA 校验之外的可选 pin 校验；当 Node 只配置了
-    NODE_CTRL_CERT_FINGERPRINT 且没有 CA 文件时，它就是主要身份校验。
-    """
-
-    expected = _normalise_fingerprint(expected_fingerprint)
-    if expected is None:
-        return
-
-    ssl_object = websocket.transport.get_extra_info("ssl_object")
-    if ssl_object is None:
-        raise ssl.SSLError("Ctrl WSS peer certificate is not available")
-
-    cert_der = ssl_object.getpeercert(binary_form=True)
-    if not cert_der:
-        raise ssl.SSLError("Ctrl WSS peer certificate is empty")
-
-    actual = _sha256_fingerprint_der(cert_der)
-    if actual != expected:
-        raise ssl.SSLError("Ctrl WSS certificate fingerprint mismatch")
-
-
-async def push_snapshots_forever(stop_event: threading.Event, interval_seconds: float = 5.0) -> None:
-    """持续向 Ctrl 推送状态快照。
-
-    缺少 websockets 依赖时不报错退出，避免影响 HTTP 操作通道启动。
-    身份牌在循环内重读：Ctrl 运行中注册（issue_uid 写 identity 文件）后自动生效，无需重启。
-    """
-
+    tick = asyncio.create_task(asyncio.sleep(interval))
+    watch = asyncio.create_task(websocket.receive())
     try:
-        import websockets
-    except ImportError:
-        logger.warning("websockets package is not installed; WSS pusher is disabled")
-        return
-
-    while not stop_event.is_set():
-        identity = load_node_identity()
-        if identity is None:
-            logger.info("node identity is not available yet; retrying")
-            await asyncio.sleep(min(interval_seconds, 5.0))
-            continue
-
-        url = ctrl_wss_url(identity)
-        ssl_context = build_wss_ssl_context() if url.startswith("wss://") else None
-        expected_fingerprint = expected_ctrl_certificate_fingerprint()
-        try:
-            async with websockets.connect(url, ssl=ssl_context) as websocket:
-                verify_ctrl_peer_certificate(websocket, expected_fingerprint)
-                logger.info("connected to Ctrl WSS: %s", url)
-                while not stop_event.is_set():
-                    # 幽灵容器感知：先发消失 delete 帧，再发快照
-                    from .. import extensions
-                    for name in extensions.status_cache.take_deleted():
-                        await websocket.send(
-                            json.dumps({"type": "delete", "container_name": name}, ensure_ascii=True))
-                    await websocket.send(json.dumps(build_snapshot_batch(identity), ensure_ascii=True))
-                    await asyncio.sleep(interval_seconds)
-        except Exception as e:
-            logger.warning("Ctrl WSS push loop error: url=%s uid=%s error=%s", url, identity.uid, e)
-            await asyncio.sleep(min(interval_seconds, 5.0))
+        done, _ = await asyncio.wait({tick, watch}, return_when=asyncio.FIRST_COMPLETED)
+    finally:
+        tick.cancel()
+        watch.cancel()
+        await asyncio.gather(tick, watch, return_exceptions=True)
+    return watch in done
 
 
-def start_wss_pusher(stop_event: threading.Event) -> threading.Thread | None:
-    """按配置启动 WSS 推送线程。
+async def _push_snapshot_frames(websocket, identity: NodeIdentity) -> None:
+    """按周期推送幽灵容器删帧与快照批次，直到连接断开。"""
 
-    默认关闭，设置 NODE_WSS_ENABLED=1 后才会主动连接 Ctrl。
+    from .. import extensions
+
+    interval = _snapshot_push_interval()
+    while True:
+        # 幽灵容器感知：先发消失 delete 帧，再发快照
+        for name in extensions.status_cache.take_deleted():
+            await websocket.send_text(json.dumps({"type": "delete", "container_name": name}, ensure_ascii=True))
+        await websocket.send_text(json.dumps(build_snapshot_batch(identity), ensure_ascii=True))
+        if await _wait_for_next_tick(websocket, interval):
+            logger.info("ctrl link closed by peer: uid=%s", identity.uid)
+            return
+
+
+async def handle_ctrl_ws(websocket) -> None:
+    """Ctrl 拨入的快照推送端点门户。
+
+    Ctrl 是拨出方并持有 pin，Node 侧只校验 uid 与本机身份牌一致。
+    身份牌未就绪时不开推送循环——Ctrl 注册（issue_uid）后会带 uid 重拨。
     """
 
-    enabled = os.getenv("NODE_WSS_ENABLED", "0").lower() in {"1", "true", "yes", "on"}
-    if not enabled:
-        logger.info("NODE_WSS_ENABLED is off; WSS pusher not started")
-        return None
-
-    interval = float(os.getenv("NODE_WSS_PUSH_INTERVAL", "5"))
-
-    def _run():
-        asyncio.run(push_snapshots_forever(stop_event, interval))
-
-    thread = threading.Thread(target=_run, name="node-wss-pusher", daemon=True)
-    thread.start()
-    return thread
-
-
-def wait_for_thread_stop(thread: threading.Thread | None, timeout: float = 3.0) -> None:
-    """应用关闭时等待 WSS 推送线程退出。"""
-
-    if thread is None:
+    identity = load_node_identity()
+    if identity is None:
+        logger.warning("ctrl link rejected: node identity is not initialized")
+        await websocket.close(code=4404)
         return
-    deadline = time.time() + timeout
-    remaining = deadline - time.time()
-    if remaining > 0:
-        thread.join(remaining)
+    uid = _resolve_link_uid(websocket)
+    if not uid or uid != identity.uid:
+        logger.warning("ctrl link rejected: uid mismatch (got %r)", uid)
+        await websocket.close(code=4403)
+        return
+    await websocket.accept()
+    logger.info("ctrl link accepted: uid=%s", uid)
+    try:
+        await _push_snapshot_frames(websocket, identity)
+    except Exception as exc:
+        # 对端正常断开走 _push_snapshot_frames 的返回路径；走到这里都是意外，
+        # 所以要栈——否则只剩一句无上下文的字符串。
+        logger.warning("ctrl link closed: uid=%s: %s", uid, exc, exc_info=True)
+
+
+@ctrl_link_router.websocket(CTRL_LINK_PATH)
+async def ws_ctrl(websocket: WebSocket):
+    await handle_ctrl_ws(websocket)
