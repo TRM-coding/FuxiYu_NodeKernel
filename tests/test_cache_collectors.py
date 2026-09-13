@@ -550,7 +550,7 @@ def test_disk_usage_cache_collects_overlay_bind_and_snapshot(monkeypatch, tmp_pa
     monkeypatch.setattr(extensions, "docker_client", _DockerClient([container]))
 
     cache = DiskUsageCache()
-    monkeypatch.setattr(cache, "get_bind", lambda path: {
+    monkeypatch.setattr(cache, "get_bind", lambda path, container_name=None: {
         "bind_mount_bytes": 8192,
         "bind_mount_source": "fresh",
         "bind_mount_path": path,
@@ -598,7 +598,7 @@ def test_disk_usage_cache_overlay_failure_keeps_total_pending(monkeypatch):
         "overlay_rw_source": "error",
         "overlay_rw_error": "inspect_size_failed",
     })
-    monkeypatch.setattr(cache, "get_bind", lambda path: {
+    monkeypatch.setattr(cache, "get_bind", lambda path, container_name=None: {
         "bind_mount_bytes": 8192,
         "bind_mount_source": "fresh",
         "bind_mount_path": path,
