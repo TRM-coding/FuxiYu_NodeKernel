@@ -40,6 +40,7 @@ class DiskUsageCache:
 
     def collect_bind(self, bind_path: str) -> None:
         """后台线程体：跑 du -sb，完成后回填缓存；失败标记 running=False（下次请求重试）。"""
+        started = time.monotonic()
         try:
             r = subprocess.run(
                 ["du", "-sb", bind_path],
@@ -54,11 +55,19 @@ class DiskUsageCache:
                         "running": False,
                         "updated_at": datetime.datetime.utcnow(),
                     }
+                logger.debug("bind du ok: path=%s bytes=%s rc=%s elapsed=%.2fs",
+                             bind_path, size, r.returncode, time.monotonic() - started)
                 return
+            # 空 stdout = du 一个测量值都没给出（路径不可达、权限不足、或解析到的不是 GNU du）。
+            # 这一支与下面的异常一样曾经静默，于是"永远 measuring"无从追查——必须留痕。
+            logger.warning("bind du empty stdout: path=%s rc=%s stderr=%r",
+                           bind_path, r.returncode, r.stderr.strip()[:300])
         except subprocess.TimeoutExpired:
-            pass
-        except Exception:
-            pass
+            logger.warning("bind du timeout: path=%s timeout=%ss elapsed=%.2fs",
+                           bind_path, BIND_DU_TIMEOUT_SEC, time.monotonic() - started)
+        except Exception as e:
+            logger.warning("bind du failed: path=%s elapsed=%.2fs err=%r",
+                           bind_path, time.monotonic() - started, e)
         # 失败: 标记 running=False，下次请求会重试
         with self._lock:
             entry = self._bind_cache.get(bind_path)
@@ -174,6 +183,14 @@ class DiskUsageCache:
             else:
                 usage["total_bytes"] = rw + (bm or 0)
 
+            # 与 Ctrl 侧 `skipped incomplete measurement` 一一对应：这条是那条告警的上游，
+            # 两边对不上时（比如这边看着齐全、那边却说 total=None）能立刻看出是传输还是判定问题。
+            logger.debug(
+                "collect_container: name=%s overlay=%s/%s bind=%s/%s total=%s",
+                container_name, usage["overlay_rw_bytes"], usage["overlay_rw_source"],
+                usage["bind_mount_bytes"], usage["bind_mount_source"], usage["total_bytes"],
+            )
+
             with self._lock:
                 self._container_cache[container_name] = {
                     "usage": usage,
@@ -208,6 +225,10 @@ class DiskUsageCache:
             time.sleep(DISK_SWEEP_STEP_SLEEP)
 
     def start(self):
+        # 启动先记下 du 解析到哪个可执行文件：PATH 里没有 du、或解析到非 GNU 实现，
+        # 都会让 collect_bind 永远失败，而那些失败发生在后台线程里，事后无从追查。
+        logger.info("disk cache starting: du=%s du_timeout=%ss bind_ttl=%ss sweep_ttl=%ss",
+                    shutil.which("du"), BIND_DU_TIMEOUT_SEC, BIND_CACHE_TTL_SEC, DISK_SWEEP_TTL_SEC)
         threading.Thread(target=self._sweep_loop, daemon=True, name="disk-usage-sweep").start()
 
     ##################
@@ -237,6 +258,10 @@ class DiskUsageCache:
             age = (datetime.datetime.utcnow() - entry["updated_at"]).total_seconds()
             if age < BIND_CACHE_TTL_SEC:
                 # 新鲜缓存，直接返回
+                logger.debug("bind lookup: path=%s bytes=%s source=%s age=%.1fs running=%s",
+                             bind_path, entry["bytes"],
+                             "fresh" if not entry.get("running") else "cached",
+                             age, entry.get("running"))
                 return {
                     "bind_mount_bytes": entry["bytes"],
                     "bind_mount_source": "fresh" if not entry.get("running") else "cached",
@@ -247,6 +272,8 @@ class DiskUsageCache:
                 with self._lock:
                     entry["running"] = True
                 threading.Thread(target=self.collect_bind, args=(bind_path,), daemon=True).start()
+            logger.debug("bind lookup: path=%s bytes=%s source=stale age=%.1fs running=%s",
+                         bind_path, entry["bytes"], age, entry.get("running"))
             return {
                 "bind_mount_bytes": entry["bytes"],
                 "bind_mount_source": "stale",
@@ -258,6 +285,8 @@ class DiskUsageCache:
             with self._lock:
                 self._bind_cache[bind_path] = {"bytes": None, "running": True, "updated_at": datetime.datetime.utcnow()}
             threading.Thread(target=self.collect_bind, args=(bind_path,), daemon=True).start()
+            logger.debug("bind lookup: path=%s bytes=None source=measuring age=0.0s running=True (first measure triggered)",
+                         bind_path)
             return {
                 "bind_mount_bytes": None,
                 "bind_mount_source": "measuring",
@@ -266,6 +295,9 @@ class DiskUsageCache:
 
         # 正在跑 du（entry 存在但 bytes=None 且 running=True）
         if entry.get("running"):
+            age = (datetime.datetime.utcnow() - entry["updated_at"]).total_seconds()
+            logger.debug("bind lookup: path=%s bytes=None source=measuring age=%.1fs running=True (du in flight)",
+                         bind_path, age)
             return {
                 "bind_mount_bytes": None,
                 "bind_mount_source": "measuring",
@@ -276,6 +308,9 @@ class DiskUsageCache:
         with self._lock:
             entry["running"] = True
         threading.Thread(target=self.collect_bind, args=(bind_path,), daemon=True).start()
+        age = (datetime.datetime.utcnow() - entry["updated_at"]).total_seconds()
+        logger.debug("bind lookup: path=%s bytes=None source=measuring age=%.1fs running=True (retry after failed du)",
+                     bind_path, age)
         return {
             "bind_mount_bytes": None,
             "bind_mount_source": "measuring",
