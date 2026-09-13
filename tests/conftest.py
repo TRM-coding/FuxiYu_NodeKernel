@@ -7,24 +7,12 @@
 WSS 迁移说明：加密/签名属于消息层协议，与传输层（HTTP / WSS）无关，
 本文件提供的辅助函数届时原样复用。
 """
-import base64
-import json
 from pathlib import Path
 
 import pytest
 import docker as docker_pkg
 
 NODE_ROOT = Path(__file__).resolve().parents[1]
-
-from FuxiYu_NodeKernel.utils import CheckKeys as node_ck  # noqa: E402
-from FuxiYu_NodeKernel.utils.CheckKeys import KeyConfig  # noqa: E402
-
-
-def configure_absolute_key_paths(monkeypatch) -> None:
-    """把 CheckKeys 的密钥路径从 CWD 相对改为仓库绝对路径。"""
-    monkeypatch.setattr(KeyConfig, "PRIVATE_KEY_PATH", str(NODE_ROOT / "private_A.pem"))
-    monkeypatch.setattr(KeyConfig, "PUBLIC_KEY_PATH", str(NODE_ROOT / "public_A.pem"))
-    monkeypatch.setattr(KeyConfig, "PUBLIC_KEY_CONTROL", str(NODE_ROOT / "public_A.pem"))
 
 
 def docker_not_found() -> docker_pkg.errors.NotFound:
@@ -100,14 +88,11 @@ class FakeDockerClient:
 
 
 def encrypted_body(payload: dict) -> dict:
-    """用真实密钥构造 Node 侧 wire 格式请求体 {"message": b64, "signature": b64}。"""
-    raw = json.dumps(payload)
-    return {
-        "message": base64.b64encode(node_ck.encryption(raw)).decode(),
-        "signature": base64.b64encode(node_ck.signature(raw)).decode(),
-    }
+    """check_keys 信封已退役：直接返回明文 payload（Node FastAPI 端点收 Pydantic）。"""
+    return payload
 
 
 @pytest.fixture()
 def key_paths(monkeypatch):
-    configure_absolute_key_paths(monkeypatch)
+    """check_keys 已退役：空 fixture 占位（保留签名，避免调用方改动）。"""
+    pass

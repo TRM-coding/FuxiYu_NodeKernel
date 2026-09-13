@@ -19,11 +19,12 @@ def _env_int(name: str, default: int) -> int:
 
 
 class NetConfig:
-    """三仓库统一网络键名。分发时只改这几个值。"""
+    """三仓库统一网络键名。分发时只改这几个值。
+
+    Node 只监听自己的 NODE_PORT：快照由 Ctrl 主动拨 `/ws/ctrl` 取，
+    Node 不需要（也不应该需要）知道 Ctrl 的地址。
+    """
     NODE_PORT = _env_int("NODE_PORT", 5789)
-    # WSS 迁移后 Node 主动连 server 时使用（当前 HTTP 接收模式下预留不消费）
-    CTRL_IP = os.getenv("CTRL_IP", "127.0.0.1")
-    CTRL_PORT = _env_int("CTRL_PORT", 5000)
 
 
 class KeyConfig:

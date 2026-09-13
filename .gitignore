@@ -2,8 +2,17 @@
 **/__pycache__/
 */.pytest_cache/
 */__pycache__/
-*.log
+
+.env
+.node_identity.json
 
 /logs/*
 !/logs/.gitkeep
-.env
+
+/certs/*
+!/certs/.gitkeep
+
+*.db
+*.sqlite
+*.sqlite3
+*.log
