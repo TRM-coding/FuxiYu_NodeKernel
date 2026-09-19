@@ -94,6 +94,56 @@ def test_build_image_builds_missing_tag(monkeypatch):
     assert "decode" not in build_calls[0]
 
 
+def _capture_build_kwargs(monkeypatch):
+    """跑一次 build_image，返回 docker images.build 收到的 kwargs。"""
+    calls = []
+
+    class _Images:
+        def get(self, tag):
+            raise docker.errors.ImageNotFound("not found")
+
+        def build(self, **kwargs):
+            calls.append(kwargs)
+            return ([], [])
+
+    class _Client:
+        def __init__(self):
+            self.images = _Images()
+
+    monkeypatch.setattr(extensions, "docker_client", _Client())
+    build_image({"dockerfile_text": "FROM ubuntu:24.04\n", "image_tag": "fuxi/image-1:x"})
+    return calls[0]
+
+
+_PROXY_KEYS = ("http_proxy", "HTTP_PROXY", "https_proxy", "HTTPS_PROXY", "no_proxy", "NO_PROXY")
+
+
+def test_build_image_forwards_proxy_env_as_build_args(monkeypatch):
+    """**构建必须带上代理参数。**
+
+    daemon 级代理（`docker info` 里那两条）只覆盖**拉取**，进不了构建的 RUN 步骤——
+    实测：不传 build-arg 时 RUN 里的 http_proxy 是空的，传了才有值。平台此前一个
+    build-arg 都不传，于是"宿主机配好了代理"对构建毫无用处：apt 裸奔，在必须走代理
+    才能出网的机器上静默失败（2026-09 实测，表现为 `got 'NOSPLIT'`）。
+    """
+    for k in _PROXY_KEYS:
+        monkeypatch.delenv(k, raising=False)
+    monkeypatch.setenv("http_proxy", "http://proxy.example:8091")
+    monkeypatch.setenv("HTTPS_PROXY", "http://proxy.example:8091")
+
+    assert _capture_build_kwargs(monkeypatch)["buildargs"] == {
+        "http_proxy": "http://proxy.example:8091",
+        "HTTPS_PROXY": "http://proxy.example:8091",
+    }
+
+
+def test_build_image_without_proxy_passes_no_build_args(monkeypatch):
+    """没配代理 → 不传 buildargs，构建行为与从前完全一致（不做任何隐式改动）。"""
+    for k in _PROXY_KEYS:
+        monkeypatch.delenv(k, raising=False)
+    assert _capture_build_kwargs(monkeypatch)["buildargs"] is None
+
+
 def test_create_container_uses_prepared_image_and_only_runs_sshd_gate(monkeypatch):
     """create_container 只接收已准备好的 image tag，不关心 Dockerfile/build。"""
     run_calls = []

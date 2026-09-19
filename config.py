@@ -38,9 +38,15 @@ class AppConfig(KeyConfig):
     PRIVATE_KEY_PATH = os.getenv("PRIVATE_KEY_PATH", KeyConfig.PRIVATE_KEY_PATH)
     SECRET_KEY = os.getenv("SECRET_KEY", "dev")
 
-class NodeProxyConfig(AppConfig):
-    # 代理服务器配置
-    PROXY_HOST = os.getenv("PROXY_HOST", "http://202.205.102.121:8091")
+
+# 这里曾有 NodeProxyConfig(PROXY_HOST=...)：一次没有接线的代理尝试——类建好了，
+# 但全仓无人引用（`get_config()` 返回的是 AppConfig），而且把一个**部署环境的地址**
+# 硬编码成了源码默认值。已删除（2026-09）。
+#
+# 代理这件事现在的落点：
+#   - 配置来源：Node 的 .env 里的 HTTP_PROXY / HTTPS_PROXY / NO_PROXY（run.py 加载）
+#   - 用途：`services/container_service._proxy_build_args` 把它透传成构建参数——
+#     因为 daemon 级代理只覆盖拉取，进不了构建的 RUN 步骤（见该函数注释）
 
 
 def get_config(env: str | None = None):

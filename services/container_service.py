@@ -39,6 +39,30 @@ def _build_spec_value(build, key: str, default=None):
     return default
 
 
+# 构建期代理要通过 Docker 的**预定义 build-arg** 才能进到 RUN 里（大小写两种写法都收）。
+_PROXY_ENV_KEYS = (
+    "http_proxy", "HTTP_PROXY",
+    "https_proxy", "HTTPS_PROXY",
+    "no_proxy", "NO_PROXY",
+)
+
+
+def _proxy_build_args() -> dict:
+    """把本进程的代理环境变量透传成构建参数。
+
+    **必须显式传**：daemon 级代理（`docker info` 里那两条）只覆盖**拉取**，进不了构建的
+    RUN 步骤——实测：不传 build-arg 时 RUN 里的 `http_proxy` 是空的，传了才有值。
+    而平台的构建此前一个 build-arg 都不传，于是"宿主机配好了代理"对构建毫无用处：
+    apt 裸奔，在必须走代理才能出网的机器上静默失败（2026-09 实测，表现为
+    `Clearsigned file isn't valid, got 'NOSPLIT'`）。
+
+    预定义 build-arg **不会留在镜像里**，所以这里透传代理不会污染产物。
+    本进程没配代理时返回 None，构建行为与从前完全一致。
+    """
+    args = {k: os.environ[k] for k in _PROXY_ENV_KEYS if os.environ.get(k)}
+    return args or None
+
+
 def _build_log_tail(buildlog, limit: int = 20, max_chars: int = 2000) -> str:
     """把 docker build 的输出流压成**末尾若干行**的纯文本，供失败时上报。
 
@@ -103,6 +127,8 @@ def build_image(build) -> str:
                 tag=image_tag,
                 rm=True,
                 forcerm=True,
+                # 代理透传：不传的话 RUN 里的 apt 是裸奔的（见 _proxy_build_args）
+                buildargs=_proxy_build_args(),
             )
         except Exception as e:
             # **把 docker build 的原始输出带上**：只报一句 "returned a non-zero code: 100"
