@@ -70,6 +70,44 @@ def _proxy_build_args() -> dict:
     return args or None
 
 
+_APT_MIRROR_ENV_KEY = "FUXI_APT_MIRROR"
+
+
+def _inject_apt_mirror(dockerfile_text: str) -> str:
+    """把本机配置的 apt 镜像源插到 `FROM` 之后；没配就**原样返回**。
+
+    ★ 位置为什么只能是这里：换源要赶在任何 apt 之前，而 Dockerfile 里 `FROM` 之前什么都做不了
+    —— 那时还没有文件系统（`FROM` 本身就是"创建这一层"）。所以唯一的位置是紧跟 `FROM`。
+
+    ★ 为什么由 Node 做而不是 Ctrl：**网络可达性是机器的事实**。同一份模板，A 机能直连官方源、
+    B 机不能（校园网会拦 HTTP 并返回一个非 clearsigned 的响应，报出来是
+    `Clearsigned file isn't valid, got 'NOSPLIT'`）；而 Ctrl 的设置是全局的，为了一台机器的
+    网络去改平台设置会波及本来正常的机器。放在本机 .env 里，一台机器一个样。
+
+    ★ 这是**执行侧为本地环境做的适配**，不是内容的一部分：Ctrl 渲染出的 dockerfile_text 不变，
+    这里只在它开头插一段。插入行带 `fuxi:` 前缀，便于事后辨认是谁加的（免得被当成 Ctrl 渲染的）。
+    """
+    mirror = (os.getenv(_APT_MIRROR_ENV_KEY) or "").strip().rstrip("/")
+    # 只接受干净的 URL：它要被拼进 shell 命令
+    if not mirror or not mirror.startswith(("http://", "https://")) or any(c in mirror for c in " \t\n'\"`$"):
+        if mirror:
+            logger.warning("%s 值不合法，已忽略: %r", _APT_MIRROR_ENV_KEY, mirror)
+        return dockerfile_text
+
+    snippet = (
+        f"# fuxi: 本机 apt 镜像（{_APT_MIRROR_ENV_KEY}，见 container_service._inject_apt_mirror）\n"
+        f"RUN sed -i 's|http://archive.ubuntu.com|{mirror}|g;"
+        f" s|http://security.ubuntu.com|{mirror}|g'"
+        " /etc/apt/sources.list.d/*.sources /etc/apt/sources.list 2>/dev/null || true"
+    )
+    lines = dockerfile_text.splitlines()
+    for idx, line in enumerate(lines):
+        if line.strip().upper().startswith("FROM "):
+            lines.insert(idx + 1, snippet)
+            return "\n".join(lines)
+    return dockerfile_text
+
+
 def _build_log_tail(buildlog, limit: int = 20, max_chars: int = 2000) -> str:
     """把 docker build 的输出流压成**末尾若干行**的纯文本，供失败时上报。
 
@@ -119,6 +157,8 @@ def build_image(build) -> str:
         return image_tag
     except docker.errors.ImageNotFound:
         logger.info("Image build cache miss: tag=%s", image_tag)
+
+    dockerfile_text = _inject_apt_mirror(dockerfile_text)
 
     with tempfile.TemporaryDirectory(prefix="fuxi-build-") as tmpdir:
         tmp_path = Path(tmpdir)

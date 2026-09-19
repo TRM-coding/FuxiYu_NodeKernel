@@ -255,6 +255,45 @@ def test_create_container_restore_rejects_mount_outside_base(monkeypatch):
         )
 
 
+def test_apt_mirror_is_injected_right_after_from(monkeypatch):
+    """配置了本机 apt 镜像时，必须插在 **FROM 之后**——那是唯一能做换源的位置。
+
+    `FROM` 之前什么都做不了（那时还没有文件系统），而换源又要赶在任何 apt 之前。
+    """
+    from FuxiYu_NodeKernel.services.container_service import _inject_apt_mirror
+
+    monkeypatch.setenv("FUXI_APT_MIRROR", "https://mirrors.tuna.tsinghua.edu.cn")
+    out = _inject_apt_mirror("FROM ubuntu:24.04\n\nUSER root\nRUN apt-get update\n")
+
+    lines = out.splitlines()
+    assert lines[0] == "FROM ubuntu:24.04"
+    assert lines[1].startswith("# fuxi: 本机 apt 镜像")
+    assert lines[2].startswith("RUN sed -i")
+    assert "mirrors.tuna.tsinghua.edu.cn" in lines[2]
+    assert "archive.ubuntu.com" in lines[2] and "security.ubuntu.com" in lines[2]
+    # 原来的内容一个不落
+    assert "RUN apt-get update" in out
+
+
+def test_apt_mirror_absent_leaves_text_untouched(monkeypatch):
+    """没配就**一字不改**——默认行为与从前完全一致。"""
+    from FuxiYu_NodeKernel.services.container_service import _inject_apt_mirror
+
+    monkeypatch.delenv("FUXI_APT_MIRROR", raising=False)
+    text = "FROM ubuntu:24.04\n\nUSER root\n"
+    assert _inject_apt_mirror(text) == text
+
+
+def test_apt_mirror_rejects_illegal_values(monkeypatch):
+    """非法值（会被拼进 shell 命令）一律忽略，绝不带着引号/空格进构建。"""
+    from FuxiYu_NodeKernel.services.container_service import _inject_apt_mirror
+
+    text = "FROM ubuntu:24.04\n"
+    for bad in ("mirror.example", "https://x'; rm -rf /; echo '", "https://a b"):
+        monkeypatch.setenv("FUXI_APT_MIRROR", bad)
+        assert _inject_apt_mirror(text) == text, bad
+
+
 def test_build_image_surfaces_the_raw_build_output(monkeypatch):
     """构建失败时必须把 docker build 的**原始输出**带出来。
 
