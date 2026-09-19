@@ -87,6 +87,11 @@ def test_build_image_builds_missing_tag(monkeypatch):
     assert build_image(build) == build["image_tag"]
     assert build_calls and build_calls[0]["tag"] == build["image_tag"]
     assert build_calls[0]["dockerfile"] == "Dockerfile"
+    # 回归锁：**不能传 decode=True**。`ImageCollection.build` 自己会把响应流过一遍
+    # `json_stream`（块已是 dict），再传 decode 会让底层先解一次、上层又对 dict 调
+    # `.decode()`，报 `'dict' object has no attribute 'decode'` —— 实测直接把整条创建链路
+    # 打挂，而单测用的假客户端不会暴露它，只有真 daemon 才看得见。
+    assert "decode" not in build_calls[0]
 
 
 def test_create_container_uses_prepared_image_and_only_runs_sshd_gate(monkeypatch):

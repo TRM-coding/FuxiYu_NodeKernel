@@ -51,9 +51,13 @@ def _build_log_tail(buildlog, limit: int = 20, max_chars: int = 2000) -> str:
     """
     lines: list[str] = []
     for chunk in buildlog or []:
-        if not isinstance(chunk, dict):
-            continue
-        text = chunk.get("stream") or chunk.get("error") or ""
+        if isinstance(chunk, dict):
+            text = chunk.get("stream") or chunk.get("error") or ""
+        elif isinstance(chunk, (bytes, bytearray)):
+            # 个别版本/路径下不做 JSON 解码，给的是裸字节；一并兜住
+            text = chunk.decode("utf-8", errors="replace")
+        else:
+            text = str(chunk)
         for line in str(text).splitlines():
             line = line.rstrip()
             if line:
@@ -90,14 +94,15 @@ def build_image(build) -> str:
         (tmp_path / "Dockerfile").write_text(dockerfile_text, encoding="utf-8")
         logger.info("Building image tag=%s in tmp=%s", image_tag, tmpdir)
         try:
-            # decode=True：拿结构化的输出块（dict），失败时才能把原因读出来
+            # **不要传 decode=True**：`ImageCollection.build` 自己就会把响应流过一遍
+            # `json_stream`，块已经是 dict；再传 decode 会让底层先解一次、上层又对 dict 调
+            # `.decode()`，报 `'dict' object has no attribute 'decode'`（2026-09 实测）。
             _, buildlog = extensions.docker_client.images.build(
                 path=tmpdir,
                 dockerfile="Dockerfile",
                 tag=image_tag,
                 rm=True,
                 forcerm=True,
-                decode=True,
             )
         except Exception as e:
             # **把 docker build 的原始输出带上**：只报一句 "returned a non-zero code: 100"
