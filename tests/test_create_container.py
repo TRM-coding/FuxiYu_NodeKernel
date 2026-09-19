@@ -198,6 +198,58 @@ def test_create_container_restore_rejects_mount_outside_base(monkeypatch):
         )
 
 
+def test_build_image_surfaces_the_raw_build_output(monkeypatch):
+    """构建失败时必须把 docker build 的**原始输出**带出来。
+
+    只报一句 "returned a non-zero code: 100" 的话，调用方看不出 apt 到底报了什么——
+    2026-09 实测为此从"ssh-keygen 找不到"一路倒推到"构建时没有代理"。
+    """
+    class _Images:
+        def get(self, tag):
+            raise docker.errors.ImageNotFound("not found")
+
+        def build(self, **kwargs):
+            raise docker.errors.BuildError(
+                "The command '/bin/sh -c apt-get update ...' returned a non-zero code: 100",
+                build_log=[
+                    {"stream": "Step 3/5 : RUN set -eu; apt-get update ...\n"},
+                    {"stream": "Err:1 http://archive.ubuntu.com/ubuntu noble InRelease\n"},
+                    {"stream": "  Clearsigned file isn't valid, got 'NOSPLIT'\n"},
+                    {"stream": "E: The repository is not signed.\n"},
+                ],
+            )
+
+    class _Client:
+        def __init__(self):
+            self.images = _Images()
+
+    monkeypatch.setattr(extensions, "docker_client", _Client())
+
+    with pytest.raises(RuntimeError) as excinfo:
+        build_image({"dockerfile_text": "FROM ubuntu:24.04\n", "image_tag": "fuxi/image-1:x"})
+
+    message = str(excinfo.value)
+    assert "non-zero code: 100" in message, "原始异常仍要在"
+    assert "NOSPLIT" in message, "docker build 的原始输出必须带出来"
+    assert "not signed" in message
+
+
+def test_build_log_tail_keeps_only_the_end():
+    """只留末尾：真正的原因总在最后几行，整段塞进 failed_detail 反而没人看。"""
+    from FuxiYu_NodeKernel.services.container_service import _build_log_tail
+
+    log = [{"stream": f"line-{i}\n"} for i in range(50)]
+    tail = _build_log_tail(log, limit=3)
+    assert tail == "line-47\nline-48\nline-49"
+
+
+def test_build_log_tail_tolerates_junk():
+    from FuxiYu_NodeKernel.services.container_service import _build_log_tail
+
+    assert _build_log_tail(None) == ""
+    assert _build_log_tail([{"stream": ""}, {"error": "boom"}]) == "boom"
+
+
 def test_build_image_uses_cached_image_tag(monkeypatch):
     """同 tag 已存在时命中 Node 本地缓存：跳过 build，直接返回 tag。"""
     build_calls = []

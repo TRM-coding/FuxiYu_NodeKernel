@@ -39,6 +39,28 @@ def _build_spec_value(build, key: str, default=None):
     return default
 
 
+def _build_log_tail(buildlog, limit: int = 20, max_chars: int = 2000) -> str:
+    """把 docker build 的输出流压成**末尾若干行**的纯文本，供失败时上报。
+
+    只取末尾：真正的原因（apt 的报错、找不到的包、网络故障）总在最后几行，而完整日志
+    可能有几千行，整段塞进 failed_detail 反而没人看。
+
+    存在的理由（2026-09 实测）：`apt-get update` 在容器里失败、而整层仍然退出 0（见平台注入
+    片段的断言），构建报"成功"，镜像里却没有 openssh。当时能拿到的只有一句
+    `returned a non-zero code: 100`，完全看不出 apt 到底报了什么，只能从上层症状一路倒推。
+    """
+    lines: list[str] = []
+    for chunk in buildlog or []:
+        if not isinstance(chunk, dict):
+            continue
+        text = chunk.get("stream") or chunk.get("error") or ""
+        for line in str(text).splitlines():
+            line = line.rstrip()
+            if line:
+                lines.append(line)
+    return "\n".join(lines[-limit:])[-max_chars:]
+
+
 def build_image(build) -> str:
     """按 Ctrl 发来的最终 Dockerfile 临时构建镜像。
 
@@ -67,13 +89,29 @@ def build_image(build) -> str:
         tmp_path = Path(tmpdir)
         (tmp_path / "Dockerfile").write_text(dockerfile_text, encoding="utf-8")
         logger.info("Building image tag=%s in tmp=%s", image_tag, tmpdir)
-        extensions.docker_client.images.build(
-            path=tmpdir,
-            dockerfile="Dockerfile",
-            tag=image_tag,
-            rm=True,
-            forcerm=True,
-        )
+        try:
+            # decode=True：拿结构化的输出块（dict），失败时才能把原因读出来
+            _, buildlog = extensions.docker_client.images.build(
+                path=tmpdir,
+                dockerfile="Dockerfile",
+                tag=image_tag,
+                rm=True,
+                forcerm=True,
+                decode=True,
+            )
+        except Exception as e:
+            # **把 docker build 的原始输出带上**：只报一句 "returned a non-zero code: 100"
+            # 的话，调用方根本看不出 apt 报了什么（2026-09 实测，为此绕了一大圈）。
+            # 属性名是 `build_log`（带下划线）——docker-py 的 BuildError 把日志存这儿，
+            # 不是 `buildlog`。写错的代价是"一条日志都拿不到"，所以这条实测过（见测试）。
+            tail = _build_log_tail(getattr(e, "build_log", None))
+            if tail:
+                logger.error("image build failed: tag=%s\n--- docker build output (tail) ---\n%s",
+                             image_tag, tail)
+                raise RuntimeError(
+                    f"{e}\n--- docker build output (tail) ---\n{tail}"
+                ) from e
+            raise
     return image_tag
 
 
