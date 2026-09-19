@@ -209,9 +209,16 @@ def create_container(
     # Use docker.types.Mount for a more reliable bind mount
     mounts = [Mount(target="/root", source=host_root_mount, type="bind", read_only=False)]
     print(f"DEBUG: Using mounts={mounts}")
+    # 容器里跑什么：**镜像自己说了算**（2026-09 决策）。
+    #
+    # Ctrl 把启动命令渲染成最终 Dockerfile 的**最后一行 ENTRYPOINT**，所以它已经是镜像的
+    # 一部分：Node 不传 command、也不碰 entrypoint 字段，只负责把镜像跑起来。
+    #
+    # 这样分工才合理——"跑什么"是控制面的策略（连同它默认的 tail -f /dev/null 一起写在
+    # Ctrl 的渲染函数里），Node 是纯执行器。此前的那条路（运行期传 command）必须额外置空
+    # Entrypoint 才不被镜像入口吃掉，一旦漏掉就会静默跑错——把策略放在构建期就从根上没了。
     container = extensions.docker_client.containers.run(
         config.image,
-        "tail -f /dev/null",   # 保证容器一直运行
         detach=True,
         tty=True,
         name=name,
@@ -239,6 +246,18 @@ def create_container(
 
 
     # container.exec_run("service ssh restart", user="root")
+    def _container_exited(container) -> bool:
+        """容器是否已经不在运行（用于把"启动命令立刻退出"与真的 sshd 故障分开）。
+
+        读 docker 的实时状态；查询本身失败时返回 False——那说明连状态都拿不到，
+        报 sshd 故障至少不会比报错方向更误导。
+        """
+        try:
+            container.reload()
+            return (container.status or "").lower() not in ("running", "created", "restarting")
+        except Exception:
+            return False
+
     def _run(container, cmd: str, timeout_sec: int = 120):
         # 这里用一个 shell wrapper 来实现命令超时，避免某些命令（如 apt-get）在容器内卡死导致 exec_run 永远不返回的问题
         wrapped = (
@@ -303,6 +322,14 @@ def create_container(
         logger.info("create_container sshd started: name=%s container_id=%s", name, container.id)
     except Exception as e:
         logger.error("create_container sshd gate failed: name=%s container_id=%s error=%s", name, container.id, e)
+        # 归因（2026-09）：自 Ctrl 可以指定启动命令起，"sshd gate failed" 有了一个全新的、
+        # 而且用户完全无从判断的成因——**容器的启动命令立刻退出了**，于是容器已停止，
+        # 后续 exec 全部失败。裸报 sshd 会把人引去查 sshd，所以这里先看容器还在不在。
+        if _container_exited(container):
+            raise RuntimeError(
+                "container exited immediately after start: the configured entrypoint command "
+                "did not keep it running (platform cannot provide SSH without a live container)"
+            ) from e
         raise RuntimeError(f"sshd gate failed: {e}") from e
 
     # ── 端口映射回填（docker 自动分配）：inspect NetworkSettings.Ports 提取实际宿主端口 ──

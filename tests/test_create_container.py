@@ -288,6 +288,69 @@ def test_create_container_fails_when_sshd_gate_fails(monkeypatch):
         create_container("admin", Container.Config_info(**VALID_CFG))
 
 
+def _run_and_capture(monkeypatch):
+    """跑一次 create_container，返回 docker containers.run 收到的 (args, kwargs)。"""
+    run_calls = []
+
+    class _Containers(FakeContainers):
+        def run(self, *a, **k):
+            run_calls.append((a, k))
+            return FakeContainer(name=k.get("name", "c1"))
+
+    monkeypatch.setattr(extensions, "docker_client", FakeDockerClient(_Containers()))
+    _patch_fs(monkeypatch)
+    monkeypatch.setenv("NODE_CONTAINERS_BASE", "/tmp")
+    create_container("admin", Container.Config_info(**VALID_CFG))
+    return run_calls[0]
+
+
+def test_create_container_passes_no_command_and_does_not_touch_entrypoint(monkeypatch):
+    """Node 是**纯执行器**：容器跑什么由镜像自己带，Node 一个字节都不插手。
+
+    2026-09 决策：启动命令由 Ctrl 渲染成最终 Dockerfile 的**最后一行 ENTRYPOINT**，
+    因此它已经是镜像的一部分。Node 这边必须**什么都不传**——
+
+    - 传 command 会顶掉镜像的 CMD 语义（而且不置空 Entrypoint 时还会被镜像入口当参数吃掉，
+      2026-09 实测复现过：镜像入口为 /bin/echo 时容器打印 "FROM-ENTRYPOINT tail -f /dev/null"）；
+    - 传 entrypoint 更是越权：那是镜像的定义。
+
+    这条断言同时是对"分工"的锁：Node 侧再出现任何关于"跑什么"的判断，都是回归。
+    """
+    args, kwargs = _run_and_capture(monkeypatch)
+    assert args == (VALID_CFG["image"],), "只传镜像名，不传 command"
+    assert "entrypoint" not in kwargs, "不碰镜像的 Entrypoint"
+    assert "command" not in kwargs
+
+
+def test_create_container_explains_image_that_exits_immediately(monkeypatch):
+    """容器起来就死 → 报错要指向真正的原因，而不是 sshd。
+
+    "sshd gate failed" 会把人引去查 sshd；真因通常是镜像的 ENTRYPOINT 立刻退出了。
+    """
+
+    class _ExitedContainer(FakeContainer):
+        def __init__(self, **kw):
+            super().__init__(status="exited", **kw)
+
+        def exec_run(self, cmd, **kw):
+            # 只让 sshd 那一关失败（前面的 chpasswd 等照常），模拟"容器一退出，
+            # 到守门这一步所有 exec 都失败"的真实时序
+            if isinstance(cmd, list) and len(cmd) >= 3 and "/usr/sbin/sshd" in cmd[2]:
+                raise RuntimeError("container is not running")
+            return super().exec_run(cmd, **kw)
+
+    class _Containers(FakeContainers):
+        def run(self, *a, **k):
+            return _ExitedContainer(name=k.get("name", "c1"))
+
+    monkeypatch.setattr(extensions, "docker_client", FakeDockerClient(_Containers()))
+    _patch_fs(monkeypatch)
+    monkeypatch.setenv("NODE_CONTAINERS_BASE", "/tmp")
+
+    with pytest.raises(RuntimeError, match="exited immediately"):
+        create_container("admin", Container.Config_info(**VALID_CFG))
+
+
 @pytest.mark.docker
 def test_happy_path(monkeypatch, tmp_path):
     """真实 docker：创建 → 校验返回 → 校验容器参数 → 校验 sshd 守门 → 清理。"""
