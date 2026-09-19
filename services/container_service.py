@@ -39,11 +39,17 @@ def _build_spec_value(build, key: str, default=None):
     return default
 
 
-# 构建期代理要通过 Docker 的**预定义 build-arg** 才能进到 RUN 里（大小写两种写法都收）。
+# 构建期代理要通过 Docker 的**预定义 build-arg** 才能进到 RUN 里（大小写两种写法都收，
+# 实测 apt 两种都认）。
+#
+# ⚠ **刻意不含 `no_proxy`**：它进到构建里几乎只会帮倒忙。实测（2026-09）：某台机器上
+# `archive.ubuntu.com` 解析到内网地址，而 `NO_PROXY` 里写着 `10.0.0.0/8,192.168.0.0/16`
+# ——于是 apt 绕开代理直连，被校园网拦下，报的却是 `Clearsigned file isn't valid, got
+# 'NOSPLIT'`，一路查不出原因。构建里的请求本来就该走代理出去；真要放行某个内部地址，
+# 在模板的 dockerfile_body 里显式写 `ENV no_proxy=...`，别让进程级的 NO_PROXY 偷偷生效。
 _PROXY_ENV_KEYS = (
     "http_proxy", "HTTP_PROXY",
     "https_proxy", "HTTPS_PROXY",
-    "no_proxy", "NO_PROXY",
 )
 
 
@@ -58,6 +64,7 @@ def _proxy_build_args() -> dict:
 
     预定义 build-arg **不会留在镜像里**，所以这里透传代理不会污染产物。
     本进程没配代理时返回 None，构建行为与从前完全一致。
+    `no_proxy` **不透传**，理由见 `_PROXY_ENV_KEYS` 上方的注释。
     """
     args = {k: os.environ[k] for k in _PROXY_ENV_KEYS if os.environ.get(k)}
     return args or None

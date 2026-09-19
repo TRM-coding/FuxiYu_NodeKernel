@@ -131,10 +131,12 @@ def test_build_image_forwards_proxy_env_as_build_args(monkeypatch):
     monkeypatch.setenv("http_proxy", "http://proxy.example:8091")
     monkeypatch.setenv("HTTPS_PROXY", "http://proxy.example:8091")
 
+    monkeypatch.setenv("NO_PROXY", "localhost,10.0.0.0/8")
+
     assert _capture_build_kwargs(monkeypatch)["buildargs"] == {
         "http_proxy": "http://proxy.example:8091",
         "HTTPS_PROXY": "http://proxy.example:8091",
-    }
+    }, "no_proxy 不许透传——它会让构建里的请求绕开代理（2026-09 实测踩过）"
 
 
 def test_build_image_without_proxy_passes_no_build_args(monkeypatch):
