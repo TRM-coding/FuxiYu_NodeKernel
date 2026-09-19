@@ -116,7 +116,15 @@ def build_image(build) -> str:
     with tempfile.TemporaryDirectory(prefix="fuxi-build-") as tmpdir:
         tmp_path = Path(tmpdir)
         (tmp_path / "Dockerfile").write_text(dockerfile_text, encoding="utf-8")
-        logger.info("Building image tag=%s in tmp=%s", image_tag, tmpdir)
+        proxy_args = _proxy_build_args()
+        # 把"这次构建有没有代理"写进日志：这台机器出不了外网时，apt 的报错长得一样
+        # （都是 NOSPLIT / not signed），光看报错分不清"没配代理"还是"配了没生效"。
+        # 有这一行，两种情况的日志第一眼就不同（2026-09 实测踩过这个坑）。
+        logger.info(
+            "Building image tag=%s in tmp=%s proxy=%s",
+            image_tag, tmpdir,
+            {k: v for k, v in proxy_args.items()} if proxy_args else "（本进程没有代理环境变量）",
+        )
         try:
             # **不要传 decode=True**：`ImageCollection.build` 自己就会把响应流过一遍
             # `json_stream`，块已经是 dict；再传 decode 会让底层先解一次、上层又对 dict 调
@@ -128,7 +136,7 @@ def build_image(build) -> str:
                 rm=True,
                 forcerm=True,
                 # 代理透传：不传的话 RUN 里的 apt 是裸奔的（见 _proxy_build_args）
-                buildargs=_proxy_build_args(),
+                buildargs=proxy_args,
             )
         except Exception as e:
             # **把 docker build 的原始输出带上**：只报一句 "returned a non-zero code: 100"
