@@ -786,21 +786,46 @@ def restart_container(container_name: str, timeout: int = 10) -> bool:
         return False
 
 
+def _bounded_command_output(text: str | None, *, limit: int = 10, max_chars: int = 1000) -> str:
+    """把一条命令的输出压成"最多 limit 行 / max_chars 字符"，供错误信息使用。
+
+    截断时**明确写出省略了多少行**——静默截断会让人以为输出就这么多（与
+    `_build_log_tail` 同一个用意：错误信息要能被读懂，也不能无限长）。
+    """
+    lines = [line for line in (text or "").splitlines() if line.strip()]
+    if not lines:
+        return ""
+    body = "\n".join(lines[:limit])[:max_chars]
+    if len(lines) > limit:
+        body += f"\n…（其余 {len(lines) - limit} 行已省略）"
+    return body
+
+
 def clean_mount(mount_path: str) -> bool:
     """清理已删除容器的宿主机 mount 目录（校验 + 执行都在 service 层）。
 
     安全检查：路径必须位于 NODE_CONTAINERS_BASE 下且包含 /containers/，
     realpath 规范化防止 ../ 路径穿越绕过检查。超时抛 subprocess.TimeoutExpired；
-    rm 删除失败抛 RuntimeError（幂等：路径不存在 rm -rf 仍返回 0）。
+    rm 删除失败抛 RuntimeError（带 rm 的 stderr；幂等：路径不存在 rm -rf 仍返回 0）。
     """
     base = os.path.realpath(os.getenv("NODE_CONTAINERS_BASE", "/home"))
     real = os.path.realpath(str(mount_path))
     if not real.startswith(base + os.sep) or "/containers/" not in real:
         raise ValueError("invalid mount_path")
-    # 删除失败抛 RuntimeError（端点转 500），不再假成功 → Ctrl 不会误标 cleaned_at，可重试
-    r = subprocess.run(["rm", "-rf", real], timeout=30, check=False)
+    # 删除失败抛 RuntimeError（端点转 500），不再假成功 → Ctrl 不会误标 cleaned_at，可重试。
+    #
+    # **必须把 rm 自己的 stderr 带上**：吞掉它，日志里就只剩一句 `rc=1`，分不清是权限、
+    # 只读文件系统还是路径不对。2026-09 实测踩到：容器内以 root 写进挂载目录的东西，在
+    # 宿主上是 root:root（`.cache` 还是 0700），Node 以非 root 运行时 rm 报的是
+    # `Permission denied`——那条 stderr 被丢掉之后，这个失败完全不可读，只能靠人去翻目录。
+    r = subprocess.run(
+        ["rm", "-rf", real], timeout=30, check=False,
+        capture_output=True, text=True, errors="replace",
+    )
     if r.returncode != 0:
-        raise RuntimeError(f"rm -rf failed (rc={r.returncode}): {real}")
+        detail = _bounded_command_output(r.stderr) or _bounded_command_output(r.stdout)
+        suffix = f"\n--- rm output ---\n{detail}" if detail else ""
+        raise RuntimeError(f"rm -rf failed (rc={r.returncode}): {real}{suffix}")
     return True
 
 
