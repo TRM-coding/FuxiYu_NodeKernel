@@ -160,6 +160,98 @@ def test_build_proxy_rejects_illegal_values(monkeypatch):
         assert _inject_build_proxy(text) == text, bad
 
 
+def _clear_proxy_env(monkeypatch):
+    for k in _PROXY_KEYS:
+        monkeypatch.delenv(k, raising=False)
+
+
+def test_runtime_proxy_env_pairs_lower_and_upper(monkeypatch):
+    """运行期代理：读到什么就大小写各出一份；**no_proxy 绝不跟着进去**。"""
+    from FuxiYu_NodeKernel.services.container_service import _runtime_proxy_env
+
+    _clear_proxy_env(monkeypatch)
+    monkeypatch.setenv("HTTP_PROXY", "http://proxy.example:8091")   # 大写也认
+    monkeypatch.setenv("NO_PROXY", "localhost,10.0.0.0/8")
+
+    assert _runtime_proxy_env() == {
+        "http_proxy": "http://proxy.example:8091",
+        "HTTP_PROXY": "http://proxy.example:8091",
+    }
+
+
+def test_runtime_proxy_env_empty_without_proxy(monkeypatch):
+    from FuxiYu_NodeKernel.services.container_service import _runtime_proxy_env
+
+    _clear_proxy_env(monkeypatch)
+    assert _runtime_proxy_env() == {}
+
+
+def test_runtime_proxy_setup_merges_etc_environment(monkeypatch):
+    """`/etc/environment` 是**合并**写入，不是覆盖。
+
+    回归锁：旧实现是 `> /etc/environment`，会把镜像自带的 PATH 一起顶掉——2026-09 在学生的
+    容器里实测看到该文件只剩一行 PATH（那行是镜像的），覆盖式写入会让 SSH 会话连 PATH 都没。
+    """
+    from FuxiYu_NodeKernel.services.container_service import _runtime_proxy_setup_command
+
+    cmd = _runtime_proxy_setup_command(
+        {"http_proxy": "http://p:8091", "https_proxy": "http://p:8091"}
+    )
+
+    assert ">> /etc/environment" in cmd, "追加而不是覆盖"
+    assert "> /etc/environment" not in cmd.replace(">> /etc/environment", ""), "不能有覆盖式重定向"
+    assert "[ -d /etc/apt/apt.conf.d ]" in cmd, "apt 配置只在 apt 系镜像上写"
+    assert "http_proxy=http://p:8091" in cmd
+
+
+def test_create_container_passes_runtime_proxy_environment(monkeypatch):
+    """给容器主进程与 `docker exec` 的那一份（SSH 会话那份走 /etc/environment）。"""
+    _clear_proxy_env(monkeypatch)
+    monkeypatch.setenv("https_proxy", "http://proxy.example:8091")
+
+    _, kwargs = _run_and_capture(monkeypatch)
+
+    assert kwargs["environment"]["https_proxy"] == "http://proxy.example:8091"
+    assert kwargs["environment"]["HTTPS_PROXY"] == "http://proxy.example:8091"
+
+
+def test_create_container_omits_environment_without_proxy(monkeypatch):
+    """没配代理就**不传这个键**（空 dict 也会被 docker 当成"设了环境"）。"""
+    _clear_proxy_env(monkeypatch)
+
+    _, kwargs = _run_and_capture(monkeypatch)
+
+    assert "environment" not in kwargs
+
+
+def test_create_container_writes_proxy_into_container(monkeypatch):
+    """代理必须在创建流程里**真的被写进容器**，且早于其它命令。
+
+    回归锁：这段注入在 create_container 瘦身时被整块删掉过（38de262），学生的症状是
+    "容器内网络不通"——平台侧什么都看不出来。锁住"有人再删它"这件事。
+    """
+    created = []
+
+    class _Containers(FakeContainers):
+        def run(self, *a, **k):
+            c = FakeContainer(name=k.get("name", "c1"))
+            created.append(c)
+            return c
+
+    _clear_proxy_env(monkeypatch)
+    monkeypatch.setenv("http_proxy", "http://proxy.example:8091")
+    monkeypatch.setattr(extensions, "docker_client", FakeDockerClient(_Containers()))
+    _patch_fs(monkeypatch)
+    monkeypatch.setenv("NODE_CONTAINERS_BASE", "/tmp")
+
+    create_container("admin", Container.Config_info(**VALID_CFG))
+
+    cmds = [str(call[0]) for call in created[0].exec_calls]
+    proxy_idx = next(i for i, c in enumerate(cmds) if "/etc/environment" in c)
+    chpasswd_idx = next(i for i, c in enumerate(cmds) if "chpasswd" in c)
+    assert proxy_idx < chpasswd_idx
+
+
 def test_create_container_uses_prepared_image_and_only_runs_sshd_gate(monkeypatch):
     """create_container 只接收已准备好的 image tag，不关心 Dockerfile/build。"""
     run_calls = []

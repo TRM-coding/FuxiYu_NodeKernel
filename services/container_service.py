@@ -39,17 +39,15 @@ def _build_spec_value(build, key: str, default=None):
     return default
 
 
-# 构建期代理只取这两个键（大小写都认，注入时统一成小写）。
+# 代理注入（构建期与运行期）只取这两个键；读的时候大小写都认，写出去统一成小写。
 #
 # ⚠ **刻意不含 `no_proxy`**：它进到构建里几乎只会帮倒忙。实测（2026-09）：某台机器上
 # `archive.ubuntu.com` 解析到内网地址，而 `NO_PROXY` 里写着 `10.0.0.0/8,192.168.0.0/16`
 # ——于是 apt 绕开代理直连，被校园网拦下，报的却是 `Clearsigned file isn't valid, got
 # 'NOSPLIT'`，一路查不出原因。构建里的请求本来就该走代理出去；真要放行某个内部地址，
 # 在模板的 dockerfile_body 里显式写 `ENV no_proxy=...`，别让进程级的 NO_PROXY 偷偷生效。
-_PROXY_ENV_KEYS = (
-    "http_proxy", "HTTP_PROXY",
-    "https_proxy", "HTTPS_PROXY",
-)
+# 运行期同理：容器里的请求也该走代理出去，理由和踩过的坑是同一个。
+_PROXY_ENV_KEYS = ("http_proxy", "https_proxy")
 
 
 def _clean_proxy_value(value: str) -> str:
@@ -83,7 +81,7 @@ def _inject_build_proxy(dockerfile_text: str) -> str:
     而注入的 ARG 必须赶在平台注入段那次 `apt-get` 之前生效。
     """
     args = []
-    for name in ("http_proxy", "https_proxy"):
+    for name in _PROXY_ENV_KEYS:
         value = _clean_proxy_value(
             os.environ.get(name) or os.environ.get(name.upper()) or ""
         )
@@ -102,6 +100,61 @@ def _inject_build_proxy(dockerfile_text: str) -> str:
             lines.insert(idx + 1, snippet)
             return "\n".join(lines)
     return dockerfile_text
+
+
+def _runtime_proxy_env() -> dict[str, str]:
+    """本机给**容器内**用的代理环境变量（大小写各一份）；没配就是空 dict。
+
+    与构建期同一个来源（Node 进程的 .env）——代理是机器的事实。两处的差别只在
+    "送到哪里"：构建期写进 Dockerfile 的 `ARG`，运行期写进容器。
+
+    ★ 为什么运行期也得给：学生 SSH 进去之后的 apt / pip / git / curl 出外网走的就是它。
+    2026-09 学生报"容器内网络不通"，根因就是这段在 create_container 瘦身时跟着
+    "容器内装 sshd"一起被删掉了（38de262）——那段注入不只服务于装包，它同时是
+    容器出外网的唯一入口。
+    """
+    env: dict[str, str] = {}
+    for name in _PROXY_ENV_KEYS:
+        value = _clean_proxy_value(
+            os.environ.get(name) or os.environ.get(name.upper()) or ""
+        )
+        if value:
+            env[name] = value
+            env[name.upper()] = value
+    return env
+
+
+def _runtime_proxy_setup_command(proxy_env: dict[str, str]) -> str:
+    """把代理落到容器文件系统：`/etc/environment`（SSH 会话靠 PAM 读它）+ apt 配置。
+
+    ★ 为什么非写 `/etc/environment` 不可：`docker run -e` 那套环境变量**进不了 SSH 会话**
+    ——sshd 会清空环境另起一套，只从 PAM（`pam_env` 读 `/etc/environment`）等来源取值。
+    学生是 SSH 进去用的，这个文件才是他们真正吃到代理的地方（两边都写：`-e` 覆盖
+    容器主进程与 `docker exec`，`/etc/environment` 覆盖 SSH 会话）。
+
+    ★ 为什么是**合并**而不是覆盖：旧实现用 `>` 直接覆盖，会把镜像自带的 PATH 一起干掉
+    ——2026-09 在学生的容器里实测看到 `/etc/environment` 只剩一行 PATH，那行是镜像的；
+    覆盖式写入会让 SSH 会话连 PATH 都没有。这里先删掉自己写的代理行再追加，幂等。
+
+    ★ apt 配置只在 apt 系镜像上写（`/etc/apt/apt.conf.d` 存在时），其它基底不塞垃圾文件。
+    """
+    lines = "".join(f"{key}={value}\\n" for key, value in proxy_env.items())
+    http_url = proxy_env.get("http_proxy") or proxy_env.get("https_proxy") or ""
+    apt = ""
+    if http_url:
+        apt = (
+            "if [ -d /etc/apt/apt.conf.d ]; then "
+            f"printf 'Acquire::http::Proxy \"{http_url}\";\\n"
+            f"Acquire::https::Proxy \"{http_url}\";\\n' > /etc/apt/apt.conf.d/99proxy; "
+            "fi"
+        )
+    return (
+        "touch /etc/environment; "
+        "sed -i -E '/^[[:space:]]*(http_proxy|https_proxy|HTTP_PROXY|HTTPS_PROXY)=/d' "
+        "/etc/environment; "
+        f"printf '{lines}' >> /etc/environment; "
+        + apt
+    )
 
 
 def _build_log_tail(buildlog, limit: int = 20, max_chars: int = 2000) -> str:
@@ -328,6 +381,8 @@ def create_container(
     # Use docker.types.Mount for a more reliable bind mount
     mounts = [Mount(target="/root", source=host_root_mount, type="bind", read_only=False)]
     print(f"DEBUG: Using mounts={mounts}")
+    # 运行期代理：给容器主进程与 `docker exec` 的那一份（SSH 会话那份要写文件，见下）。
+    proxy_env = _runtime_proxy_env()
     # 容器里跑什么：**镜像自己说了算**（2026-09 决策）。
     #
     # Ctrl 把启动命令渲染成最终 Dockerfile 的**最后一行 ENTRYPOINT**，所以它已经是镜像的
@@ -350,7 +405,9 @@ def create_container(
         cpuset_cpus=cpuset_cpus,
         device_requests=device_requests,
         mounts=mounts,
-        **({"shm_size": shm_size_bytes} if shm_size_bytes is not None else {})
+        **({"shm_size": shm_size_bytes} if shm_size_bytes is not None else {}),
+        # 没配代理就不传这个键（空 dict 也会被 docker 当成"设了环境"）
+        **({"environment": proxy_env} if proxy_env else {})
     )
     print(f"Container created with ID={container.id} and name={name}")
 
@@ -403,6 +460,20 @@ def create_container(
             raise RuntimeError(f"cmd failed: {cmd}\nexit={exit_code}\noutput={out}")
         
         return r
+
+    # 代理落到容器里（在任何需要网络的命令之前）：SSH 会话靠 /etc/environment 出外网。
+    # 尽力而为——写不进去不该让创建失败（容器至少还能用内网），但必须在日志里留痕：
+    # 少了这一行，症状会变成"学生说容器没网"，而平台侧什么都看不出来（2026-09 就是这么丢的）。
+    if proxy_env:
+        try:
+            _run(container, _runtime_proxy_setup_command(proxy_env))
+            logger.info(
+                "create_container proxy injected: name=%s vars=%s",
+                name, sorted(proxy_env),
+            )
+        except Exception as e:
+            logger.warning("create_container proxy inject failed: name=%s error=%s", name, e)
+
     # 初始密码为 owner_name + "123"，用户可以登录后再改密码（也可以直接提供公钥登录）
     _run(container, f"echo 'root:{owner_name}123' | chpasswd")
     try:
