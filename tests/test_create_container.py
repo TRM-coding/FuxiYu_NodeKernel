@@ -14,6 +14,9 @@ from FuxiYu_NodeKernel import extensions
 
 from .conftest import FakeContainer, FakeContainers, FakeDockerClient
 
+# 与本进程代理相关的环境变量（大小写都认）
+_PROXY_KEYS = ("http_proxy", "HTTP_PROXY", "https_proxy", "HTTPS_PROXY", "no_proxy", "NO_PROXY")
+
 VALID_CFG = dict(
     gpu_list=[],
     cpu_number=2,
@@ -94,56 +97,67 @@ def test_build_image_builds_missing_tag(monkeypatch):
     assert "decode" not in build_calls[0]
 
 
-def _capture_build_kwargs(monkeypatch):
-    """跑一次 build_image，返回 docker images.build 收到的 kwargs。"""
-    calls = []
+def test_build_proxy_is_injected_as_arg_after_from(monkeypatch):
+    """代理必须以 `ARG` 写进 **FROM 之后**——那是唯一绕开 buildargs 的路。
 
-    class _Images:
-        def get(self, tag):
-            raise docker.errors.ImageNotFound("not found")
-
-        def build(self, **kwargs):
-            calls.append(kwargs)
-            return ([], [])
-
-    class _Client:
-        def __init__(self):
-            self.images = _Images()
-
-    monkeypatch.setattr(extensions, "docker_client", _Client())
-    build_image({"dockerfile_text": "FROM ubuntu:24.04\n", "image_tag": "fuxi/image-1:x"})
-    return calls[0]
-
-
-_PROXY_KEYS = ("http_proxy", "HTTP_PROXY", "https_proxy", "HTTPS_PROXY", "no_proxy", "NO_PROXY")
-
-
-def test_build_image_forwards_proxy_env_as_build_args(monkeypatch):
-    """**构建必须带上代理参数。**
-
-    daemon 级代理（`docker info` 里那两条）只覆盖**拉取**，进不了构建的 RUN 步骤——
-    实测：不传 build-arg 时 RUN 里的 http_proxy 是空的，传了才有值。平台此前一个
-    build-arg 都不传，于是"宿主机配好了代理"对构建毫无用处：apt 裸奔，在必须走代理
-    才能出网的机器上静默失败（2026-09 实测，表现为 `got 'NOSPLIT'`）。
+    docker-py 把 `buildargs` 塞在 URL query 里，而 CLI/BuildKit 走 body：某些 daemon 的
+    构建路径不读 query，于是"手动 --build-arg 就通、走 SDK 就不通"，且两侧日志一模一样
+    （2026-09 实测）。写进 Dockerfile 的 ARG 不经过那条路，谁调都一样。
     """
+    from FuxiYu_NodeKernel.services.container_service import _inject_build_proxy
+
     for k in _PROXY_KEYS:
         monkeypatch.delenv(k, raising=False)
-    monkeypatch.setenv("http_proxy", "http://proxy.example:8091")
-    monkeypatch.setenv("HTTPS_PROXY", "http://proxy.example:8091")
+    monkeypatch.setenv("HTTP_PROXY", "http://proxy.example:8091")   # 大写也认，注入时统一小写
+    monkeypatch.setenv("https_proxy", "http://proxy.example:8091")
 
+    out = _inject_build_proxy("FROM ubuntu:24.04\n\nUSER root\nRUN apt-get update\n")
+
+    lines = out.splitlines()
+    assert lines[0] == "FROM ubuntu:24.04"
+    assert lines[1].startswith("# fuxi: 本机构建代理")
+    assert lines[2] == "ARG http_proxy=http://proxy.example:8091"
+    assert lines[3] == "ARG https_proxy=http://proxy.example:8091"
+    assert "RUN apt-get update" in out, "原内容一个不落"
+
+
+def test_build_proxy_absent_leaves_text_untouched(monkeypatch):
+    """没配就**一字不改**——默认行为与从前完全一致。"""
+    from FuxiYu_NodeKernel.services.container_service import _inject_build_proxy
+
+    for k in _PROXY_KEYS:
+        monkeypatch.delenv(k, raising=False)
+    text = "FROM ubuntu:24.04\n\nUSER root\n"
+    assert _inject_build_proxy(text) == text
+
+
+def test_build_proxy_never_injects_no_proxy(monkeypatch):
+    """**no_proxy 绝不注入**：它会让构建里的请求绕开代理直连。
+
+    实测（2026-09）：某台机器上 apt 主站解析到内网地址，而 no_proxy 写着
+    `10.0.0.0/8,192.168.0.0/16` → apt 绕开代理 → 被校园网拦下 → 报的却是
+    `Clearsigned file isn't valid, got 'NOSPLIT'`，极难定位。
+    """
+    from FuxiYu_NodeKernel.services.container_service import _inject_build_proxy
+
+    monkeypatch.setenv("HTTP_PROXY", "http://proxy.example:8091")
     monkeypatch.setenv("NO_PROXY", "localhost,10.0.0.0/8")
 
-    assert _capture_build_kwargs(monkeypatch)["buildargs"] == {
-        "http_proxy": "http://proxy.example:8091",
-        "HTTPS_PROXY": "http://proxy.example:8091",
-    }, "no_proxy 不许透传——它会让构建里的请求绕开代理（2026-09 实测踩过）"
+    out = _inject_build_proxy("FROM ubuntu:24.04\n")
+    assert "no_proxy" not in out.lower()
+    assert "10.0.0.0/8" not in out
 
 
-def test_build_image_without_proxy_passes_no_build_args(monkeypatch):
-    """没配代理 → 不传 buildargs，构建行为与从前完全一致（不做任何隐式改动）。"""
-    for k in _PROXY_KEYS:
-        monkeypatch.delenv(k, raising=False)
-    assert _capture_build_kwargs(monkeypatch)["buildargs"] is None
+def test_build_proxy_rejects_illegal_values(monkeypatch):
+    """非法值（会被拼进 Dockerfile 文本）一律忽略。"""
+    from FuxiYu_NodeKernel.services.container_service import _inject_build_proxy
+
+    text = "FROM ubuntu:24.04\n"
+    for bad in ("proxy.example", "http://a b", "http://x\nRUN evil", "http://x'$(id)"):
+        for k in _PROXY_KEYS:
+            monkeypatch.delenv(k, raising=False)
+        monkeypatch.setenv("http_proxy", bad)
+        assert _inject_build_proxy(text) == text, bad
 
 
 def test_create_container_uses_prepared_image_and_only_runs_sshd_gate(monkeypatch):
@@ -253,45 +267,6 @@ def test_create_container_restore_rejects_mount_outside_base(monkeypatch):
             Container.Config_info(**VALID_CFG),
             restore_mount_path="/etc/fuxi-leak",
         )
-
-
-def test_apt_mirror_is_injected_right_after_from(monkeypatch):
-    """配置了本机 apt 镜像时，必须插在 **FROM 之后**——那是唯一能做换源的位置。
-
-    `FROM` 之前什么都做不了（那时还没有文件系统），而换源又要赶在任何 apt 之前。
-    """
-    from FuxiYu_NodeKernel.services.container_service import _inject_apt_mirror
-
-    monkeypatch.setenv("FUXI_APT_MIRROR", "https://mirrors.tuna.tsinghua.edu.cn")
-    out = _inject_apt_mirror("FROM ubuntu:24.04\n\nUSER root\nRUN apt-get update\n")
-
-    lines = out.splitlines()
-    assert lines[0] == "FROM ubuntu:24.04"
-    assert lines[1].startswith("# fuxi: 本机 apt 镜像")
-    assert lines[2].startswith("RUN sed -i")
-    assert "mirrors.tuna.tsinghua.edu.cn" in lines[2]
-    assert "archive.ubuntu.com" in lines[2] and "security.ubuntu.com" in lines[2]
-    # 原来的内容一个不落
-    assert "RUN apt-get update" in out
-
-
-def test_apt_mirror_absent_leaves_text_untouched(monkeypatch):
-    """没配就**一字不改**——默认行为与从前完全一致。"""
-    from FuxiYu_NodeKernel.services.container_service import _inject_apt_mirror
-
-    monkeypatch.delenv("FUXI_APT_MIRROR", raising=False)
-    text = "FROM ubuntu:24.04\n\nUSER root\n"
-    assert _inject_apt_mirror(text) == text
-
-
-def test_apt_mirror_rejects_illegal_values(monkeypatch):
-    """非法值（会被拼进 shell 命令）一律忽略，绝不带着引号/空格进构建。"""
-    from FuxiYu_NodeKernel.services.container_service import _inject_apt_mirror
-
-    text = "FROM ubuntu:24.04\n"
-    for bad in ("mirror.example", "https://x'; rm -rf /; echo '", "https://a b"):
-        monkeypatch.setenv("FUXI_APT_MIRROR", bad)
-        assert _inject_apt_mirror(text) == text, bad
 
 
 def test_build_image_surfaces_the_raw_build_output(monkeypatch):

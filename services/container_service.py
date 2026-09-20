@@ -39,8 +39,7 @@ def _build_spec_value(build, key: str, default=None):
     return default
 
 
-# 构建期代理要通过 Docker 的**预定义 build-arg** 才能进到 RUN 里（大小写两种写法都收，
-# 实测 apt 两种都认）。
+# 构建期代理只取这两个键（大小写都认，注入时统一成小写）。
 #
 # ⚠ **刻意不含 `no_proxy`**：它进到构建里几乎只会帮倒忙。实测（2026-09）：某台机器上
 # `archive.ubuntu.com` 解析到内网地址，而 `NO_PROXY` 里写着 `10.0.0.0/8,192.168.0.0/16`
@@ -53,52 +52,49 @@ _PROXY_ENV_KEYS = (
 )
 
 
-def _proxy_build_args() -> dict:
-    """把本进程的代理环境变量透传成构建参数。
+def _clean_proxy_value(value: str) -> str:
+    """只接受干净的代理 URL——它要被**直接拼进 Dockerfile 文本**，所以必须挡掉
+    空格、换行、引号、反引号、`$` 这些能在 Dockerfile 里变出第二条指令的字符。"""
+    value = (value or "").strip()
+    if value.startswith(("http://", "https://")) and not any(
+        c in value for c in " \t\n\r'\"`$"
+    ):
+        return value
+    return ""
 
-    **必须显式传**：daemon 级代理（`docker info` 里那两条）只覆盖**拉取**，进不了构建的
-    RUN 步骤——实测：不传 build-arg 时 RUN 里的 `http_proxy` 是空的，传了才有值。
-    而平台的构建此前一个 build-arg 都不传，于是"宿主机配好了代理"对构建毫无用处：
-    apt 裸奔，在必须走代理才能出网的机器上静默失败（2026-09 实测，表现为
-    `Clearsigned file isn't valid, got 'NOSPLIT'`）。
 
-    预定义 build-arg **不会留在镜像里**，所以这里透传代理不会污染产物。
-    本进程没配代理时返回 None，构建行为与从前完全一致。
-    `no_proxy` **不透传**，理由见 `_PROXY_ENV_KEYS` 上方的注释。
+def _inject_build_proxy(dockerfile_text: str) -> str:
+    """把本机配置的代理以 `ARG` 形式写进 `FROM` 之后；没配就**原样返回**。
+
+    ★ 为什么不用 docker-py 的 `buildargs`：源码里可查——它把参数塞进 **URL 的 query**
+    （`params.update({'buildargs': json.dumps(buildargs)})`），而 CLI / BuildKit 走的是
+    **body**。某些 daemon 的构建路径不读 query，于是出现"手动 `docker build --build-arg`
+    就通、平台走 SDK 就不通"，而且两侧日志长得一模一样，差异完全不可见（2026-09 实测，
+    为此绕了很久）。`use_config_proxy=True` 走的是同一条 query 路径，同样不可靠。
+
+    ★ 为什么是 `ARG` 而不是 `ENV`：`ARG` 只在构建期存在，**不落进运行中的容器**
+    （实测：构建完 `docker run … echo $http_proxy` 是空的）。`ENV` 会把代理地址烤进
+    每一个容器——代理是构建期的环境，不是镜像的内容。
+
+    ★ 为什么由 Node 注入：**代理是机器的事实**（同一份模板，有的机器要代理、有的直连正常），
+    而 Ctrl 的设置是全局的。放本机 .env 里，一台机器一个样，不会波及别的机器。
+
+    ★ 位置只能是 `FROM` 之后：Dockerfile 里 `FROM` 之前只允许注释与 `ARG`，做不了别的；
+    而注入的 ARG 必须赶在平台注入段那次 `apt-get` 之前生效。
     """
-    args = {k: os.environ[k] for k in _PROXY_ENV_KEYS if os.environ.get(k)}
-    return args or None
-
-
-_APT_MIRROR_ENV_KEY = "FUXI_APT_MIRROR"
-
-
-def _inject_apt_mirror(dockerfile_text: str) -> str:
-    """把本机配置的 apt 镜像源插到 `FROM` 之后；没配就**原样返回**。
-
-    ★ 位置为什么只能是这里：换源要赶在任何 apt 之前，而 Dockerfile 里 `FROM` 之前什么都做不了
-    —— 那时还没有文件系统（`FROM` 本身就是"创建这一层"）。所以唯一的位置是紧跟 `FROM`。
-
-    ★ 为什么由 Node 做而不是 Ctrl：**网络可达性是机器的事实**。同一份模板，A 机能直连官方源、
-    B 机不能（校园网会拦 HTTP 并返回一个非 clearsigned 的响应，报出来是
-    `Clearsigned file isn't valid, got 'NOSPLIT'`）；而 Ctrl 的设置是全局的，为了一台机器的
-    网络去改平台设置会波及本来正常的机器。放在本机 .env 里，一台机器一个样。
-
-    ★ 这是**执行侧为本地环境做的适配**，不是内容的一部分：Ctrl 渲染出的 dockerfile_text 不变，
-    这里只在它开头插一段。插入行带 `fuxi:` 前缀，便于事后辨认是谁加的（免得被当成 Ctrl 渲染的）。
-    """
-    mirror = (os.getenv(_APT_MIRROR_ENV_KEY) or "").strip().rstrip("/")
-    # 只接受干净的 URL：它要被拼进 shell 命令
-    if not mirror or not mirror.startswith(("http://", "https://")) or any(c in mirror for c in " \t\n'\"`$"):
-        if mirror:
-            logger.warning("%s 值不合法，已忽略: %r", _APT_MIRROR_ENV_KEY, mirror)
+    args = []
+    for name in ("http_proxy", "https_proxy"):
+        value = _clean_proxy_value(
+            os.environ.get(name) or os.environ.get(name.upper()) or ""
+        )
+        if value:
+            args.append(f"ARG {name}={value}")
+    if not args:
         return dockerfile_text
 
     snippet = (
-        f"# fuxi: 本机 apt 镜像（{_APT_MIRROR_ENV_KEY}，见 container_service._inject_apt_mirror）\n"
-        f"RUN sed -i 's|http://archive.ubuntu.com|{mirror}|g;"
-        f" s|http://security.ubuntu.com|{mirror}|g'"
-        " /etc/apt/sources.list.d/*.sources /etc/apt/sources.list 2>/dev/null || true"
+        "# fuxi: 本机构建代理（见 container_service._inject_build_proxy）\n"
+        + "\n".join(args)
     )
     lines = dockerfile_text.splitlines()
     for idx, line in enumerate(lines):
@@ -158,19 +154,20 @@ def build_image(build) -> str:
     except docker.errors.ImageNotFound:
         logger.info("Image build cache miss: tag=%s", image_tag)
 
-    dockerfile_text = _inject_apt_mirror(dockerfile_text)
+    dockerfile_text = _inject_build_proxy(dockerfile_text)
 
     with tempfile.TemporaryDirectory(prefix="fuxi-build-") as tmpdir:
         tmp_path = Path(tmpdir)
         (tmp_path / "Dockerfile").write_text(dockerfile_text, encoding="utf-8")
-        proxy_args = _proxy_build_args()
         # 把"这次构建有没有代理"写进日志：这台机器出不了外网时，apt 的报错长得一样
         # （都是 NOSPLIT / not signed），光看报错分不清"没配代理"还是"配了没生效"。
         # 有这一行，两种情况的日志第一眼就不同（2026-09 实测踩过这个坑）。
         logger.info(
-            "Building image tag=%s in tmp=%s proxy=%s",
+            "Building image tag=%s in tmp=%s build_proxy=%s",
             image_tag, tmpdir,
-            {k: v for k, v in proxy_args.items()} if proxy_args else "（本进程没有代理环境变量）",
+            _clean_proxy_value(
+                os.environ.get("http_proxy") or os.environ.get("HTTP_PROXY") or ""
+            ) or "（本进程没有代理环境变量）",
         )
         try:
             # **不要传 decode=True**：`ImageCollection.build` 自己就会把响应流过一遍
@@ -182,8 +179,6 @@ def build_image(build) -> str:
                 tag=image_tag,
                 rm=True,
                 forcerm=True,
-                # 代理透传：不传的话 RUN 里的 apt 是裸奔的（见 _proxy_build_args）
-                buildargs=proxy_args,
             )
         except Exception as e:
             # **把 docker build 的原始输出带上**：只报一句 "returned a non-zero code: 100"
