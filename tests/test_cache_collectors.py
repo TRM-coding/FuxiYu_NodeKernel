@@ -815,3 +815,77 @@ def test_ctrl_ca_trust_file_bootstraps_public_ca(monkeypatch, tmp_path):
 
     assert target == node_root / "certs" / "ctrl_ca.pem"
     assert target.read_text(encoding="utf-8") == "public ctrl ca"
+
+
+# ── 端口映射：每轮从 docker 重算 + 去重（2026-09）────────────────────────
+
+
+def test_extract_port_info_dedupes_ipv4_ipv6_bindings():
+    """docker 为一个发布端口返回 IPv4(0.0.0.0) + IPv6(::) 两条 binding → 只落一条。
+
+    回归锁（2026-09 实测）：逐条摊平会让 22 / 50000 / 8080 每个都出现两次，
+    而映射结构里没有 host_ip 字段，两条连区分都区分不出来。
+    """
+    from FuxiYu_NodeKernel.docker_operates.port_mappings import extract_port_info
+
+    attrs = {"NetworkSettings": {"Ports": {
+        "22/tcp": [
+            {"HostIp": "0.0.0.0", "HostPort": "32776"},
+            {"HostIp": "::", "HostPort": "32776"},
+        ],
+        "8080/tcp": [
+            {"HostIp": "0.0.0.0", "HostPort": "32777"},
+            {"HostIp": "::", "HostPort": "32777"},
+        ],
+    }}}
+
+    ssh_port, mappings = extract_port_info(attrs)
+
+    assert ssh_port == 32776
+    assert mappings == [
+        {"container_port": 22, "host_port": 32776, "protocol": "tcp"},
+        {"container_port": 8080, "host_port": 32777, "protocol": "tcp"},
+    ]
+
+
+def test_extract_port_info_tolerates_missing_and_junk():
+    from FuxiYu_NodeKernel.docker_operates.port_mappings import extract_port_info
+
+    assert extract_port_info(None) == (None, [])
+    assert extract_port_info({}) == (None, [])
+    assert extract_port_info({"NetworkSettings": {}}) == (None, [])
+    # 未发布的端口（bindings=None）、坏 key、非数字 HostPort：一律跳过而不是抛
+    junk = {"NetworkSettings": {"Ports": {
+        "22/tcp": None,
+        "notaport": [{"HostPort": "abc"}],
+        "6006/tcp": [{"HostPort": None}],
+    }}}
+    assert extract_port_info(junk) == (None, [])
+
+
+def test_status_cache_refreshes_port_info_from_attrs_every_round():
+    """每轮快照都从 attrs 重算端口：不再把创建那一刻的旧值一直推给 Ctrl。
+
+    回归锁（2026-09 实测）：库里按 docker 事实手改的值，刷新一次就被 Node 上报的旧值
+    盖回去——根因就是缓存沿用创建时的值，而不是每轮重算。
+    """
+    from FuxiYu_NodeKernel.constant import ContainerStatus as _CS
+
+    cache = ContainerStatusCache()
+    cache.set_port_info(
+        "c1", 1111, [{"container_port": 22, "host_port": 1111, "protocol": "tcp"}]
+    )
+    assert cache.get_state("c1")["port"] == 1111
+
+    container = _Container("c1", status="running")
+    container.attrs["NetworkSettings"] = {"Ports": {
+        "22/tcp": [{"HostIp": "0.0.0.0", "HostPort": "2222"}],
+    }}
+    cache._apply_container(container)
+
+    state = cache.get_state("c1")
+    assert state["status"] == _CS.ONLINE.value
+    assert state["port"] == 2222, "端口以 docker 当前事实为准，不是创建时的 1111"
+    assert state["port_mappings"] == [
+        {"container_port": 22, "host_port": 2222, "protocol": "tcp"}
+    ]

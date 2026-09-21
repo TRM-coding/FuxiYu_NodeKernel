@@ -13,6 +13,7 @@ from docker.types import Mount
 import os
 from typing import NamedTuple
 from ..utils import sanitizer as _sanitizer
+from ..docker_operates.port_mappings import extract_port_info
 import subprocess
 import threading
 import time
@@ -523,30 +524,12 @@ def create_container(
         raise RuntimeError(f"sshd gate failed: {e}") from e
 
     # ── 端口映射回填（docker 自动分配）：inspect NetworkSettings.Ports 提取实际宿主端口 ──
+    # 提取逻辑在 docker_operates.port_mappings（采集侧每轮也用它重算，两边必须一致）。
     port = None
     port_mappings = []
     try:
         container.reload()
-        net_ports = (container.attrs.get("NetworkSettings") or {}).get("Ports") or {}
-        for container_port_key, bindings in net_ports.items():
-            cport_str, _, proto = container_port_key.partition("/")
-            proto = proto or "tcp"
-            for binding in bindings or []:
-                host_port = binding.get("HostPort")
-                if not host_port:
-                    continue
-                try:
-                    host_port = int(host_port)
-                    cport = int(cport_str)
-                except (TypeError, ValueError):
-                    continue
-                port_mappings.append({
-                    "container_port": cport,
-                    "host_port": host_port,
-                    "protocol": proto,
-                })
-                if cport == 22 and port is None:
-                    port = host_port
+        port, port_mappings = extract_port_info(container.attrs)
     except Exception as e:
         print(f"port mapping inspect failed: {e}")
         logger.warning("create_container port inspect failed: name=%s error=%s", name, e)

@@ -21,6 +21,7 @@ import time
 import docker
 
 from ..constant import ContainerStatus
+from .port_mappings import extract_port_info
 
 logger = logging.getLogger(__name__)
 
@@ -483,9 +484,20 @@ class ContainerStatusCache:
     ##################
     # 采集侧（docker 事件/对账 → 缓存回填；API 层不可调用）
 
-    def update(self, name: str, status: str, runtime_metrics: dict | None = None) -> None:
+    def update(
+        self,
+        name: str,
+        status: str,
+        runtime_metrics: dict | None = None,
+        attrs: dict | None = None,
+    ) -> None:
         """采集回填口（events/对账/转换态终态共用）：
-        存在则更新、不存在则创建（填充器语义：events/对账发现新容器也要能落缓存）。"""
+        存在则更新、不存在则创建（填充器语义：events/对账发现新容器也要能落缓存）。
+
+        *attrs*：这一轮从 docker 读到的容器 attrs。**给了就从里面重算端口**——端口是
+        docker 的事实，重算才不会把创建那一刻的旧值一直推给 Ctrl（2026-09：库里手改
+        成 docker 事实的值会被旧值盖回去）。没给（如 events 路径拿不到 attrs）则沿用旧值。
+        """
         with self._lock:
             old_entry = self._cache.get(name, {})
             old = old_entry.get("status")
@@ -497,19 +509,33 @@ class ContainerStatusCache:
                 entry["runtime_metrics"] = runtime_metrics
             elif old_entry.get("runtime_metrics") is not None:
                 entry["runtime_metrics"] = old_entry.get("runtime_metrics")
-            # 端口信息（创建后 inspect 回填）随状态推进保留
-            if old_entry.get("port") is not None:
-                entry["port"] = old_entry.get("port")
-            if old_entry.get("port_mappings") is not None:
-                entry["port_mappings"] = old_entry.get("port_mappings")
+            if attrs is not None:
+                # 每轮重算：端口以 docker 当前事实为准（含去重，见 port_mappings 模块）
+                port, port_mappings = extract_port_info(attrs)
+                if port is not None:
+                    entry["port"] = port
+                entry["port_mappings"] = port_mappings
+            else:
+                # 端口信息（创建后 inspect 回填）随状态推进保留
+                if old_entry.get("port") is not None:
+                    entry["port"] = old_entry.get("port")
+                if old_entry.get("port_mappings") is not None:
+                    entry["port_mappings"] = old_entry.get("port_mappings")
             self._cache[name] = entry
         if old != status:
             logger.info("status-cache update: name=%s %s -> %s", name, old, status)
 
     def set_port_info(self, name: str, port: int | None, port_mappings: list | None) -> None:
-        """创建完成后回填端口映射（docker 自动分配结果），随快照推给 Ctrl。"""
+        """创建完成后回填端口映射（docker 自动分配结果），随快照推给 Ctrl。
+
+        注：若缓存里还没有这个容器，这里会建一条最小条目——**必须带上 updated_at**，
+        否则 `get_state` 取它时会 KeyError（读侧按契约假定条目完整）。
+        """
         with self._lock:
-            entry = self._cache.setdefault(name, {"status": ContainerStatus.UNKNOWN.value})
+            entry = self._cache.setdefault(name, {
+                "status": ContainerStatus.UNKNOWN.value,
+                "updated_at": datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%S'),
+            })
             if port is not None:
                 entry["port"] = port
             if port_mappings is not None:
@@ -608,7 +634,13 @@ class ContainerStatusCache:
             # 终态守卫：FAILED 不被对账复活（操作/事件路径仍可恢复：restart → ready_check 门禁）
             self.update_runtime_metrics(container.name, runtime_metrics)
             return
-        self.update(container.name, _map_container_to_status(container), runtime_metrics=runtime_metrics)
+        # 带上 attrs：本轮从 docker 重算端口（不再沿用创建时的旧值）
+        self.update(
+            container.name,
+            _map_container_to_status(container),
+            runtime_metrics=runtime_metrics,
+            attrs=getattr(container, "attrs", None),
+        )
 
     ##################
     # 读缓存
