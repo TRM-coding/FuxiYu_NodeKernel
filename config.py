@@ -27,6 +27,23 @@ class NetConfig:
     NODE_PORT = _env_int("NODE_PORT", 5789)
 
 
+class PortConfig:
+    """容器宿主端口的分配段（Node 分配，实现在 docker_operates/port_allocator.py）。
+
+    默认 20000–29999 的理由：
+
+    - 内核 ephemeral 段是 32768–60999，docker 自己的 `-P` 也从 32768 附近起 ——
+      避开它，就不跟出站连接抢号；
+    - 避开 K8s NodePort 段 30000–32767；
+    - 一万个够用：每容器约 2–3 个端口 ≈ 数千容器/机，远未到规模。
+
+    ★ 宿主防火墙/上游只放行小段时，把它改小成实际可放行的区间（例如 20000–21999）——
+      这是唯一无法在代码里自愈的一条，改完要重启 Node。
+    """
+    NODE_PORT_RANGE_START = _env_int("NODE_PORT_RANGE_START", 20000)
+    NODE_PORT_RANGE_END = _env_int("NODE_PORT_RANGE_END", 29999)
+
+
 class KeyConfig:
     PUBLIC_KEY_PATH='public_A.pem'
     PRIVATE_KEY_PATH='private_A.pem'

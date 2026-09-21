@@ -37,12 +37,13 @@ class FakeContainer:
         self.attrs = {"State": {"Status": status}}
         self._exit_code = exec_exit_code
         self.exec_calls = []
+        self.removed = False
 
     def reload(self) -> None:
         pass
 
     def remove(self, *a, **k) -> None:
-        pass
+        self.removed = True
 
     def stop(self, *a, **k) -> None:
         pass
@@ -68,6 +69,7 @@ class FakeContainer:
 class FakeContainers:
     def __init__(self, existing=None):
         self._existing = list(existing or [])
+        self.run_calls = []
 
     def get(self, name_or_id):
         for c in self._existing:
@@ -79,12 +81,40 @@ class FakeContainers:
         return list(self._existing)
 
     def run(self, *a, **k):
+        self.run_calls.append((a, k))
         return FakeContainer(name=k.get("name", "c1"))
 
 
+class FakeImage:
+    """docker image 假实现：分配器只读 `attrs.Config.ExposedPorts`。"""
+
+    def __init__(self, exposed=None, tag: str = "fake:latest"):
+        default = {"22/tcp": {}}
+        self.tag = tag
+        self.attrs = {"Config": {"ExposedPorts": dict(default if exposed is None else exposed)}}
+
+
+class FakeImages:
+    def __init__(self, exposed=None, missing: bool = False):
+        self.exposed = exposed
+        self.missing = missing
+        self.pulled = []
+
+    def get(self, tag):
+        if self.missing:
+            raise docker_pkg.errors.ImageNotFound("no such image")
+        return FakeImage(self.exposed, tag)
+
+    def pull(self, tag):
+        self.pulled.append(tag)
+        self.missing = False
+        return FakeImage(self.exposed, tag)
+
+
 class FakeDockerClient:
-    def __init__(self, containers=None):
+    def __init__(self, containers=None, images=None):
         self.containers = containers or FakeContainers()
+        self.images = images or FakeImages()
 
 
 def encrypted_body(payload: dict) -> dict:

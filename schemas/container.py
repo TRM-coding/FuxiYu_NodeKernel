@@ -32,6 +32,9 @@ class ContainerConfig(BaseModel):
     memory: int = Field(..., ge=0, description="Memory limit in GB")
     shared_memory: int = Field(..., ge=0, description="Shared memory size in GB")
     name: str
+    # **遗留字段，Node 不采用**：宿主端口自 2026-09 起由 Node 自己分配并显式绑定（见
+    # docker_operates/port_allocator.py），Ctrl 现在恒发 0。保留它是为了不动 wire 契约——
+    # 但谁都不要拿它去起容器：那会让端口重新变成"Ctrl 猜、docker 另有事实"的局面。
     port: int = Field(..., ge=0, le=65535)
     image: str
 

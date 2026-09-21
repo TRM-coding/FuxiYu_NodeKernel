@@ -8,11 +8,13 @@ import os
 import docker
 import pytest
 
+from FuxiYu_NodeKernel.config import PortConfig
+from FuxiYu_NodeKernel.docker_operates import port_allocator
 from FuxiYu_NodeKernel.services.container_service import build_image, create_container, CreateContainerReturn
 from FuxiYu_NodeKernel.utils.Container import Container
 from FuxiYu_NodeKernel import extensions
 
-from .conftest import FakeContainer, FakeContainers, FakeDockerClient
+from .conftest import FakeContainer, FakeContainers, FakeDockerClient, FakeImages
 
 # 与本进程代理相关的环境变量（大小写都认）
 _PROXY_KEYS = ("http_proxy", "HTTP_PROXY", "https_proxy", "HTTPS_PROXY", "no_proxy", "NO_PROXY")
@@ -274,9 +276,11 @@ def test_create_container_uses_prepared_image_and_only_runs_sshd_gate(monkeypatc
 
     assert isinstance(result, CreateContainerReturn)
     assert run_calls and run_calls[0][0][0] == cfg_data["image"]
-    # 端口发布交给 docker（2026-08 决策）：22 与 EXPOSE 全部自动分配宿主端口
-    assert run_calls[0][1]["ports"] == {"22/tcp": None}
-    assert run_calls[0][1]["publish_all_ports"] is True
+    # 宿主端口由 Node 分配并**显式绑定**（2026-09 决策）：号跟着容器走，不再随 -P 漂
+    ports = run_calls[0][1]["ports"]
+    assert set(ports) == {"22/tcp"}
+    assert PortConfig.NODE_PORT_RANGE_START <= ports["22/tcp"] <= PortConfig.NODE_PORT_RANGE_END
+    assert run_calls[0][1]["publish_all_ports"] is False
     exec_commands = [
         call[0][2] for call in created[0].exec_calls
         if isinstance(call[0], list) and len(call[0]) >= 3
@@ -287,6 +291,123 @@ def test_create_container_uses_prepared_image_and_only_runs_sshd_gate(monkeypatc
     assert "mkdir -p /run/sshd" in joined
     assert "ssh-keygen -A" in joined
     assert "/usr/sbin/sshd" in joined
+
+
+def _create_and_capture(monkeypatch, *, exposed=None, missing_image=False, containers=None):
+    """跑一次 create_container，返回 (containers 假实现, images 假实现)。
+
+    宿主 /proc 的占用被打空：分配结果必须只由用例摆出的占用决定。
+    """
+    containers = containers or FakeContainers()
+    images = FakeImages(exposed=exposed, missing=missing_image)
+    monkeypatch.setattr(extensions, "docker_client", FakeDockerClient(containers, images))
+    monkeypatch.setattr(port_allocator, "_system_bound_ports", lambda: set())
+    _patch_fs(monkeypatch)
+    monkeypatch.setenv("NODE_CONTAINERS_BASE", "/tmp")
+    create_container("admin", Container.Config_info(**VALID_CFG))
+    return containers, images
+
+
+def test_all_exposed_ports_get_an_explicit_host_port(monkeypatch):
+    """★ 保留 -P 的便利（镜像 EXPOSE 的端口全都发布），但号由 Node 写死。
+
+    这是换掉 `-P` 的**唯一前提**：漏发一个 EXPOSE 端口，学生的服务就再也连不上了。
+    """
+    containers, _ = _create_and_capture(
+        monkeypatch, exposed={"8080/tcp": {}, "50000/tcp": {}}
+    )
+
+    start = PortConfig.NODE_PORT_RANGE_START
+    assert containers.run_calls[0][1]["ports"] == {
+        "22/tcp": start, "8080/tcp": start + 1, "50000/tcp": start + 2,
+    }
+
+
+def test_image_absent_locally_is_pulled_to_read_its_expose(monkeypatch):
+    """本地没有镜像就补拉一次（`docker run` 本来也会隐式拉），否则会静默退化成"只发 22"。"""
+    containers, images = _create_and_capture(
+        monkeypatch, exposed={"8080/tcp": {}}, missing_image=True
+    )
+
+    assert images.pulled == [VALID_CFG["image"]]
+    assert set(containers.run_calls[0][1]["ports"]) == {"22/tcp", "8080/tcp"}
+
+
+def test_port_conflict_reallocates_the_whole_group(monkeypatch):
+    """扫描与绑定之间被别人抢了号 → 整组换号重试，不做单端口修补。"""
+    start = PortConfig.NODE_PORT_RANGE_START
+    attempts = []
+
+    class _Flaky(FakeContainers):
+        def run(self, *a, **k):
+            attempts.append(k["ports"])
+            if len(attempts) == 1:
+                raise docker.errors.APIError(
+                    f"driver failed programming external connectivity on endpoint c: "
+                    f"Bind for 0.0.0.0:{start} failed: port is already allocated"
+                )
+            return super().run(*a, **k)
+
+    _create_and_capture(monkeypatch, containers=_Flaky())
+
+    assert attempts == [{"22/tcp": start}, {"22/tcp": start + 1}]
+
+
+def test_leftover_container_is_removed_before_retry(monkeypatch):
+    """端口冲突发生在 start 阶段：容器对象已经建出来了，不清掉下一次尝试会撞同名。"""
+    start = PortConfig.NODE_PORT_RANGE_START
+    attempts = []
+    created = []
+
+    class _Flaky(FakeContainers):
+        def run(self, *a, **k):
+            attempts.append(k["ports"])
+            container = FakeContainer(name=k["name"], status="created")
+            created.append(container)
+            self._existing.append(container)  # 半成品容器确实存在于 daemon 里
+            if len(attempts) == 1:
+                raise docker.errors.APIError(
+                    f"Bind for 0.0.0.0:{start} failed: port is already allocated"
+                )
+            return container
+
+    _create_and_capture(monkeypatch, containers=_Flaky())
+
+    assert created[0].removed is True
+
+
+def test_repeated_bind_conflicts_stop_at_the_attempt_cap(monkeypatch):
+    """反复冲突是**系统性信号**（扫描与 docker 不一致），不该退化成上万次 docker 调用。"""
+    start = PortConfig.NODE_PORT_RANGE_START
+
+    class _AlwaysConflicting(FakeContainers):
+        def run(self, *a, **k):
+            self.run_calls.append((a, k))
+            raise docker.errors.APIError(
+                "Bind for 0.0.0.0:20000 failed: port is already allocated"
+            )
+
+    containers = _AlwaysConflicting()
+    with pytest.raises(RuntimeError, match="failed to bind host ports after 10 attempts"):
+        _create_and_capture(monkeypatch, containers=containers)
+
+    # 每次尝试都换了号（整组重分配），不是在同一号上死磕
+    tried = [k["ports"]["22/tcp"] for _, k in containers.run_calls]
+    assert tried == list(range(start, start + 10))
+
+
+def test_unrelated_run_failure_is_not_retried(monkeypatch):
+    """只对端口冲突重试：镜像缺失之类的失败重试十次只是把错误拖慢十倍。"""
+    class _Boom(FakeContainers):
+        def run(self, *a, **k):
+            self.run_calls.append((a, k))
+            raise docker.errors.APIError("No such image: fuxi/nope")
+
+    containers = _Boom()
+    with pytest.raises(docker.errors.APIError, match="No such image"):
+        _create_and_capture(monkeypatch, containers=containers)
+
+    assert len(containers.run_calls) == 1
 
 
 def test_create_container_gpu_request_uses_device_ids_without_driver(monkeypatch):
@@ -578,7 +699,11 @@ def test_happy_path(monkeypatch, tmp_path):
         extensions.init_docker()
     client = extensions.docker_client
 
-    test_config = Container.Config_info(**VALID_CFG)
+    # 这个用例要跑得完，镜像里必须有 sshd（平台构建出来的镜像都有，裸 ubuntu 没有）。
+    # 所以允许指一个真实镜像：NODE_TEST_IMAGE=fuxi/image-1:<tag>。
+    docker_cfg = dict(VALID_CFG)
+    docker_cfg["image"] = os.getenv("NODE_TEST_IMAGE", VALID_CFG["image"])
+    test_config = Container.Config_info(**docker_cfg)
     # 带公钥：验证守门重排（公钥先于 sshd 安装）
     dummy_key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI dummy-key-for-test@fuxi"
 
@@ -593,6 +718,7 @@ def test_happy_path(monkeypatch, tmp_path):
         r = container.exec_run(["/bin/sh", "-c", cmd], user="root")
         return getattr(r, "exit_code", r[0]), r.output
 
+    bound_port = None
     try:
         result = create_container("admin", test_config, public_key=dummy_key)
 
@@ -605,8 +731,17 @@ def test_happy_path(monkeypatch, tmp_path):
         assert real.attrs["HostConfig"]["Memory"] == test_config.memory * 1024 * 1024 * 1024
         # 生产代码按 cpuset 固定核（cpu_number=2 → "0,1"），不是 CpuQuota 配额
         assert real.attrs["HostConfig"]["CpusetCpus"] == ",".join(str(i) for i in range(test_config.cpu_number))
-        assert "22/tcp" in real.attrs["HostConfig"]["PortBindings"]
-        assert real.attrs["HostConfig"]["PortBindings"]["22/tcp"][0]["HostPort"] == str(test_config.port)
+        # 宿主端口由 Node 从分配段里给并**显式写入** HostConfig.PortBindings：
+        # 号跟着容器走，stop/restart 不会漂（2026-09 决策）。config.port 是 Ctrl 时代的
+        # 遗留字段，Node 只记日志、不采用。
+        binding = real.attrs["HostConfig"]["PortBindings"]["22/tcp"][0]["HostPort"]
+        assert int(binding) in range(
+            PortConfig.NODE_PORT_RANGE_START, PortConfig.NODE_PORT_RANGE_END + 1
+        )
+        assert real.attrs["NetworkSettings"]["Ports"]["22/tcp"][0]["HostPort"] == binding
+        bound_port = int(binding)
+        # 分配器读到的占用视图必须包含这个刚发布的号（与回显同一个字段）
+        assert bound_port in port_allocator.occupied_host_ports(client=client)
 
         # ── 守门重排验证（create 完成 ⟹ sshd 就绪；公钥先于 sshd 安装） ──
         code, out = _exec(real, "test -x /usr/sbin/sshd && echo SSH_BIN_OK")
@@ -626,3 +761,7 @@ def test_happy_path(monkeypatch, tmp_path):
             leftover.remove(force=True)
         except docker_pkg.errors.NotFound:
             pass
+
+    # 「删除即释放」——号回到池子里，下一个容器能接着用（生命周期规则的回归锁）
+    assert bound_port is not None
+    assert bound_port not in port_allocator.occupied_host_ports(client=client)

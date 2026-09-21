@@ -13,7 +13,9 @@ from docker.types import Mount
 import os
 from typing import NamedTuple
 from ..utils import sanitizer as _sanitizer
+from ..config import PortConfig
 from ..docker_operates.port_mappings import extract_port_info
+from ..docker_operates.port_allocator import allocate_ports, container_ports_for
 import subprocess
 import threading
 import time
@@ -270,6 +272,53 @@ class RemoveContinaerReturn:
 #Function Implementation
 ####################################################
 
+# 一个容器最多实际尝试几次 docker 绑定（每次尝试 = 一次创建往返）。
+# 环耗尽（PortRangeExhausted）才是有意义的终止条件；而"反复绑定冲突"是系统性信号，
+# 不该让一次创建退化成上万次 docker 调用——两者在报错里分开（2026-09 决策）。
+_MAX_PORT_BIND_ATTEMPTS = 10
+
+
+def _image_container_ports(image_tag: str) -> list[str]:
+    """镜像要发布的容器端口（含强制的 22/tcp）。
+
+    本地没有就补拉一次：`docker run` 本来也会隐式拉，这里只是把那一刻提前，好读到镜像声明的
+    EXPOSE——否则会静默退化成"只发 22"，而那正是当初换成 `-P` 想避免的事。
+    """
+    try:
+        image = extensions.docker_client.images.get(image_tag)
+    except docker.errors.ImageNotFound:
+        logger.warning("image %s not present locally, pulling to read its EXPOSE", image_tag)
+        image = extensions.docker_client.images.pull(image_tag)
+    return container_ports_for(image)
+
+
+def _is_port_conflict(err: Exception) -> bool:
+    """docker 拒绝绑定宿主端口。
+
+    典型报文：`driver failed programming external connectivity on endpoint X:
+    Bind for 0.0.0.0:20000 failed: port is already allocated`。只认这两种措辞，
+    免得把镜像缺失之类的失败也当成"换个号再来"。
+    """
+    text = str(err).lower()
+    return "port is already allocated" in text or "address already in use" in text
+
+
+def _remove_leftover_container(name: str) -> None:
+    """端口冲突发生在 start 阶段，容器对象已经建出来了——不清掉，下一次尝试会撞同名。
+
+    尽力而为：清不掉就交给下一次尝试去撞 `container already exists`，那时的报错更直白。
+    """
+    try:
+        leftover = extensions.docker_client.containers.get(name)
+    except docker.errors.NotFound:
+        return
+    try:
+        leftover.remove(force=True)
+        logger.warning("removed leftover container %s after a failed bind", name)
+    except Exception as e:
+        logger.warning("could not remove leftover container %s: %s", name, e)
+
+
 # 将owner_name作为root，创建port新容器
 def create_container(
     owner_name: str,
@@ -392,24 +441,53 @@ def create_container(
     # 这样分工才合理——"跑什么"是控制面的策略（连同它默认的 tail -f /dev/null 一起写在
     # Ctrl 的渲染函数里），Node 是纯执行器。此前的那条路（运行期传 command）必须额外置空
     # Entrypoint 才不被镜像入口吃掉，一旦漏掉就会静默跑错——把策略放在构建期就从根上没了。
-    container = extensions.docker_client.containers.run(
-        config.image,
-        detach=True,
-        tty=True,
-        name=name,
-        
-        # 端口发布交给 docker（2026-08 决策）：22 与 EXPOSE 端口全部自动分配宿主端口，
-        # 创建后 inspect 回填实际映射；Ctrl 不再分配端口（get_the_first_free_port 退役）。
-        ports={"22/tcp": None},
-        publish_all_ports=True,   # 等价 docker run -P：自动发布 Dockerfile EXPOSE 的端口
-        mem_limit=mem_limit,
-        cpuset_cpus=cpuset_cpus,
-        device_requests=device_requests,
-        mounts=mounts,
-        **({"shm_size": shm_size_bytes} if shm_size_bytes is not None else {}),
-        # 没配代理就不传这个键（空 dict 也会被 docker 当成"设了环境"）
-        **({"environment": proxy_env} if proxy_env else {})
-    )
+    #
+    # 宿主端口由 **Node 分配并显式绑定**（2026-09 决策，取代 docker -P）：
+    # 显式绑定写进 HostConfig.PortBindings、跟着容器走，stop/restart 都不再漂号；
+    # 选号规则与"为什么不持久化游标"见 docker_operates/port_allocator.py。
+    container_ports = _image_container_ports(config.image)
+    port_map: dict[str, int] = {}
+    excluded_ports: set[int] = set()
+    bind_error: Exception | None = None
+    for attempt in range(1, _MAX_PORT_BIND_ATTEMPTS + 1):
+        port_map = allocate_ports(container_ports, exclude=excluded_ports)
+        try:
+            container = extensions.docker_client.containers.run(
+                config.image,
+                detach=True,
+                tty=True,
+                name=name,
+                ports=port_map,
+                publish_all_ports=False,  # 关掉：否则没被显式覆盖的 EXPOSE 端口又会随机漂
+                mem_limit=mem_limit,
+                cpuset_cpus=cpuset_cpus,
+                device_requests=device_requests,
+                mounts=mounts,
+                **({"shm_size": shm_size_bytes} if shm_size_bytes is not None else {}),
+                # 没配代理就不传这个键（空 dict 也会被 docker 当成"设了环境"）
+                **({"environment": proxy_env} if proxy_env else {})
+            )
+            break
+        except Exception as e:
+            if not _is_port_conflict(e):
+                raise
+            # 扫描与绑定之间被别人抢了号：**整组重来**，不做单端口修补（免留半分配）
+            logger.warning(
+                "host port conflict for %s (attempt %d/%d, ports=%s): %s",
+                name, attempt, _MAX_PORT_BIND_ATTEMPTS, port_map, e,
+            )
+            excluded_ports |= set(port_map.values())
+            bind_error = e
+            _remove_leftover_container(name)
+    else:
+        raise RuntimeError(
+            f"failed to bind host ports after {_MAX_PORT_BIND_ATTEMPTS} attempts "
+            f"(last try {port_map}); repeated conflicts mean the port scan and docker "
+            f"disagree — check NODE_PORT_RANGE "
+            f"{PortConfig.NODE_PORT_RANGE_START}-{PortConfig.NODE_PORT_RANGE_END} "
+            f"and whether the host firewall/netns changed"
+        ) from bind_error
+    logger.info("container %s bound host ports %s", name, port_map)
     print(f"Container created with ID={container.id} and name={name}")
 
 
@@ -523,8 +601,10 @@ def create_container(
             ) from e
         raise RuntimeError(f"sshd gate failed: {e}") from e
 
-    # ── 端口映射回填（docker 自动分配）：inspect NetworkSettings.Ports 提取实际宿主端口 ──
-    # 提取逻辑在 docker_operates.port_mappings（采集侧每轮也用它重算，两边必须一致）。
+    # ── 端口映射回填：inspect NetworkSettings.Ports 取**实际**宿主端口 ──
+    # 号是上面分配并显式绑定的，这里仍然以 docker 的事实为准——分配器算出来的那组只是
+    # 意图，回显这一份才是结果，两者对不上时以这边为准（提取逻辑在
+    # docker_operates.port_mappings，采集侧每轮也用它重算，两边必须一致）。
     port = None
     port_mappings = []
     try:
