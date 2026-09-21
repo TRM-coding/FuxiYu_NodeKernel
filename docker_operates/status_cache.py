@@ -526,7 +526,10 @@ class ContainerStatusCache:
             logger.info("status-cache update: name=%s %s -> %s", name, old, status)
 
     def set_port_info(self, name: str, port: int | None, port_mappings: list | None) -> None:
-        """创建完成后回填端口映射（docker 自动分配结果），随快照推给 Ctrl。
+        """创建完成后回填端口映射（**docker 实际绑定的结果**），随快照推给 Ctrl。
+
+        号是创建时 Node 分配并显式绑定的（见 port_allocator），但这里填的是 docker 回读
+        出来的那一份——分配是意图，这份是事实，两者不一致时以这份为准。
 
         注：若缓存里还没有这个容器，这里会建一条最小条目——**必须带上 updated_at**，
         否则 `get_state` 取它时会 KeyError（读侧按契约假定条目完整）。

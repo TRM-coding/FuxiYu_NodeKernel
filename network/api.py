@@ -163,7 +163,8 @@ def create_container_api(message: CreateContainerMessage):
                 result.container_name,
                 result.container_id,
             )
-            # 端口映射（docker 自动分配结果）回填 status_cache，随快照推 Ctrl 落库
+            # 端口映射（docker 实际绑定的结果）回填 status_cache，随快照推 Ctrl 落库。
+            # 号由 Node 在创建时分配并显式绑定，这里仍以 docker 回读为准。
             extensions.status_cache.set_port_info(
                 cfg_obj.name,
                 getattr(result, "port", None),
