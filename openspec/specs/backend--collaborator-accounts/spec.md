@@ -224,6 +224,29 @@ Node SHALL 通过 Pydantic 模型处理此对象，保留嵌套类型、继承�
 
 来源：[constant.py](../../../constant.py)。
 
+### Requirement: 恢复重建账号时修正家目录属主 [services/container_service.py]
+
+创建/恢复请求携带 `restore_accounts` 时，Node SHALL 在容器建立后逐个重建账号，并按 `role` 决定是否附加管理员组；任一条目重建失败 SHALL 使本次创建按失败处理。
+
+账号的家目录 SHALL 位于持久化挂载之内，从而随挂载数据一并取回；重建时 SHALL 把家目录属主修正为新建账号，MUST NOT 假定镜像为该账号分配的标识与删除前一致。
+
+#### Scenario: 按恢复清单重建账号
+
+- **WHEN** 创建/恢复请求携带 `restore_accounts` 清单
+- **THEN** Node 对每个条目重建账号，条目重建失败则本次创建判为失败
+
+#### Scenario: 属主随账号重建被修正
+
+- **WHEN** 账号被重建，且镜像分配的标识与删除前不同
+- **THEN** 该账号对其家目录可读写
+
+#### Scenario: 家目录数据随挂载取回
+
+- **WHEN** 恢复一个协作者家目录已位于持久化挂载之内、且该目录留有文件的容器
+- **THEN** 这些文件在恢复后的容器中可见
+
+来源：[services/container_service.py](../../../services/container_service.py)、[network/api.py](../../../network/api.py)。
+
 ## Data model appendix
 
 ### AddCollaboratorConfig 数据契约 [schemas/container.py]
@@ -299,4 +322,6 @@ Node SHALL 通过 Pydantic 模型处理此对象，保留嵌套类型、继承�
 
 - [constant.py](../../../constant.py)
 - [schemas/container.py](../../../schemas/container.py)
+- [services/container_service.py](../../../services/container_service.py)
+- [network/api.py](../../../network/api.py)
 - [tests/](../../../tests/)：Linux 安全默认套件 152 passed、11 deselected；未运行 Docker 集成测试。

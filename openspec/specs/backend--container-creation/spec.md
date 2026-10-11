@@ -31,7 +31,7 @@ Node SHALL 通过 Pydantic 模型处理此对象，保留嵌套类型、继承�
 
 字段与成员见文末同名数据附录。
 
-系统 SHALL 保持以下已实现的职责：dockerfile_text 为 Ctrl 生成的最终 Dockerfile，image_tag 为最终制品 tag；正文为空走既有镜像，不把用户模板和完整 Dockerfile 混同。
+系统 SHALL 保持以下已实现的职责：dockerfile_text 为 Ctrl 生成的最终 Dockerfile，image_tag 为最终制品 tag；未提供 image_build 时按 config.image 使用既有镜像，提供了构建段但正文或标签为空时构建失败，不把用户模板和完整 Dockerfile 混同。
 
 #### Scenario: 字段校验与缺省值
 
@@ -168,6 +168,62 @@ Node SHALL 通过 Pydantic 模型处理此对象，保留嵌套类型、继承�
 
 来源：[services/container_service.py](../../../services/container_service.py)。
 
+### Requirement: 构建段命中本机标签即跳过构建 [services/container_service.py]
+
+Node SHALL 以 `image_build.image_tag` 作为本机 Docker 制品的缓存键（key）：该标签在本机已存在时 SHALL 直接复用并跳过构建，不存在时才按 `image_build.dockerfile_text` 现场构建。`dockerfile_text` 或 `image_tag` 为空时 SHALL 判为无法构建并失败，MUST NOT 静默退回“按运行标签直接启动、不下发构建”。构建成功后 SHALL 以构建出的标签作为本次创建实际运行的镜像。
+
+是否需要真正构建 SHALL 由 Node 在本机判定；Node MUST NOT 因外部存在“该标签已被派发过”的记录而跳过该判定。
+
+#### Scenario: 命中即跳过构建
+
+- **WHEN** 本机 Docker 已存在构建段声明的标签
+- **THEN** 直接使用该标签，不执行构建
+
+#### Scenario: 未命中则现场构建
+
+- **WHEN** 本机 Docker 不存在该标签
+- **THEN** 用构建段的 Dockerfile 文本构建出该标签后继续创建
+
+#### Scenario: 构建段缺文本时失败而非降级
+
+- **WHEN** 请求声明了构建段但 `dockerfile_text` 为空
+- **THEN** 本次创建失败，不按运行标签直接启动容器
+
+#### Scenario: 构建结果决定运行镜像
+
+- **WHEN** 构建段存在且构建成功
+- **THEN** 本次创建实际运行的镜像标签等于构建段声明的标签
+
+来源：[services/container_service.py](../../../services/container_service.py)。
+
+### Requirement: 恢复挂载来源只由入参决定 [services/container_service.py]
+
+恢复既有容器时，宿主挂载来源 SHALL 取请求携带的 `restore_mount_path`（已删除容器保留的宿主目录），MUST NOT 依据本次容器名重新推导，也 MUST NOT 因运行镜像的来源不同而改变。未携带该入参时才按 `NODE_CONTAINERS_BASE` / owner / 容器名推导新建目录。
+
+`restore_mount_path` SHALL 经 realpath 规范化，并约束在容器挂载根目录之下且含 `containers` 路径段；目录不存在时 SHALL 拒绝该次创建。目标容器名已被本机占用时 SHALL 直接拒绝，MUST NOT 自行改名或改用其它挂载目录。
+
+#### Scenario: 恢复沿用原目录
+
+- **WHEN** 恢复请求携带原容器的宿主挂载目录
+- **THEN** 挂载来源取该目录，与本次容器名和运行镜像的来源无关
+
+#### Scenario: 改名不改变数据位置
+
+- **WHEN** 恢复请求携带的容器名与原容器不同，而挂载入参仍指向原目录
+- **THEN** 数据仍来自原目录，不按新名字推导新目录
+
+#### Scenario: 越界或缺失的挂载入参被拒绝
+
+- **WHEN** 挂载入参经规范化后超出容器挂载根、缺少 `containers` 段，或目录不存在
+- **THEN** 本次创建被拒绝
+
+#### Scenario: 名字被占用即拒绝
+
+- **WHEN** 本机已存在同名容器
+- **THEN** 本次创建失败，不自行改名、不替换挂载来源
+
+来源：[services/container_service.py](../../../services/container_service.py)、[network/api.py](../../../network/api.py)。
+
 ## Data model appendix
 
 ### ContainerConfig 数据契约 [schemas/container.py]
@@ -241,5 +297,6 @@ Node SHALL 通过 Pydantic 模型处理此对象，保留嵌套类型、继承�
 
 - [schemas/container.py](../../../schemas/container.py)
 - [services/container_service.py](../../../services/container_service.py)
+- [network/api.py](../../../network/api.py)
 - [utils/Container.py](../../../utils/Container.py)
 - [tests/](../../../tests/)：Linux 安全默认套件 152 passed、11 deselected；未运行 Docker 集成测试。

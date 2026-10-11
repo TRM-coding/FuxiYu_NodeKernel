@@ -83,7 +83,37 @@ Node SHALL 保持以下线路形状及数据来源：type='snapshot'；topic='sy
 
 来源：[network/wss.py](../../../network/wss.py)。
 
+### Requirement: Ctrl 拨入链路端点与身份门禁 [network/wss.py]
+
+Node SHALL 在既有 HTTPS 监听上以路径 `/ws/ctrl` 提供 Ctrl 拨入的 WebSocket 端点，复用同一张 Node 证书与同一套客户端证书校验；该端点 MUST NOT 要求新增监听端口或新增证书。Node MUST NOT 主动向 Ctrl 发起连接，也 MUST NOT 自行维护到 Ctrl 的重连循环——连接的生灭与重建由 Ctrl 侧承担。
+
+本机身份牌未就绪时，端点 SHALL 关闭连接且不进入推送循环。连接查询参数携带的 `uid` 缺失或与本机持久化身份牌不一致时，端点 SHALL 在推送任何帧之前关闭连接。
+
+#### Scenario: 复用既有端口与证书
+
+- **WHEN** Node 以既有入口启动，且配置了 Ctrl 的 CA 信任文件
+- **THEN** `/ws/ctrl` 与操作接口在同一监听、同一证书下同时可用，WSS 握手继承既有的客户端证书校验
+
+#### Scenario: uid 不符则拒绝
+
+- **WHEN** 连接未携带 `uid`，或携带的 `uid` 与本机身份牌不一致
+- **THEN** Node 在推送任何帧之前关闭该连接
+
+#### Scenario: 身份牌未就绪不推送
+
+- **WHEN** 本机尚无身份牌
+- **THEN** 端点关闭连接，不建立推送循环；等待 Ctrl 下发身份牌后重拨
+
+#### Scenario: 无入站连接时不产生出站流量
+
+- **WHEN** Node 启动后没有任何 Ctrl 连接
+- **THEN** Node 不向任何 Ctrl 地址发起连接尝试
+
+来源：[network/wss.py](../../../network/wss.py)、[run.py](../../../run.py)。
+
 ## Source references
 
 - [network/wss.py](../../../network/wss.py)
+- [run.py](../../../run.py)
+- [__init__.py](../../../__init__.py)
 - [tests/](../../../tests/)：Linux 安全默认套件 152 passed、11 deselected；未运行 Docker 集成测试。
