@@ -2,14 +2,13 @@
 
 ## Purpose
 
-接收资源/镜像构建/恢复输入，后台创建 Docker 容器，受理态与最终状态分别表达。本文件是 chester-next 33672c4edd96 在 2026-10-11 的代码逆向基线，按能力组织相关类型而非每个 class 单独建文件。完整字段、继承与兼容定义保留在下列 Requirements 中；跨能力使用以公共类型及源文件为准，已知问题集中于 [Global QUESTIONS](../../../../FuxiYu_Global/QUESTIONS.md)。
+定义资源、镜像构建与恢复输入及后台容器创建行为，分别表达受理态与最终状态。按能力组织完整类型契约；构建缓存以 Ctrl 下发的准确标签为准。
 
 ## Requirements
 
 ### Requirement: ContainerConfig 数据契约 [schemas/container.py]
 
 Node SHALL 通过 Pydantic 模型处理此对象，保留嵌套类型、继承字段和 Field 约束；缺失必填字段或非法值在进入业务操作前由请求校验拒绝。
-
 
 字段与成员见文末同名数据附录。
 
@@ -20,14 +19,11 @@ Node SHALL 通过 Pydantic 模型处理此对象，保留嵌套类型、继承�
 - **WHEN** 消费者构造该模型且提供有效必填字段
 - **THEN** 模型采用声明的缺省值并保持继承字段；违反类型或 Field 边界的输入不作为有效实例
 
-
-
 来源：[schemas/container.py](../../../schemas/container.py)。
 
 ### Requirement: ImageBuildConfig 数据契约 [schemas/container.py]
 
 Node SHALL 通过 Pydantic 模型处理此对象，保留嵌套类型、继承字段和 Field 约束；缺失必填字段或非法值在进入业务操作前由请求校验拒绝。
-
 
 字段与成员见文末同名数据附录。
 
@@ -38,14 +34,11 @@ Node SHALL 通过 Pydantic 模型处理此对象，保留嵌套类型、继承�
 - **WHEN** 消费者构造该模型且提供有效必填字段
 - **THEN** 模型采用声明的缺省值并保持继承字段；违反类型或 Field 边界的输入不作为有效实例
 
-
-
 来源：[schemas/container.py](../../../schemas/container.py)。
 
 ### Requirement: RestoreAccountConfig 数据契约 [schemas/container.py]
 
 Node SHALL 通过 Pydantic 模型处理此对象，保留嵌套类型、继承字段和 Field 约束；缺失必填字段或非法值在进入业务操作前由请求校验拒绝。
-
 
 字段与成员见文末同名数据附录。
 
@@ -56,14 +49,11 @@ Node SHALL 通过 Pydantic 模型处理此对象，保留嵌套类型、继承�
 - **WHEN** 消费者构造该模型且提供有效必填字段
 - **THEN** 模型采用声明的缺省值并保持继承字段；违反类型或 Field 边界的输入不作为有效实例
 
-
-
 来源：[schemas/container.py](../../../schemas/container.py)。
 
 ### Requirement: CreateContainerMessage 数据契约 [schemas/container.py]
 
 Node SHALL 通过 Pydantic 模型处理此对象，保留嵌套类型、继承字段和 Field 约束；缺失必填字段或非法值在进入业务操作前由请求校验拒绝。
-
 
 字段与成员见文末同名数据附录。
 
@@ -74,14 +64,11 @@ Node SHALL 通过 Pydantic 模型处理此对象，保留嵌套类型、继承�
 - **WHEN** 消费者构造该模型且提供有效必填字段
 - **THEN** 模型采用声明的缺省值并保持继承字段；违反类型或 Field 边界的输入不作为有效实例
 
-
-
 来源：[schemas/container.py](../../../schemas/container.py)。
 
 ### Requirement: CreateContainerResponse 数据契约 [schemas/container.py]
 
 Node SHALL 通过 Pydantic 模型处理此对象，保留嵌套类型、继承字段和 Field 约束；缺失必填字段或非法值在进入业务操作前由请求校验拒绝。
-
 
 字段与成员见文末同名数据附录。
 
@@ -91,8 +78,6 @@ Node SHALL 通过 Pydantic 模型处理此对象，保留嵌套类型、继承�
 
 - **WHEN** 消费者构造该模型且提供有效必填字段
 - **THEN** 模型采用声明的缺省值并保持继承字段；违反类型或 Field 边界的输入不作为有效实例
-
-
 
 来源：[schemas/container.py](../../../schemas/container.py)。
 
@@ -111,8 +96,6 @@ Node SHALL 通过 Pydantic 模型处理此对象，保留嵌套类型、继承�
 - **WHEN** 生产者序列化此别名所代表的数据
 - **THEN** 值域或数据形状保持与上述 Literal/目标类型一致
 
-
-
 来源：[schemas/container.py](../../../schemas/container.py)。
 
 ### Requirement: Container 数据契约 [utils/Container.py]
@@ -128,14 +111,11 @@ Node SHALL 通过 Pydantic 模型处理此对象，保留嵌套类型、继承�
 - **WHEN** 生产方构造并向消费方传递此数据类型
 - **THEN** 成员名称和数据职责保持一致；运行配置只传配置值，证书数据只传文件引用
 
-
-
 来源：[utils/Container.py](../../../utils/Container.py)。
 
 ### Requirement: Container.Config_info 数据契约 [utils/Container.py]
 
 Node SHALL 通过 Pydantic 模型处理此对象，保留嵌套类型、继承字段和 Field 约束；缺失必填字段或非法值在进入业务操作前由请求校验拒绝。
-
 
 字段与成员见文末同名数据附录。
 
@@ -146,14 +126,11 @@ Node SHALL 通过 Pydantic 模型处理此对象，保留嵌套类型、继承�
 - **WHEN** 消费者构造该模型且提供有效必填字段
 - **THEN** 模型采用声明的缺省值并保持继承字段；违反类型或 Field 边界的输入不作为有效实例
 
-
-
 来源：[utils/Container.py](../../../utils/Container.py)。
 
 ### Requirement: CreateContainerReturn 数据契约 [services/container_service.py]
 
 系统 SHALL 按此类型的字段、成员和构造约定传递内部数据；该内部类型不自动构成一个公开 HTTP 请求端点。
-
 
 字段与成员见文末同名数据附录。
 
@@ -164,35 +141,35 @@ Node SHALL 通过 Pydantic 模型处理此对象，保留嵌套类型、继承�
 - **WHEN** 生产方构造并向消费方传递此数据类型
 - **THEN** 成员名称和数据职责保持一致；运行配置只传配置值，证书数据只传文件引用
 
-
-
 来源：[services/container_service.py](../../../services/container_service.py)。
 
 ### Requirement: 构建段命中本机标签即跳过构建 [services/container_service.py]
 
-Node SHALL 以 `image_build.image_tag` 作为本机 Docker 制品的缓存键（key）：该标签在本机已存在时 SHALL 直接复用并跳过构建，不存在时才按 `image_build.dockerfile_text` 现场构建。`dockerfile_text` 或 `image_tag` 为空时 SHALL 判为无法构建并失败，MUST NOT 静默退回“按运行标签直接启动、不下发构建”。构建成功后 SHALL 以构建出的标签作为本次创建实际运行的镜像。
-
-是否需要真正构建 SHALL 由 Node 在本机判定；Node MUST NOT 因外部存在“该标签已被派发过”的记录而跳过该判定。
+Node SHALL 以 `image_build.image_tag` 作为本机 Docker 制品的缓存键：该标签在本机已存在时直接复用，不存在时才按 `image_build.dockerfile_text` 构建。正文或标签为空 SHALL 失败，MUST NOT 静默退回按运行标签直接启动。Node MUST NOT 因外部派发记录存在或同一模板的旧标签存在而跳过本次标签查验，也不自行推导 Ctrl 的资源身份或缓存版本。
 
 #### Scenario: 命中即跳过构建
-
 - **WHEN** 本机 Docker 已存在构建段声明的标签
 - **THEN** 直接使用该标签，不执行构建
 
 #### Scenario: 未命中则现场构建
-
 - **WHEN** 本机 Docker 不存在该标签
 - **THEN** 用构建段的 Dockerfile 文本构建出该标签后继续创建
 
 #### Scenario: 构建段缺文本时失败而非降级
-
-- **WHEN** 请求声明了构建段但 `dockerfile_text` 为空
+- **WHEN** 请求声明了构建段但 dockerfile_text 为空
 - **THEN** 本次创建失败，不按运行标签直接启动容器
 
 #### Scenario: 构建结果决定运行镜像
-
 - **WHEN** 构建段存在且构建成功
 - **THEN** 本次创建实际运行的镜像标签等于构建段声明的标签
+
+#### Scenario: 平台注入换代而旧标签仍在
+- **WHEN** 旧版本标签存在，但 Ctrl 因平台注入变化派发不同的新标签与新 Dockerfile
+- **THEN** 按新 Dockerfile 构建新标签，保留旧制品，不因旧标签存在跳过构建
+
+#### Scenario: 新版本再次派发
+- **WHEN** 新版本标签已在本机构建完成，Ctrl 再次派发同一新版本
+- **THEN** 命中新标签并复用，不再次构建，也不修改旧容器的镜像
 
 来源：[services/container_service.py](../../../services/container_service.py)。
 

@@ -563,6 +563,76 @@ def test_build_image_uses_cached_image_tag(monkeypatch):
     assert build_calls == []
 
 
+def test_build_image_cache_key_is_the_tag_not_the_dockerfile(monkeypatch):
+    """缓存按准确标签查验，配方换代由 Ctrl 负责。"""
+    build_calls = []
+
+    class _Images:
+        def get(self, tag):
+            return object()
+
+        def build(self, **kwargs):
+            build_calls.append(kwargs)
+            return ([], [])
+
+    class _Client:
+        def __init__(self):
+            self.images = _Images()
+
+    monkeypatch.setattr(extensions, "docker_client", _Client())
+
+    same_tag = "fuxi/image-7:20260826T010203Z"
+    first = build_image({"dockerfile_text": "FROM ubuntu:22.04\nRUN echo one\n", "image_tag": same_tag})
+    second = build_image({"dockerfile_text": "FROM ubuntu:22.04\nRUN echo two\n", "image_tag": same_tag})
+
+    assert first == second == same_tag
+    assert build_calls == [], "同一个 tag 就是命中；node 不看文本"
+
+
+def test_build_image_rebuilds_when_the_tag_changes(monkeypatch):
+    """新标签未命中时构建，重复派发复用，旧制品保留。"""
+    build_calls = []
+    removed = []
+
+    class _Images:
+        def __init__(self):
+            self.built_tags = set()
+
+        def get(self, tag):
+            if tag in self.built_tags:
+                return object()
+            raise docker.errors.ImageNotFound("not found")
+
+        def build(self, **kwargs):
+            build_calls.append(kwargs)
+            self.built_tags.add(kwargs["tag"])
+            return ([], [])
+
+        def remove(self, tag, **kwargs):
+            removed.append(tag)
+
+    class _Client:
+        def __init__(self):
+            self.images = _Images()
+
+    monkeypatch.setattr(extensions, "docker_client", _Client())
+
+    text = "FROM ubuntu:22.04\nRUN echo same\n"
+    tag_v1 = "fuxi/image-7:20260826T010203Z"
+    tag_v2 = "fuxi/image-7:20260826T010204Z"
+
+    assert build_image({"dockerfile_text": text, "image_tag": tag_v1}) == tag_v1
+    assert len(build_calls) == 1
+    # 旧 tag 存在也要为**新 tag** 构建新内容（同一个 tag 复用由 Ctrl 的指纹判旧保证）
+    assert build_image({"dockerfile_text": text, "image_tag": tag_v2}) == tag_v2
+    assert len(build_calls) == 2, "换了 tag 就是新制品，必须构建"
+    assert [c["tag"] for c in build_calls] == [tag_v1, tag_v2]
+    # 重复新 tag → 复用，不再构建
+    assert build_image({"dockerfile_text": text, "image_tag": tag_v2}) == tag_v2
+    assert len(build_calls) == 2, "同一个 tag 第二次必须复用"
+    assert removed == [], "构建缓存换代不删旧制品——旧容器还挂在旧标签上"
+
+
 def test_no_build_path_does_not_install_sshd_in_node(monkeypatch):
     """旧现场安装链路清退：没有 build payload 时也不再由 Node apt 安装 sshd。"""
     created = []
