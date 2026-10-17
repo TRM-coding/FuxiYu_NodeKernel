@@ -2,134 +2,133 @@
 
 ## Context
 
-动机见 [proposal.md](proposal.md)。当前 `docker_operates/disk_usage_cache.py` 按 Docker `Mounts.Source` 执行 `du -sb`，bind 缓存仅以路径为键，容器缓存以名称为键，两层 TTL 均为 900 秒。`collect_bind` 还会接受非零退出码的 stdout；失败时保留旧 bytes。WSS 每次读取容器缓存，尚不携带用量真正产生的时间。
+动机见 [proposal.md](proposal.md)。当前 `docker_operates/disk_usage_cache.py` 按 Docker `Mounts.Source` 执行 `du -sb`，bind 缓存以路径为键；当 Source 路径与实际 `/root` 挂载目录对象错位时，Node 会测到错误目录，Ctrl 也缺少可信的修正业务路径。旧方案曾把目录对象编号/PID 做成跨端身份门禁，用户已明确否决：精确对象匹配只用于 Node 内部定位真实宿主路径、校正返回的 `bind_mount_path`；恢复、长期资格、冻结、删除、清理和测量有效性一律按业务路径及测量事实判断。
 
-现场曾同时存在 Source inode 31924552、实际挂载 inode 31924550，且路径改正后旧 6 GiB 缓存仍被推送。该证据说明需要比较目录对象并绑定采样代际，不能只加一个 inode 字段。
-
-首版范围限定为单台 Node 的本机文件系统视图：比较 Docker 声明的 bind Source 与运行容器 `/root` 实际挂载对象的 `(st_dev, st_ino)`，并把结果与 Docker 对象、进程代际、宿主 boot、采集进程 epoch、本地扫描代际和真实测量时间绑定。首版不把 inode 当作永久身份，不做跨机器目录查找，不自动修改目录，也不解决 Q70 的跨进程操作代际。
+首版范围限定为单台 Node 的本机路径视图：可以在既有容器存储根和已有路径父目录的有界范围内定位真实目录，不做全盘递归，不修改目录、不改 Docker 配置、不重挂载，不把路径诊断或目录对象编号变成业务授权。Q70 的跨进程删除授权与 Q72 的累计冻结策略仍由各自边界负责；本变更不提供删除/清理授权，只提供路径纠正、真实测量时间和测量状态。Ctrl 的 restore 静默一次宽限由 Ctrl 持久化，并在新实例上走正常磁盘链路检查；Node 不新增 restore preflight/API/门禁。
 
 ## Goals / Non-Goals
 
-**Goals:** 建立“本次实际挂载—被测对象—缓存结果—Ctrl 收到的证据”闭环；在观测有效期内发现路径替换，显式失效旧测量；让 Ctrl 能区分当前可信测量、最后成功值和不可验证状态。
+**Goals:**
 
-**Non-Goals:** 不自动修复目录名，不自动搜索或选择另一条宿主路径，不建立永久文件系统对象 ID，不实现 Q70 的跨进程操作身份协议，不改变 `du -sb` 的 apparent-size 计量口径，不把磁盘证据变成删除/清理授权。Q71 的实际对象计量与冻结扩展、Q72 的冻结累计策略由 Ctrl 侧配套变更负责；本变更只提供可判定的事实。扫描期间文件持续变化时，不承诺快照级精确性。
+- 让既有 `bind_mount_path` 成为业务路径；Source 与实际挂载一致时确认 Source，错位时在有界候选内唯一匹配后修正真实宿主路径。
+- 路径无法唯一确认时保留原有/最后确认路径并如实诊断，不用诊断状态阻断业务，也不把诊断失败说成测量失败。
+- 按业务路径测量与缓存；路径变化后重新测量，旧路径样本不得改贴新路径。
+- 保留真实测量时间、组成完整性、非零 du 错误、过期与乱序保护、Q72 累计政策。
+- 删除旧目录/对象跨端身份协议，目录 dev/inode/PID 只留 Node 内部定位与调试。
+
+**Non-Goals:**
+
+- 不自动改名、重挂载、创建目录或改挂 Docker/宿主配置，不删除/清理目录；只返回校正后的业务路径，不改目录本身。
+- 不做全盘递归搜索，不把 `/proc` 临时路径返回给 Ctrl，不凭 inode 批改历史快照或旧清理记录。
+- 不建立跨机器永久目录 ID，不解决 Q70 的跨进程操作代际，不把路径纠正当作删除/清理授权。
+- 不新增 Node restore preflight/API/门禁；Ctrl restore 政策不在本变更扩展。
+- 不改动正式 `openspec/specs/` 或 archive；不改动 guard-runtime-state-reconciliation 的 runtime DockerID、ready_identity、action_ref 或对象防旧写。
 
 ## Decisions
 
-### 1. 本机比较 Source 与 actual 的 dev+inode
+### 1. 业务路径模型与有界真实路径纠正
 
-使用本次 Docker inspect 的不可变 Docker ID、`State.Pid`，与 `/proc/<pid>/stat` starttime（第 22 字段；解析时必须正确处理 comm 字段中的空格和括号）关联进程。记录宿主 boot ID 和每次采集进程启动生成的 collector epoch；epoch 不是机器业务身份，不替代 `node_uid`。
+线路上的 `bind_mount_path` 是业务路径（用户通称 `mount_path`）；`configured_mount_path` 只记录 Docker Source，是诊断字段。新增：
 
-解析 Docker 声明的 `/root` bind Source，读取 Source 与 `/proc/<pid>/root/root` 的 `(st_dev, st_ino)`，并核对 `/proc/<pid>/mountinfo` 中确有对应 `/root` 挂载。设备号、inode 与 PID starttime 以十进制字符串上报，避免通用 JSON 数值精度损失；相同 inode 但设备不同必须判为 mismatch。`mount_id` 与 mount namespace 标识只用于本轮视图检查和诊断，不能跨宿主或重启比较。
+- `mount_path_status`：`resolved | unresolved | not_running | no_bind`，可选缺省 `unresolved`。
+- `mount_path_observed_at`：UTC 路径核对时间，不是测量时间；`configured_mount_path`/`bind_mount_path` 为 `str | null`。
 
-进程变化、无权限、宿主 proc 不可见、mountinfo 不可读或无法证明 `/root` 挂载视图时降级为 unknown，不能只检查路径还存在。Docker 声明了 `/root` bind 但 Source 路径不存在或无法解析时标为 missing；两者都不能等同于 no_bind。Docker inspect 明确没有 `/root` bind 时才是 no_bind；不能把读取 `Mounts` 的异常吞掉后当作零 bind。paused 的进程可验证；stopped/restarting 且无稳定 PID 时为 not_running，有 PID 但宿主 proc 不可读时为 unknown。符号链接 Source 的解析口径必须与 Docker 挂载时的行为一致；未验证前不假定跟随或不跟随。
+路径核对使用 Docker inspect 的 `/root` bind Source，以及运行/暂停容器 `/proc/<pid>/root/root` 的实际目录对象 `(st_dev, st_ino)`。该对象比较只在 Node 内部用于定位路径和调试，不进入 HTTP/WSS 业务身份字段，不作为恢复、长期资格、冻结、删除或清理的前置。
 
-相同 dev/inode 只证明当时根对象一致，不证明目录下的挂载视图相同；首版对 `/root` 下无法验证的嵌套挂载明确报告 `unsupported_view`，不输出可信总量。inode 只在单台机器、文件系统和采样代际内作为比较证据，不成为跨机器永久 ID。
+纠正顺序固定：
 
-### 2. 轻量探测与目录扫描分开
+1. Docker 成功确认没有 `/root` bind：`no_bind`；`bind_mount_path=null`、`measurement_mount_path=null`，只允许 overlay-only。单纯 inspect 不可读、Source 缺失或 unresolved MUST NOT 被解释为 no_bind，也不得清空已有业务路径。
+2. 容器没有可验证 PID（停止/重启过渡等）：`not_running`；保留既有/最后确认业务路径，不猜测、不把 Source 单侧当作实际路径。
+3. Source 路径可解析且 Source 对象与 `/proc/<pid>/root/root` 一致：`resolved`，使用该 Source 路径作为业务路径。
+4. Source 路径缺失/不可解析，或 Source 与实际对象不一致，但 `/proc/<pid>/root/root` 仍可读：仍 MUST 尝试有界候选定位 actual；唯一匹配才 `resolved` 并修正业务路径。Source 改名后旧路径不存在不直接等于 unresolved。
+5. actual 可读但在允许根/父目录直接子项、最后确认路径父目录和已有业务路径内没有可命名路径、没有匹配、多个匹配，或实际目录已无可唯一命名的允许范围路径：`unresolved`，保留既有/最后确认路径；无既有路径则为 null。
+6. `/proc`/actual 不可读、inspect 失败或无法证明挂载视图：`unresolved`，保留既有路径；无既有路径则为 null。不能只因为 Source 被 unlink 就跳过第 4 步。
 
-独立后台探测目标周期 10 秒，默认身份最大年龄 30 秒；超限直接标 unknown。探测只做 Docker inspect、`/proc` 身份读取和 mountinfo 检查，不执行 du、不持缓存锁，并与 du 使用不同的线程/执行器；Docker 调用设置超时。WSS 仍只读缓存，按当前时间降级过期证据；探测故障不能使旧 match 无限有效。大量容器下记录一轮耗时，无法达到周期时报告过期并提供可调参数，不声称所有规模下都有固定十秒保证。
+有界候选只包括：既有容器存储根 `NODE_CONTAINERS_BASE` 下、带 `containers` 路径段的 Source 父目录直接子项；最后确认业务路径的同类父目录直接子项；以及已有的业务路径本身。Source 缺失时仍可用最后确认/已有业务路径的允许父目录作为候选起点；不得因 Source 缺失就全盘搜索。只查看允许根内的实际目录，不递归、不遍历 symlink 目录；不把 `/proc` 路径、猜测名或 Docker 配置写回。唯一匹配的标准是候选目录对象与 actual 根对象一致；目录对象编号只在这次内部定位中使用，核对结束即丢弃，不持久化、不上线路。
 
-任一 Docker/进程/目录身份改变、停止或 probe 失败，递增本地 generation，取消旧样本资格；start/stop/restart 事件可唤醒探测，但宿主改名没有 Docker 事件，轮询仍必须存在。paused 的进程可验证；stopped/restarting 且无稳定 PID 时为 not_running，有 PID 但宿主 proc 不可读时为 unknown。Docker inspect 明确无 bind 时才是 no_bind，不能把取 Mounts 异常吞掉后当作零 bind。
+路径核对开始前，Node 内部记录当前活跃容器/Docker ID/PID 与路径核对序号；发布修正前复核仍属于同一活跃容器且本轮序号未被新核对取代。旧定位晚回只丢弃，不得改写新对象或新活跃容器的业务路径。该 token/序号只保护路径纠正，MUST NOT 进入测量有效性、采样、恢复、长期资格、冻结、删除或清理判断。
 
-### 3. 固定扫描对象并阻止旧线程回填
+无法唯一确认时 MUST 保留原有/最后确认业务路径并标 `unresolved`；没有已有路径时业务路径为 null。`unresolved` 是诊断，不是错误路径、不是空目录、也不是业务阻断。`no_bind` 才表示 Docker 明确无 bind，Ctrl 接收端应清空当前活跃容器的业务 bind 路径（不能保留旧路径再按同路径判定）；`unresolved`/`not_running` 不得清空路径。Ctrl 只对当前认证机器、活跃容器的 `mount_path_status=resolved` 修正持久化到 `containers.bind_mount_path`；不凭 inode 批改历史快照或旧清理记录，后续新记录读取新路径。
 
-仅在 source 和 actual 匹配、挂载视图受支持时建立有效扫描任务。使用目录 FD 固定该对象：打开 Source 的目录 FD 后 `fstat`，与已验证身份一致才扫描该 FD 对应目录；Python 实现可把 FD 传给子进程并通过 `/proc/self/fd/<fd>/.` 访问。任务中保留 FD，避免目录被改名或被删除重建后扫描另一个对象。
+### 2. 按业务路径测量、缓存与有效性
 
-缓存命中与回填必须同时匹配 `collector_epoch`、Docker ID、PID/starttime、boot ID、Source 与 actual 的 dev/inode、以及本地 generation，不能仅按路径、名称或 inode 命中。扫描前后检查容器与挂载视图、Source/actual 身份、进程 starttime、boot、collector epoch 和 generation；任何变化都丢弃结果。不能只比较前后 inode 来声称排除了 A→B→A 全部交错。
+bind 用量一律按当前业务路径 `bind_mount_path` 测量，并在 `measurement_mount_path` 记录实际测量路径。bind 缓存按规范化业务路径为键，不按目录对象、PID 或旧身份键命中。路径变更（Source 修正、候选唯一匹配、业务路径更新）必须使旧路径测量失效并触发新路径测量；旧路径的字节数 MUST NOT 被改贴到新路径。
 
-仅 rc=0、stdout 能解析为单个非负整数字节数且扫描后验证通过才发布。超时、非零退出、权限错误、空输出和解析失败均发布失败状态；`rc != 0` 时即使 stdout 含数字也不采纳。保留最后成功结果只供诊断，不能进入 `total_bytes`。扫描完成后立即按相同 generation 原子组装容器快照，避免再等下一轮 900 秒 sweep；overlay 与 bind 各保留采集时间，合计样本 `measured_at` 取两者中较早时间。默认测量最大年龄 900 秒；过期旧值不能继续成为有效 total，即使后台重试中。
+保留 `disk_protocol_version=1`（尚未实现，可收窄字段但保持协议名）、`collector_epoch`（采集进程会话）、`observation_seq`（同 epoch 内状态/测量发布排序，不是目录身份）、`measurement_status`、`measured_at`、`measurement_mount_path`、`measurement_reason`。旧目录/对象身份字段从磁盘用量协议中删除；runtime DockerID 仍在状态/动作协议中保留。
 
-#### 隔离 Linux 验证计划（实现前置）
+`total_bytes` 仅在以下条件同时成立时非空：
 
-FD 传递和 du 对已固定目录的遍历必须在隔离的 Linux 临时目录或命名空间中先验证，不能以“Python 打开 FD 后仍传路径”或未经验证的符号链接跟随假设直接实现。最低验证矩阵：
+- `measurement_status=ok`；
+- overlay 与 bind 组成完整（Docker 明确 `no_bind` 时只要求 overlay；`no_bind` 必须来自成功 inspect，不能由异常/无 Source 推断）；
+- `measured_at` 在允许真实年龄内，且是 overlay/bind 各自完成时间中较早者；
+- `measurement_mount_path` 与当前业务 `bind_mount_path` 相同；
+- 响应/观测排序未被同 epoch 更旧序号或旧连接覆盖。
 
-1. 创建 A、B 两个目录，打开 A 的 `O_DIRECTORY` FD，将 FD 传给子进程，确认 `du -sb /proc/self/fd/<fd>/.` 统计的是 A；确认 FD 回收后不泄漏。
-2. 在扫描前或扫描中把 A rename 为 A'，并在原路径重建 A 指向 B；确认 FD 扫描仍是 A'，而路径扫描会得到 B，最终只接受与 FD `fstat` 身份一致的结果。
-3. 覆盖目录被删除、替换、嵌套 bind/overlay 挂载、无权限、du 非零退出和超时；确认不跨未验证挂载视图发布、不把部分输出当成功，并单独验证符号链接 Source 的解析口径与 Docker 一致；未验证前不假定跟随或不跟随。
-4. 在容器或命名空间中重复，验证 `/proc/self/fd` 可见性、`pass_fds`/`close_fds`、子进程超时清理和线程/FD 释放，并记录不可用的内核或运行时边界。
+有效性谓词 MUST NOT 检查 `mount_path_status=resolved`、目录 dev/inode、PID 或 Source/actual 对象匹配。已存在有效业务路径且本次路径测量成功时，仅 `mount_path_status=unresolved` 不影响 `measurement_status=ok` 或 `total_bytes`；路径诊断失败也不得写成 `measurement_error`。反过来，`mount_path_status=resolved` 不能使失败的 du 变成有效。
 
-该计划是实现的验收前置；本次文档任务不执行它，也不修改生产代码。
+`measurement_status` 取值 `ok | measuring | stale | error | unverified`；`measurement_reason` 记录超时、非零退出、空/不可解析输出、路径不存在、权限、组成缺失、过期、身份/路径变更等真实原因。非零退出即使 stdout 有数字也不采纳；缺组成、异常、超时或旧值只作诊断，不能当 0。overlay-only 仅限 Docker 明确 `no_bind`，异常不是 `no_bind`。
 
-### 4. 线路契约 version 1
+### 3. 轻量路径核对与重型测量分开
 
-Node 的 `usage` 保留旧字段，新增以下字段；HTTP `ContainerDiskUsage` 与 WSS 共用同一模型和校验。身份大整数以十进制字符串无损编码。时间为带 Z 的 UTC RFC3339；Node 的单调时钟用于本地超时和缓存年龄。本表是 Node/Ctrl 共同的 version 1 线路字段总表，不随意改协议名。
+独立轻量路径核对按有界周期运行，只做 Docker inspect、`/proc` 根对象读取和有界候选核对，不执行 du、不持有 du 缓存锁；`mount_path_observed_at` 记录核对完成时间。路径核对失败/超时只产生 `unresolved` 或 `not_running` 诊断，不改变测量状态为 `measurement_error`，不阻断已有业务路径的测量与处置。
+
+路径变化可唤醒新路径测量；宿主改名没有 Docker 事件，周期核对仍必须存在。WSS/HTTP 读取只读缓存，不执行 du、不刷新 `measured_at` 或 `mount_path_observed_at`。路径核对过期后不能恢复旧的 resolved 结论，只能重新核对；但路径诊断不作为业务门禁。
+
+### 4. version 1 线路与 Ctrl 持久化
+
+`ContainerDiskUsage` 保留既有 `overlay_rw_bytes`、`bind_mount_bytes`、`bind_mount_path`、`bind_mount_source`、`total_bytes`、`error`，新增/保留：
 
 | 字段 | 类型与缺省 | 语义 |
 | --- | --- | --- |
-| `disk_protocol_version` | `int`；缺省 `None` | 存在时为 `1`；缺失按旧协议/未验证处理，不能默认成 1 |
-| `docker_id` | `str \| None` | 本次实际 Docker 对象 ID，不是数据库 ID |
-| `collector_epoch` | `str \| None` | 采集进程启动 UUID；进程重启即更换 |
-| `observation_seq` | `int \| None` | 同 collector epoch 内单调递增；实际状态更新才递增，重复样本不增 |
-| `bind_identity` | `BindIdentity \| None` | 身份观测整体；无 bind 时也可存在，status=no_bind |
-| `bind_identity.status` | `match / mismatch / missing / unknown / not_running / no_bind` | 首版身份状态；`missing` 表示声明路径不可解析，不等于 no_bind |
-| `bind_identity.source_path` | `str \| None` | Docker 配置的宿主路径；保留 `bind_mount_path`，不改存 proc 路径 |
-| `bind_identity.source` | `{device: str, inode: str} \| None` | Source 对象；不可取得时 null |
-| `bind_identity.actual` | `{device: str, inode: str} \| None` | `/proc/<pid>/root/root` 对象；不可取得时 null |
-| `bind_identity.process` | `{pid: int, start_ticks: str, boot_id: str} \| None` | 进程代际；不存在或不可读时 null |
-| `bind_identity.mount_id` | `int \| None` | mountinfo 诊断字段；不是永久 ID |
-| `bind_identity.checked_at` | `str \| None` | 身份观测完成时间；不是测量时间 |
-| `bind_identity.reason` | `str \| None` | 可枚举原因，例如 `source_replaced / source_missing / proc_unavailable / unsupported_view / pid_reused / mountinfo_unavailable` |
-| `measurement_status` | `ok / measuring / stale / error / unverified`；缺省 `None` | 测量资格；缺失按 unverified 处理 |
-| `measured_at` | `str \| None` | 合计样本的测量时间：overlay 与 bind 各自完成时间中较早者；no_bind 时为 overlay 完成时间。WSS/HTTP 收发时间不得改写 |
-| `measurement_identity` | `{collector_epoch, docker_id, process, source, actual, generation} \| None` | 本次字节数绑定的采集/进程/目录/扫描代际；no_bind 时 `source`/`actual` 为 null，仍绑定 Docker 对象与采集代际 |
-| `measurement_reason` | `str \| None` | 超时、rc 非零、输出无效、代际改变、视图不支持等原因；不能吞成零 |
-| 既有字段 | 保持既有类型 | `container_name / overlay_rw_bytes / bind_mount_bytes / bind_mount_path / bind_mount_source / total_bytes / error` 保留 |
+| `disk_protocol_version` | `int \| None` | 存在时为 `1`；旧负载缺失按未验证 |
+| `configured_mount_path` | `str \| None` | Docker Source 诊断路径，不是业务路径 |
+| `bind_mount_path` | `str \| None` | 业务路径；Node 确认后返回修正值；unresolved/not_running 保留既有/最后确认路径；no_bind 为 null |
+| `mount_path_status` | `Literal["resolved","unresolved","not_running","no_bind"] \| None` | 缺省按 `unresolved`；诊断状态，不是业务门禁 |
+| `mount_path_observed_at` | `str \| None` | UTC 路径核对时间，不是测量时间 |
+| `collector_epoch` | `str \| None` | 采集进程会话，不是目录身份 |
+| `observation_seq` | `int \| None` | 同 epoch 采样发布排序，不是目录身份 |
+| `measurement_status` | `Literal["ok","measuring","stale","error","unverified"] \| None` | 缺省按 `unverified` |
+| `measured_at` | `str \| None` | 合计样本真实测量时间，取组成中较早者；UTC 带 Z |
+| `measurement_mount_path` | `str \| None` | 本次测量实际使用的业务路径；no_bind 为 null，unresolved 不清空 |
+| `measurement_reason` | `str \| None` | 测量失败/过期/路径变更原因 |
 
-`total_bytes` 只在 match（或已确认 no_bind）与 ok 同时成立、身份和用量未过期且彼此对应时有有效值；其他情况为 null。`measured_at` 是合计样本时间，不是单次 du 完成时间；bind 的 du 完成时间只作为内部组成时间保留，除非未来显式增加可选 component 字段，否则不上 wire。no_bind 的有效 total 仍要求 `measurement_identity` 非空：`source`/`actual` 为 null，但 Docker ID、process、collector_epoch、generation 必须与当前观测一致；`bind_identity.status` 必须为 no_bind，缺少进程或 epoch 证据时 total 为空。match 的有效 total 则要求 `measurement_identity.source`/`actual` 非空且与当前身份一致。`bind_mount_bytes` 可以保留最后一次成功数值作诊断，但不得被消费方当成当前可信总量。最后一次有效数值不在 `total_bytes` 冒充当前值。`checked_at` 的新鲜不能抵消 `measured_at` 的过期，反之亦然。旧字段 `bind_mount_source` 只作兼容展示，不能覆盖新的身份/测量状态。
+旧 Node 缺少 `disk_protocol_version`、`measured_at` 或 `measurement_mount_path` 时按测量未验证处理，不能解释成缺目录身份；缺少 `mount_path_status` 按 `unresolved`；缺少业务路径时保留 Ctrl 已有值。HTTP 与 WSS 共用同一模型和校验；`null` 不得被 response model 或 JSON 序列化丢弃。
 
-Ctrl 的 `disk_identity_status`、`disk_measurement_status`、`disk_identity`、`disk_identity_checked_at`、`disk_measured_at`、`disk_received_at` 是数据库持久化列名，不是线路字段名；`disk_identity` 必须无损保存上表的嵌套对象、epoch/seq 和原因，不得重命名或把整数转成浮点。`disk_received_at` 只由 Ctrl 本地记录，Node 不发送。`bind_identity` 缺失时 Ctrl 按 `unknown`，`measurement_status` 缺失时按 `unverified`。协议名 `disk_protocol_version` 保持不变；旧消费方可以忽略未知字段，但新消费方必须把缺少协议版本的样本视为未验证。
+Ctrl 计划持久化字段为 `disk_measurement_status`、`disk_measured_at`、`disk_received_at`、`disk_observation`。`disk_observation` JSON 保存协议版本、collector_epoch/observation_seq（采样会话排序）、measurement_mount_path、configured_mount_path、mount_path_status、mount_path_observed_at 和 measurement_reason；不再保存旧目录身份列。`disk_received_at` 仅由 Ctrl 本地记录，Node 不发送。Ctrl 只按当前认证机器/活跃容器的 `mount_path_status=resolved` 修正持久化 `containers.bind_mount_path`，不按 inode 批改历史快照或旧清理记录。Ctrl 接收端在 `no_bind` 时清空当前活跃容器的业务 bind 路径（不能保留旧路径再判同路径）；unresolved/not_running 不清空。固定 8 字段 `long_term_eligibility` 不变。
 
-| Ctrl 持久化列 | Node version 1 线路来源 |
-| --- | --- |
-| `disk_identity_status` | `bind_identity.status` |
-| `disk_measurement_status` | `measurement_status` |
-| `disk_identity` | `disk_protocol_version`、`docker_id`、`collector_epoch`、`observation_seq`、`bind_identity`、`measurement_identity`、`bind_identity.reason`、`measurement_reason` |
-| `disk_identity_checked_at` | `bind_identity.checked_at` |
-| `disk_measured_at` | `measured_at` |
-| `disk_received_at` | 仅 Ctrl 本地接收时间，无 Node 字段 |
+### 5. Q70、Q72、清理与业务门禁边界
 
-Ctrl 侧持久化与门禁见 [gate-disk-check-on-mount-identity design](../../../../FuxiYu_CtrKernel/openspec/changes/gate-disk-check-on-mount-identity/design.md)。两端按同一 version 1 总表校验；Node 发送真实 UTC 时间，Ctrl 对超出允许偏差或在未来的时间降级为 `clock_skew`/未验证，不能用接收时间补齐。
+**Q70 独立。** 业务 `bind_mount_path` 仍供既有业务选择路径；路径校正本身不授予删除权限。inode、collector_epoch、observation_seq 和路径诊断不得作为跨进程删除授权、对象身份或清理目标选择依据；本变更不实现也不替代 Q70。
 
-每个实际状态更新递增 `observation_seq`；同一状态和样本的重发不改变 `measured_at`。Ctrl 按当前有效 WSS 连接和 epoch 接收：旧连接结束后其待处理数据不得覆盖新连接；同 epoch 的倒序观测必须拒绝。新连接在收到首个完整新协议观测前不恢复可信状态。此局部发布排序不解决跨请求的 Q70 同名代际授权问题。
+**Q72 保留。** 采集盲区不额外补偿，累计仍继续；异常观测期不依据无效样本执行删除，也不新增顺延；恢复可信高用量后，按原累计有效冻结天数判断，不重设 `first_frozen_at`，不新增 `review_required` 或 invalid 标记阻挡累计删除；既有机器不可用 deferral 与人工宽限保留。Node 只提供真实 `measured_at`、`measurement_status`、路径和原因，Ctrl 按既有 Q72 策略解释，不把路径诊断当门禁。
 
-### 5. 首版 Source mismatch：停止自动磁盘响应，不自动改目录
-
-默认 source mismatch 时，Node 不把任一目录用量作为可自动处置的当前总量：`total_bytes` 为空，保留明确的 mismatch 证据和最后成功值（仅诊断）。未知、missing、not_running、身份/测量过期、视图不支持同样不产生可处置总量。
-
-Node 不自动改名、不重挂载、不创建或选择另一条宿主路径、不改写 Docker 配置，也不把 actual 路径替换成 Source 后继续按路径执行删除或清理。Ctrl 侧按配套变更 `gate-disk-check-on-mount-identity` 暂停该容器的自动冻结、解冻重置、升级删除与挂载清理，并显式展示原因；恢复可信匹配和新测量后，再按 Ctrl 的既有累计策略恢复处置。
-
-### 6. Q70、Q71、Q72 的边界
-
-**Q70 独立。** 本变更的 Docker ID、dev/inode、collector epoch、observation_seq 和本地 generation 只服务于磁盘采样有效性，MUST NOT 被当作跨进程操作代际、删除授权或清理路径的原子身份。即使磁盘身份匹配，也不能据此删除容器或目录。严格跨进程同名代际仍需 Q70 单独定义的协议，本变更既不实现也不替代它。
-
-**Q71 仅后续待选。** 首版不按 actual 对象计量，也不允许在 mismatch 时冻结。若后续采纳“按实际对象计量并允许冻结”，必须同时定义预期清理对象身份、所有手动/自动清理入口和动作时验证；冻结资格不等于清理授权，清理必须被阻断或另行显式授权。该扩展不在本变更内。
-
-**Q72 已由用户决定。** 异常观测期不依据无效样本执行删除，也不新增顺延；恢复可信高用量后，按原累计有效冻结天数判断，达到阈值且机器可管辖、无有效人工宽限时可在该轮升级删除。不重设 `first_frozen_at`，不新增 `review_required` 或 invalid 标记阻止累计删除；既有机器不可用 deferral 和人工宽限继续保留。Node 只负责提供真实的 `measured_at`、`checked_at` 和身份/测量状态，不自行解释或改写冻结累计；Ctrl 负责该策略。
+**清理边界。** 路径纠正、`mount_path_status`、目录对象编号和测量字段 MUST NOT 作为删除/清理授权；清理仍需其既有入口校验和显式授权。路径不存在、du 实际失败、组成缺失或测量过期仍按原测量错误/无效处理；诊断 unresolved 本身不是清理或冻结授权，也不是测量错误。
 
 ## Risks / Trade-offs
 
-- [采集失败时暂时没有自动限额响应] → 显式展示错误、告警节流和最后测量时间；旧 Node 的未验证状态也可见，不隐藏为正常。
-- [目录根身份不覆盖子挂载与持续写入] → 无法验证的视图降级；保留扫描时间范围和 apparent-size 口径，不声称块占用或快照精确性。
-- [inode/设备号复用] → 只在有 FD 与进程代际约束的短期测量中比较，不用于持久查找目录。
-- [删除前再次有人修改目录] → 本补丁不是删除路径的原子校验；清理协议的预期身份与动作时验证仍由 Q71 单独约束。
-- [把磁盘证据当成操作代际] → 明确禁止；Q70 的跨进程授权必须独立实现，磁盘匹配不能成为删除/清理依据。
-- [恢复时把 checked_at 当成 measured_at] → 时间语义分开，Ctrl 只能按真实测量时间判龄；否则 Q72 的恢复累计会被错误重置或延长。
-- [FD 验证不足] → 隔离 Linux 计划作为实现前置；未验证前不把 `/proc/self/fd` 或符号链接跟随当作已证明行为。
+- [路径纠正候选有限而真实路径超出范围] → 保留最后确认路径并标 `unresolved`，不递归猜测、不阻断既有业务；日志给出诊断。
+- [候选目录对象唯一匹配但语义仍可能变化] → 只在本次核对使用对象编号，不持久化、不上线路、不作为业务身份；路径后续变化重新核对/测量。
+- [路径诊断失败被误当测量失败] → 状态分离：路径 `unresolved` 不改变 `measurement_status`；测量失败只由 du/组成/时间/路径一致性决定。
+- [旧 Node 无真实测量时间] → 标测量未验证，不表示缺目录身份；不因缺字段恢复旧字节数。
+- [路径变更后旧样本污染新路径] → 缓存键按业务路径，`measurement_mount_path` 必须等于当前路径；旧样本只能诊断。
+- [Q72 被路径诊断误伤] → 不使用路径诊断/inode 做冻结门槛；采集盲区不额外补偿，累计继续；只不依据无效样本执行动作。
+- [全盘搜索造成负载和误修正] → 只允许既有存储根/父目录直接子项和最后确认路径，不递归。
 
 ## Migration Plan
 
-先部署 Ctrl `gate-disk-check-on-mount-identity`，完成加列与未验证默认值；再逐机部署 Node，核对协议版本、身份覆盖率、真实测量时间及失败原因，最后验证正常长期容器的冻结链路。不得在生产通过制造错误挂载或真实删除验收。
+1. Node 实现路径核对、业务路径修正、按路径测量和 version 1 字段；不修改目录/Docker 配置，不做全盘扫描。
+2. Ctrl 先移除旧目录身份门禁并接收 `disk_measurement_status/disk_measured_at/disk_received_at/disk_observation`；只对当前认证机器/活跃容器的 `mount_path_status=resolved` 结果持久化 `containers.bind_mount_path`，不批改历史记录。
+3. 联合回放：Source/actual 一致、错位唯一匹配、歧义、unlink、offline/no PID、no_bind、路径变更时旧测量失效、unresolved + 有效业务路径测量仍可用、非零 du/缺组成/过期不产生 total、旧 Node 缺 measured_at 标未验证、Q72 累计与人工宽限/机器不可用保留。
+4. 回滚 Node 时旧字段按未验证处理，不能回落旧字节数执行冻结/删除；不删除正式 specs/archive，不修改 guard 的 runtime DockerID/ready_identity/action_ref/对象防旧写。
 
-联合验收至少覆盖 Q72：异常期不动作、恢复可信高用量可按原累计立即升级、恢复低用量正常重置、机器不可用 deferral 与人工宽限保留、没有 `review_required` 阻挡；同时验证 Q70 的操作代际独立性，以及 Q71 扩展启用后冻结可用但清理仍被阻断的边界（当前首版不启用该扩展）。
+## Verification Strategy
 
-Node 回滚后 Ctrl 把旧格式标为 unverified，自动磁盘响应暂停且异常可见，不能回落旧字节数执行删除。保留原数据库历史值和新增列。回滚 Ctrl 会丢失门禁，必须明确该风险，不把回滚当作无影响操作。
+需要真实受控交错，而不只是实现镜像单测：在 Docker inspect、Source/actual 对象读取、候选枚举、du 启动/返回、路径更新、缓存回填、WSS 读取和 Ctrl 消费之间设置 barrier，覆盖：
 
-## Source references
-
-- `docker_operates/disk_usage_cache.py`：`collect_bind`、`collect_container`、`get_bind`、`snapshot`。
-- `schemas/container.py`、`network/api.py`、`network/wss.py`：HTTP 磁盘响应与 WSS 缓存输出。
-- [inode(7)](https://man7.org/linux/man-pages/man7/inode.7.html)：inode 的文件系统作用域。
-- [proc_pid_root(5)](https://man7.org/linux/man-pages/man5/proc_pid_root.5.html)、[proc_pid_mountinfo(5)](https://man7.org/linux/man-pages/man5/proc_pid_mountinfo.5.html)：进程文件系统视图与挂载信息。
-- [proc(5)](https://man7.org/linux/man-pages/man5/proc.5.html)：`/proc/<pid>/stat` 的 starttime 与进程代际。
-- [open(2)](https://man7.org/linux/man-pages/man2/open.2.html)、[fstat(2)](https://man7.org/linux/man-pages/man2/fstat.2.html)：目录 FD 与身份一致性检查。
+- Source 与 actual 一致、错位唯一匹配、多个匹配/无匹配、Source unlink、proc 不可读、无 PID、paused、Docker 明确 no_bind。
+- 路径从 A 修正到 B 时，A 的在途 du 晚返回不能绑定 B；B 重新测量前 total 为空。
+- `mount_path_status=unresolved` 且有既有业务路径、du 成功且 measured_at 新鲜/路径一致时，total 仍有效；诊断失败不变成 measurement_error。
+- 非零 du、空/不可解析输出、超时、权限、缺组成、overlay-only 非 no_bind 不得当 0/成功。
+- collector_epoch/observation_seq 乱序、旧连接、Node 重启新 epoch；同一序号只作心跳，不刷新 measured_at。
+- 旧 Node 缺 measured_at/measurement_mount_path 标未验证；旧 Ctrl 移除旧 identity 门禁后不要求路径 resolved。
+- Q72 异常期不动作、恢复高用量按原累计、机器不可用/人工宽限保留；固定 8 字段 long_term_eligibility 不变。
