@@ -1,29 +1,19 @@
-"""Node API 蓝图单元测试（①）。
-
-不依赖 docker daemon：docker_client 用 FakeDockerClient，服务层函数 monkeypatch。
-密码学走真实密钥对 —— 覆盖"验签 → 解密 → 派发 → 响应"的消息层闭环。
-
-WSS 迁移说明：HTTP 入口会换成 WS 消息处理器，
-但"验签→派发→状态跟踪"的断言逻辑可平移复用；迁移时改入口不改这些语义。
-"""
-import base64
 import time
+import ipaddress
 
 import pytest
+from cryptography import x509
+from cryptography.x509.oid import ExtensionOID, ExtendedKeyUsageOID
+from fastapi.testclient import TestClient
 
 from FuxiYu_NodeKernel import create_app, extensions
-from FuxiYu_NodeKernel import blueprints
+from FuxiYu_NodeKernel.network import api as api_module
+from FuxiYu_NodeKernel.network import wss as wss_module
 from FuxiYu_NodeKernel.services.container_service import CreateContainerReturn
 
-from .conftest import (
-    FakeContainer,
-    FakeContainers,
-    FakeDockerClient,
-    configure_absolute_key_paths,
-    encrypted_body,
-)
+from .conftest import FakeDockerClient
 
-# Config_info 全字段（无默认值，缺一不可）
+
 VALID_CFG = {
     "gpu_list": [],
     "cpu_number": 2,
@@ -37,210 +27,493 @@ VALID_CFG = {
 
 @pytest.fixture()
 def client(monkeypatch):
-    configure_absolute_key_paths(monkeypatch)
     monkeypatch.setattr(extensions, "docker_client", FakeDockerClient())
     app = create_app()
-    app.config.update(TESTING=True)
-    return app.test_client()
+    return TestClient(app)
 
 
 def _patched_service(monkeypatch, name, fn):
-    monkeypatch.setattr(blueprints, name, fn)
+    monkeypatch.setattr(api_module, name, fn)
 
 
-# ── 验签/格式类 ──────────────────────────────────────────────────────────
+def test_openapi_contains_container_endpoints(client):
+    resp = client.get("/openapi.json")
+    assert resp.status_code == 200
+    paths = resp.json()["paths"]
+    assert "/api/create_container" in paths
+    assert "/api/check_disk_usage" in paths
+    assert "/api/node_identity/enrollment_profile" in paths
+    assert "/api/node_identity/issue_uid" in paths
 
 
-def test_invalid_json_400(client):
-    resp = client.post("/api/create_container", json=None)
-    assert resp.status_code == 400
+def test_node_identity_enrollment_and_issue_uid(client, monkeypatch, tmp_path):
+    monkeypatch.setenv("NODE_TLS_CERT_FILE", str(tmp_path / "node_cert.pem"))
+    monkeypatch.setenv("NODE_TLS_KEY_FILE", str(tmp_path / "node_key.pem"))
+    monkeypatch.setenv("NODE_IDENTITY_FILE", str(tmp_path / "identity.json"))
+
+    profile_resp = client.get("/api/node_identity/enrollment_profile")
+    assert profile_resp.status_code == 200
+    profile = profile_resp.json()
+    assert profile["uid"] is None
+    assert profile["identity_initialized"] is False
+    assert "certificate_fingerprint" not in profile
+
+    issue_resp = client.post("/api/node_identity/issue_uid", json={"uid": "node-test-uid"})
+    assert issue_resp.status_code == 200
+    issued = issue_resp.json()
+    assert issued["success"] == 1
+    assert issued["uid"] == "node-test-uid"
+    assert issued["identity_initialized"] is True
+    assert "certificate_fingerprint" not in issued
 
 
-def test_invalid_signature_401(client):
-    body = {
-        "message": base64.b64encode(b"not encrypted").decode(),
-        "signature": base64.b64encode(b"x" * 256).decode(),
-    }
-    resp = client.post("/api/create_container", json=body)
-    assert resp.status_code == 401
-    assert resp.get_json()["error_reason"] == "invalid_signature"
+def _iter_route_paths(routes):
+    """递归展开 FastAPI 的 included-router 包装，取出全部路由 path。"""
+
+    for route in routes:
+        nested = getattr(getattr(route, "original_router", None), "routes", None)
+        if nested is not None:
+            yield from _iter_route_paths(nested)
+            continue
+        path = getattr(route, "path", None)
+        if path is not None:
+            yield path
 
 
-# ── create_container ─────────────────────────────────────────────────────
+def test_ctrl_link_endpoint_registered_on_same_app(client):
+    """换向后 Node 只提供被动端点：/ws/ctrl 挂在操作通道同一张 app 上。"""
+    paths = set(_iter_route_paths(client.app.routes))
+
+    assert wss_module.CTRL_LINK_PATH == "/ws/ctrl"
+    assert wss_module.CTRL_LINK_PATH in paths
+    # 操作通道与身份端点仍在同一张 app 上，未被换向挤掉
+    assert "/api/node_identity/enrollment_profile" in paths
+    assert "/api/node_identity/issue_uid" in paths
+
+
+def test_enrollment_profile_advertises_snapshot_endpoint(monkeypatch, tmp_path):
+    monkeypatch.setenv("NODE_TLS_CERT_FILE", str(tmp_path / "node_cert.pem"))
+    monkeypatch.setenv("NODE_TLS_KEY_FILE", str(tmp_path / "node_key.pem"))
+    monkeypatch.setenv("NODE_IDENTITY_FILE", str(tmp_path / "identity.json"))
+
+    profile = wss_module.build_enrollment_profile()
+
+    assert profile["snapshot_endpoint"] == wss_module.CTRL_LINK_PATH
+    assert "wss_enabled" not in profile
+
+
+def test_node_self_signed_certificate_is_valid_pin_anchor(monkeypatch, tmp_path):
+    monkeypatch.setenv("NODE_TLS_CERT_FILE", str(tmp_path / "node_cert.pem"))
+    monkeypatch.setenv("NODE_TLS_KEY_FILE", str(tmp_path / "node_key.pem"))
+
+    files = wss_module.ensure_self_signed_certificate()
+    cert = x509.load_pem_x509_certificate(files.cert_file.read_bytes())
+    basic = cert.extensions.get_extension_for_oid(ExtensionOID.BASIC_CONSTRAINTS).value
+    san = cert.extensions.get_extension_for_oid(ExtensionOID.SUBJECT_ALTERNATIVE_NAME).value
+    eku = cert.extensions.get_extension_for_oid(ExtensionOID.EXTENDED_KEY_USAGE).value
+
+    assert basic.ca is True
+    assert "localhost" in san.get_values_for_type(x509.DNSName)
+    assert ipaddress.ip_address("127.0.0.1") in san.get_values_for_type(x509.IPAddress)
+    assert ExtendedKeyUsageOID.SERVER_AUTH in eku
+    assert ExtendedKeyUsageOID.CLIENT_AUTH in eku
 
 
 def test_create_container_success(client, monkeypatch):
     calls = []
 
-    def _stub(owner_name, cfg, public_key=None):
-        calls.append((owner_name, cfg, public_key))
+    def _stub(owner_name, cfg, public_key=None, restore_mount_path=None):
+        calls.append((owner_name, cfg, public_key, restore_mount_path))
         return CreateContainerReturn("cid123", cfg.name)
 
+    _patched_service(monkeypatch, "container_exists", lambda name: False)
     _patched_service(monkeypatch, "create_container", _stub)
 
     payload = {"owner_name": "admin", "config": VALID_CFG}
-    resp = client.post("/api/create_container", json=encrypted_body(payload))
+    resp = client.post("/api/create_container", json=payload)
 
     assert resp.status_code == 200
-    body = resp.get_json()
+    body = resp.json()
     assert body["success"] == 1
     assert body["container_status"] == "creating"
-    # 等后台线程调用 stub（防 monkeypatch 提前撤销的竞态）
     time.sleep(0.1)
     assert len(calls) == 1
     assert calls[0][0] == "admin"
     assert calls[0][1].name == "c1"
 
 
-def test_create_container_invalid_config_400(client):
+def test_create_container_with_image_build_reports_building(client, monkeypatch):
+    calls = []
+    build_calls = []
+
+    extensions.status_cache.clear_pending(VALID_CFG["name"])
+
+    def _build_stub(build):
+        build_calls.append(build)
+        return build.image_tag
+
+    def _stub(owner_name, cfg, public_key=None, restore_mount_path=None):
+        calls.append((owner_name, cfg, public_key, restore_mount_path))
+        return CreateContainerReturn("cid123", cfg.name)
+
+    _patched_service(monkeypatch, "container_exists", lambda name: False)
+    _patched_service(monkeypatch, "build_image", _build_stub)
+    _patched_service(monkeypatch, "create_container", _stub)
+
+    payload = {
+        "owner_name": "admin",
+        "config": VALID_CFG,
+        "image_build": {
+            "dockerfile_text": "FROM ubuntu:22.04\nRUN echo ok\n",
+            "image_tag": "fuxi/image-1:20260826T000000Z",
+        },
+    }
+    resp = client.post("/api/create_container", json=payload)
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["success"] == 1
+    assert body["container_status"] == "building"
+    time.sleep(0.1)
+    assert len(build_calls) == 1
+    assert len(calls) == 1
+    assert calls[0][1].image == payload["image_build"]["image_tag"]
+
+
+def test_create_container_restore_payload_passes_mount_and_accounts(client, monkeypatch):
+    calls = []
+    collaborator_calls = []
+
+    def _stub(owner_name, cfg, public_key=None, restore_mount_path=None):
+        calls.append((owner_name, cfg, public_key, restore_mount_path))
+        return CreateContainerReturn("cid123", cfg.name)
+
+    def _add_collaborator(container_name, user_name, role):
+        collaborator_calls.append((container_name, user_name, role))
+        return True
+
+    _patched_service(monkeypatch, "container_exists", lambda name: False)
+    _patched_service(monkeypatch, "create_container", _stub)
+    _patched_service(monkeypatch, "add_collaborator", _add_collaborator)
+
+    payload = {
+        "owner_name": "admin",
+        "config": VALID_CFG,
+        "restore_mount_path": "/tmp/admin/containers/c1_old",
+        "restore_accounts": [{"user_name": "alice", "role": "collaborator"}],
+    }
+    resp = client.post("/api/create_container", json=payload)
+
+    assert resp.status_code == 200
+    time.sleep(0.1)
+    assert calls[0][3] == "/tmp/admin/containers/c1_old"
+    assert collaborator_calls == [("c1", "alice", api_module.ROLE.COLLABORATOR)]
+
+
+def test_create_container_build_failed_is_visible_without_delete(client, monkeypatch):
+    cfg = dict(VALID_CFG)
+    cfg["name"] = "build_failed_c"
+    extensions.status_cache.clear_pending(cfg["name"])
+
+    def _build_stub(build):
+        raise RuntimeError("docker build failed")
+
+    _patched_service(monkeypatch, "container_exists", lambda name: False)
+    _patched_service(monkeypatch, "build_image", _build_stub)
+
+    payload = {
+        "owner_name": "admin",
+        "config": cfg,
+        "image_build": {
+            "dockerfile_text": "FROM scratch\nRUN nope\n",
+            "image_tag": "fuxi/image-1:bad",
+        },
+    }
+    resp = client.post("/api/create_container", json=payload)
+
+    assert resp.status_code == 200
+    assert resp.json()["container_status"] == "building"
+    time.sleep(0.1)
+
+    status_resp = client.post(
+        "/api/container_status",
+        json={"config": {"container_name": cfg["name"]}},
+    )
+    body = status_resp.json()
+    assert body["success"] == 0
+    assert body["container_status"] == "failed"
+    assert body["failed_reason"] == "build_failed"
+    assert body["failed_detail"] == "docker build failed"
+
+    class _NoContainerClient:
+        class _Containers:
+            def list(self, all=True):
+                return []
+
+        containers = _Containers()
+
+    monkeypatch.setattr("FuxiYu_NodeKernel.docker_operates.status_cache.docker.from_env", lambda: _NoContainerClient())
+    extensions.status_cache._reconcile_once()
+    assert cfg["name"] not in extensions.status_cache.take_deleted()
+
+
+def test_create_container_existing_returns_409(client, monkeypatch):
+    _patched_service(monkeypatch, "container_exists", lambda name: True)
+    payload = {"owner_name": "admin", "config": VALID_CFG}
+    resp = client.post("/api/create_container", json=payload)
+    assert resp.status_code == 409
+    assert resp.json()["error_reason"] == "container_exists"
+
+
+def test_create_container_invalid_config_422(client):
     bad_cfg = {**VALID_CFG, "port": "not-a-port"}
     payload = {"owner_name": "admin", "config": bad_cfg}
-    resp = client.post("/api/create_container", json=encrypted_body(payload))
-    assert resp.status_code == 400
-    assert resp.get_json()["error_reason"] == "invalid_config"
-
-
-# ── remove_container ─────────────────────────────────────────────────────
+    resp = client.post("/api/create_container", json=payload)
+    assert resp.status_code == 422
 
 
 def test_remove_container_success(client, monkeypatch):
+    forgotten = []
     _patched_service(monkeypatch, "remove_container", lambda name: 0)
-    payload = {"config": {"container_name": "c1"}}
-    resp = client.post("/api/remove_container", json=encrypted_body(payload))
+    monkeypatch.setattr(extensions.status_cache, "forget_container_generation", lambda name: forgotten.append(name))
+    resp = client.post("/api/remove_container", json={"config": {"container_name": "c1"}})
     assert resp.status_code == 200
-    assert resp.get_json()["success"] == 1
+    assert resp.json()["success"] == 1
+    assert forgotten == ["c1"]
 
 
 def test_remove_container_not_found_404(client, monkeypatch):
     _patched_service(monkeypatch, "remove_container", lambda name: 1)
-    payload = {"config": {"container_name": "ghost"}}
-    resp = client.post("/api/remove_container", json=encrypted_body(payload))
+    resp = client.post("/api/remove_container", json={"config": {"container_name": "ghost"}})
     assert resp.status_code == 404
-    assert resp.get_json()["error_reason"] == "not_found"
+    assert resp.json()["error_reason"] == "not_found"
 
 
 def test_remove_container_missing_name_400(client):
-    resp = client.post("/api/remove_container", json=encrypted_body({"config": {}}))
+    resp = client.post("/api/remove_container", json={"config": {}})
     assert resp.status_code == 400
-    assert resp.get_json()["error_reason"] == "missing_container_name"
-
-
-# ── container_status ─────────────────────────────────────────────────────
+    assert resp.json()["error_reason"] == "missing_container_name"
 
 
 def test_container_status_online(client, monkeypatch):
-    running = FakeContainer("c1", status="running", exec_exit_code=0)
-    monkeypatch.setattr(extensions, "docker_client", FakeDockerClient(FakeContainers([running])))
-    payload = {"config": {"container_name": "c1"}}
-    resp = client.post("/api/container_status", json=encrypted_body(payload))
+    _patched_service(
+        monkeypatch,
+        "list_container_status",
+        lambda: {"c1": {"source": "cache", "status": "online", "cache_updated_at": "2026-01-01T00:00:00"}},
+    )
+    resp = client.post("/api/container_status", json={"config": {"container_name": "c1"}})
     assert resp.status_code == 200
-    assert resp.get_json()["container_status"] == "online"
+    assert resp.json()["container_status"] == "online"
 
 
-def test_container_status_not_found_404(client):
-    payload = {"config": {"container_name": "ghost"}}
-    resp = client.post("/api/container_status", json=encrypted_body(payload))
-    assert resp.status_code == 404
-    assert resp.get_json()["error_reason"] == "not_found"
+def test_container_status_pending(client, monkeypatch):
+    _patched_service(monkeypatch, "list_container_status", lambda: {"c1": {"source": "pending", "status": "starting"}})
+    resp = client.post("/api/container_status", json={"config": {"container_name": "c1"}})
+    assert resp.status_code == 200
+    assert resp.json()["container_status"] == "starting"
 
 
-# ── machine_status ───────────────────────────────────────────────────────
+def test_container_status_miss_unknown(client, monkeypatch):
+    _patched_service(monkeypatch, "list_container_status", lambda: {})
+    resp = client.post("/api/container_status", json={"config": {"container_name": "ghost"}})
+    assert resp.status_code == 200
+    assert resp.json()["container_status"] == "unknown"
 
 
 def test_machine_status_online(client):
-    # 注意：不能发空 dict —— get_verified_msg 对"验证成功的空 dict"和"验证失败"返回同一个 {}，
-    # 端点会误判 401。真实 Ctrl 流量总是带 config，用真实形状。
-    resp = client.post("/api/machine_status", json=encrypted_body({"config": {}}))
+    resp = client.post("/api/machine_status", json={"config": {}})
     assert resp.status_code == 200
-    assert resp.get_json()["machine_status"] == "online"
-
-
-# ── collaborator / role ──────────────────────────────────────────────────
+    assert resp.json()["machine_status"] == "online"
 
 
 def test_add_collaborator_success(client, monkeypatch):
     _patched_service(monkeypatch, "add_collaborator", lambda *a: True)
     payload = {"config": {"container_name": "c1", "user_name": "u1", "role": "admin"}}
-    resp = client.post("/api/add_collaborator", json=encrypted_body(payload))
+    resp = client.post("/api/add_collaborator", json=payload)
     assert resp.status_code == 200
-    body = resp.get_json()
-    assert body["success"] is True
-    # Node 回显解密后的消息 —— 链路级 roundtrip 断言锚点
-    assert body["decrypted_message"] == payload
+    assert resp.json()["success"] is True
+    assert resp.json()["decrypted_message"] == payload
 
 
-def test_add_collaborator_invalid_role_400(client):
+def test_add_collaborator_invalid_role_422(client):
     payload = {"config": {"container_name": "c1", "user_name": "u1", "role": "hacker"}}
-    resp = client.post("/api/add_collaborator", json=encrypted_body(payload))
-    assert resp.status_code == 400
-    assert resp.get_json()["error_reason"] == "invalid_role"
+    resp = client.post("/api/add_collaborator", json=payload)
+    assert resp.status_code == 422
 
 
 def test_remove_collaborator_success(client, monkeypatch):
     _patched_service(monkeypatch, "remove_collaborator", lambda *a: True)
     payload = {"config": {"container_name": "c1", "user_name": "u1"}}
-    resp = client.post("/api/remove_collaborator", json=encrypted_body(payload))
+    resp = client.post("/api/remove_collaborator", json=payload)
     assert resp.status_code == 200
-    assert resp.get_json()["success"] == 1
+    assert resp.json()["success"] == 1
+
+
+def test_remove_collaborator_failure_returns_500(client, monkeypatch):
+    """服务层返回 False（容器内 userdel 失败）→ 500 失败体。
+    固定回 success:1 曾让 Ctrl 误判成功删 DB 绑定，造成容器内权限漂移。"""
+    _patched_service(monkeypatch, "remove_collaborator", lambda *a: False)
+    payload = {"config": {"container_name": "c1", "user_name": "u1"}}
+    resp = client.post("/api/remove_collaborator", json=payload)
+    assert resp.status_code == 500
+    body = resp.json()
+    assert body["success"] == 0
+    assert body["error_reason"] == "remove_failed"
 
 
 def test_update_role_success(client, monkeypatch):
     _patched_service(monkeypatch, "update_role", lambda *a: True)
     payload = {"config": {"container_name": "c1", "user_name": "u1", "updated_role": "root"}}
-    resp = client.post("/api/update_role", json=encrypted_body(payload))
+    resp = client.post("/api/update_role", json=payload)
     assert resp.status_code == 200
-    body = resp.get_json()
-    assert body["success"] is True
-    assert body["decrypted_message"] == payload
+    assert resp.json()["success"] is True
+    assert resp.json()["decrypted_message"] == payload
 
 
-def test_update_role_invalid_role_400(client):
+def test_update_role_invalid_role_422(client):
     payload = {"config": {"container_name": "c1", "user_name": "u1", "updated_role": "emperor"}}
-    resp = client.post("/api/update_role", json=encrypted_body(payload))
-    assert resp.status_code == 400
-
-
-# ── start / stop / restart（异步派发 + 状态跟踪）─────────────────────────
+    resp = client.post("/api/update_role", json=payload)
+    assert resp.status_code == 422
 
 
 def test_start_container_success(client, monkeypatch):
+    # 与 restart 同构：start 成功后进入 ready_check 确认门禁（docker running ≠ sshd 就绪），
+    # 由 probe 循环验 :22 通过后才 ONLINE
     _patched_service(monkeypatch, "start_container", lambda name: True)
-    payload = {"config": {"container_name": "c1"}}
-    resp = client.post("/api/start_container", json=encrypted_body(payload))
+    resp = client.post("/api/start_container", json={"config": {"container_name": "c1"}})
     assert resp.status_code == 200
-    body = resp.get_json()
-    assert body["success"] == 1
-    assert body["container_status"] == "starting"
+    assert resp.json()["container_status"] == "starting"
     time.sleep(0.1)
-    assert blueprints._get_action_status("c1")["status"] == "online"
+    state = extensions.status_cache.get_state("c1")
+    assert state["status"] == "starting"
+    assert extensions.status_cache.get("c1")["ready_check"] is True
+
+
+def test_start_container_waits_for_sshd_probe_before_online(client, monkeypatch):
+    _patched_service(monkeypatch, "start_container", lambda name: True)
+    monkeypatch.setattr(extensions.status_cache, "_probe_sshd", lambda name: True)
+
+    resp = client.post("/api/start_container", json={"config": {"container_name": "c_start_probe"}})
+
+    assert resp.status_code == 200
+    time.sleep(0.1)
+    for name, entry in list(extensions.status_cache.snapshot().items()):
+        if entry.get("ready_check") and extensions.status_cache._probe_sshd(name):
+            extensions.status_cache.update(name, "online")
+    assert extensions.status_cache.get_state("c_start_probe")["status"] == "online"
 
 
 def test_stop_container_success(client, monkeypatch):
     _patched_service(monkeypatch, "stop_container", lambda name: True)
-    payload = {"config": {"container_name": "c1"}}
-    resp = client.post("/api/stop_container", json=encrypted_body(payload))
+    resp = client.post("/api/stop_container", json={"config": {"container_name": "c1"}})
     assert resp.status_code == 200
-    assert resp.get_json()["container_status"] == "stoping"
+    assert resp.json()["container_status"] == "stopping"
     time.sleep(0.1)
-    assert blueprints._get_action_status("c1")["status"] == "offline"
+    assert extensions.status_cache.get_state("c1")["status"] == "offline"
 
 
 def test_restart_container_success(client, monkeypatch):
     _patched_service(monkeypatch, "restart_container", lambda name: True)
-    payload = {"config": {"container_name": "c1"}}
-    resp = client.post("/api/restart_container", json=encrypted_body(payload))
+    resp = client.post("/api/restart_container", json={"config": {"container_name": "c_restart"}})
     assert resp.status_code == 200
-    assert resp.get_json()["container_status"] == "stoping"
+    assert resp.json()["container_status"] == "restarting"
     time.sleep(0.1)
-    assert blueprints._get_action_status("c1")["status"] == "online"
+    state = extensions.status_cache.get_state("c_restart")
+    assert state["status"] == "restarting"
+    assert extensions.status_cache.get("c_restart")["ready_check"] is True
 
 
-# ── container_last_ssh_time ──────────────────────────────────────────────
+def test_restart_container_waits_for_sshd_probe_before_online(client, monkeypatch):
+    _patched_service(monkeypatch, "restart_container", lambda name: True)
+    monkeypatch.setattr(extensions.status_cache, "_probe_sshd", lambda name: True)
+
+    resp = client.post("/api/restart_container", json={"config": {"container_name": "c_restart_probe"}})
+
+    assert resp.status_code == 200
+    time.sleep(0.1)
+    for name, entry in list(extensions.status_cache.snapshot().items()):
+        if entry.get("ready_check") and extensions.status_cache._probe_sshd(name):
+            extensions.status_cache.update(name, "online")
+    assert extensions.status_cache.get_state("c_restart_probe")["status"] == "online"
+
+
+def test_pause_container_success(client, monkeypatch):
+    _patched_service(monkeypatch, "pause_container", lambda name, action: True)
+    payload = {"config": {"container_name": "c1", "action": "pause"}}
+    resp = client.post("/api/pause_container", json=payload)
+    assert resp.status_code == 200
+    assert resp.json()["container_status"] == "pausing"
+    time.sleep(0.1)
+    assert extensions.status_cache.get_state("c1")["status"] == "paused"
+
+
+def test_unpause_container_success(client, monkeypatch):
+    _patched_service(monkeypatch, "pause_container", lambda name, action: True)
+    payload = {"config": {"container_name": "c1", "action": "unpause"}}
+    resp = client.post("/api/pause_container", json=payload)
+    assert resp.status_code == 200
+    assert resp.json()["container_status"] == "unpausing"
+    time.sleep(0.1)
+    assert extensions.status_cache.get_state("c1")["status"] == "online"
 
 
 def test_container_last_ssh_time_success(client, monkeypatch):
-    _patched_service(monkeypatch, "get_last_ssh_connect_time", lambda name: "2026-01-01T00:00:00")
-    payload = {"config": {"container_name": "c1"}}
-    resp = client.post("/api/container_last_ssh_time", json=encrypted_body(payload))
+    _patched_service(
+        monkeypatch,
+        "list_last_ssh",
+        lambda: {"c1": {"last_ssh_connect_time": "2026-01-01T00:00:00", "updated_at": "2026-01-01T00:00:00"}},
+    )
+    resp = client.post("/api/container_last_ssh_time", json={"config": {"container_name": "c1"}})
     assert resp.status_code == 200
-    assert resp.get_json()["last_ssh_connect_time"] == "2026-01-01T00:00:00"
+    assert resp.json()["last_ssh_connect_time"] == "2026-01-01T00:00:00"
+
+
+def test_container_last_ssh_time_not_collected_returns_404(client, monkeypatch):
+    _patched_service(monkeypatch, "list_last_ssh", lambda: {})
+    resp = client.post("/api/container_last_ssh_time", json={"config": {"container_name": "c1"}})
+    assert resp.status_code == 404
+
+
+def test_check_disk_usage_success(client, monkeypatch):
+    _patched_service(
+        monkeypatch,
+        "list_disk_usage",
+        lambda: {
+            "machine_disk": {"total_gb": 100, "used_gb": 20, "free_gb": 80, "percent": 20},
+            "containers": {"c1": {"container_name": "c1", "total_bytes": 123}},
+        },
+    )
+    resp = client.post("/api/check_disk_usage", json={"config": {"container_name": "c1"}})
+    assert resp.status_code == 200
+    assert resp.json()["container"]["total_bytes"] == 123
+
+
+def test_clean_mount_success(client, monkeypatch):
+    calls = []
+    _patched_service(monkeypatch, "clean_mount", lambda path: calls.append(path) or True)
+    resp = client.post("/api/clean_mount", json={"config": {"mount_path": "/home/u/containers/c1"}})
+    assert resp.status_code == 200
+    assert resp.json()["success"] == 1
+    assert calls == ["/home/u/containers/c1"]
+
+
+def test_clean_mount_invalid_path_400(client, monkeypatch):
+    """service 层安全校验拒绝（路径穿越等）→ 400 invalid_path，绝不执行删除。"""
+    def _reject(path):
+        raise ValueError("invalid mount_path")
+
+    _patched_service(monkeypatch, "clean_mount", _reject)
+    resp = client.post("/api/clean_mount", json={"config": {"mount_path": "/home/a/containers/../../etc"}})
+    assert resp.status_code == 400
+    assert resp.json()["error_reason"] == "invalid_path"
+
+
+def test_clean_mount_rm_failure_500(client, monkeypatch):
+    """rm 删除失败（service 抛 RuntimeError）→ 500，不得报成功（假成功会让 Ctrl 误标 cleaned_at）。"""
+    def _fail(path):
+        raise RuntimeError("rm -rf failed")
+
+    _patched_service(monkeypatch, "clean_mount", _fail)
+    resp = client.post("/api/clean_mount", json={"config": {"mount_path": "/home/u/containers/c1"}})
+    assert resp.status_code == 500
+    assert resp.json()["success"] == 0
