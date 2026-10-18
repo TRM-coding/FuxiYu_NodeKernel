@@ -4,6 +4,7 @@
 - happy path（-m docker）：真实 docker daemon，验证资源参数与 ssh 配置
 """
 import os
+import uuid
 
 import docker
 import pytest
@@ -780,27 +781,37 @@ def test_happy_path(monkeypatch, tmp_path):
     client = extensions.docker_client
 
     # 这个用例要跑得完，镜像里必须有 sshd（平台构建出来的镜像都有，裸 ubuntu 没有）。
-    # 所以允许指一个真实镜像：NODE_TEST_IMAGE=fuxi/image-1:<tag>。
+    # 所以必须指一个真实镜像：NODE_TEST_IMAGE=fuxi/image-1:<tag>。裸 ubuntu
+    # 缺少 /usr/sbin/sshd，不能拿来验证 create 的 sshd 门禁；这是环境前置，
+    # 不是把行为断言降级为 skip。
+    image_tag = os.getenv("NODE_TEST_IMAGE")
+    if not image_tag:
+        pytest.skip(
+            "real create happy path requires NODE_TEST_IMAGE pointing to an image "
+            "with /usr/sbin/sshd; bare ubuntu:22.04 lacks it"
+        )
+    try:
+        client.images.get(image_tag)
+    except docker_pkg.errors.ImageNotFound:
+        pytest.skip(f"NODE_TEST_IMAGE not present locally: {image_tag}")
+
+    # 唯一名称，避免删除既有同名容器；只清理本次创建的对象。
     docker_cfg = dict(VALID_CFG)
-    docker_cfg["image"] = os.getenv("NODE_TEST_IMAGE", VALID_CFG["image"])
+    docker_cfg["image"] = image_tag
+    docker_cfg["name"] = f"pytest-create-{uuid.uuid4().hex[:10]}"
     test_config = Container.Config_info(**docker_cfg)
     # 带公钥：验证守门重排（公钥先于 sshd 安装）
     dummy_key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI dummy-key-for-test@fuxi"
-
-    # 前置清理：避免同名残留
-    try:
-        old = client.containers.get(test_config.name)
-        old.remove(force=True)
-    except docker_pkg.errors.NotFound:
-        pass
 
     def _exec(container, cmd):
         r = container.exec_run(["/bin/sh", "-c", cmd], user="root")
         return getattr(r, "exit_code", r[0]), r.output
 
     bound_port = None
+    created_id = None
     try:
         result = create_container("admin", test_config, public_key=dummy_key)
+        created_id = result.container_id
 
         assert isinstance(result, CreateContainerReturn)
         assert result.container_name == test_config.name
@@ -836,8 +847,10 @@ def test_happy_path(monkeypatch, tmp_path):
         code, out = _exec(real, "grep -q '^PermitRootLogin yes' /etc/ssh/sshd_config && echo CFG_OK")
         assert code == 0 and b"CFG_OK" in out, f"sshd_config 未配置: {out}"
     finally:
+        # 优先按本次返回的 Docker ID 清理；create 中途失败时用本次唯一名称兜底。
         try:
-            leftover = client.containers.get(test_config.name)
+            target = created_id or test_config.name
+            leftover = client.containers.get(target)
             leftover.remove(force=True)
         except docker_pkg.errors.NotFound:
             pass

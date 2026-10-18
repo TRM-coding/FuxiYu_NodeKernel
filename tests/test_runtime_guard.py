@@ -243,6 +243,59 @@ def test_read_seq_cas_rejects_late_old_read_and_metrics_do_not_raise_sequences()
     assert cache.get_state("c1")["runtime_metrics"]["cpu_usage_percent"] == 1.0
 
 
+def test_stale_node_epoch_ticket_cannot_publish_after_restart():
+    old = ContainerStatusCache()
+    old_container = FakeRuntimeContainer("c1", status="running", docker_id="A")
+    _seed_online(old, "c1", old_container)
+    old_ticket = old.issue_observation("c1", "old-process")
+
+    new = ContainerStatusCache()
+    new_container = FakeRuntimeContainer("c1", status="exited", docker_id="A")
+    _publish(new, "c1", new_container)
+    before = new.get_state("c1")
+    assert before["status"] == ContainerStatus.OFFLINE.value
+
+    assert new.publish_observed("c1", old_ticket, fact_from_container(old_container)) is False
+
+    after = new.get_state("c1")
+    assert after["status"] == ContainerStatus.OFFLINE.value
+    assert after["last_action"] is None
+
+
+def test_metrics_ticket_is_invalidated_by_action_or_generation_change():
+    cache = ContainerStatusCache()
+    _seed_online(cache, "c1", FakeRuntimeContainer("c1", status="running"))
+    metrics_ticket = cache.issue_observation("c1", "metrics", metrics=True)
+    cache.accept_action("c1", "pause", "pausing")
+    assert cache.publish_metrics("c1", metrics_ticket, {"cpu_usage_percent": 99.0}) is False
+    assert cache.get("c1").get("runtime_metrics") is None
+    assert cache._meta_for("c1")["last_applied_metrics_read_seq"] == 0
+
+    cache2 = ContainerStatusCache()
+    _seed_online(cache2, "c2", FakeRuntimeContainer("c2", status="running"))
+    metrics_ticket2 = cache2.issue_observation("c2", "metrics", metrics=True)
+    cache2.accept_action("c2", "create", "creating", create=True)
+    assert cache2.publish_metrics("c2", metrics_ticket2, {"cpu_usage_percent": 99.0}) is False
+    assert cache2.get("c2").get("runtime_metrics") is None
+    assert cache2._meta_for("c2")["last_applied_metrics_read_seq"] == 0
+
+
+def test_stale_unknown_ticket_cannot_overwrite_newer_runtime():
+    cache = ContainerStatusCache()
+    _seed_online(cache, "c1", FakeRuntimeContainer("c1", status="running"))
+    stale = cache.issue_observation("c1", "stale-inspect")
+    newer = cache.issue_observation("c1", "newer-inspect")
+    offline = FakeRuntimeContainer("c1", status="exited")
+    assert cache.publish_observed("c1", newer, fact_from_container(offline)) is True
+
+    assert cache.publish_unknown("c1", stale, reason="late_collect_error") is False
+
+    state = cache.get_state("c1")
+    assert state["status"] == ContainerStatus.OFFLINE.value
+    assert state.get("status_source") is None
+    assert cache.get("c1")["status"] == ContainerStatus.OFFLINE.value
+
+
 def test_finish_old_ref_is_superseded_and_never_overwrites_new_ref():
     cache = ContainerStatusCache()
     container = FakeRuntimeContainer("c1", status="running")
@@ -1058,6 +1111,22 @@ def test_create_superseded_by_non_create_releases_pending_when_create_finishes()
     assert meta["create_pending"] is False
     assert meta["last_action"].ref == start_ref
     assert cache._meta_for("c1")["actions"][cache._action_key(create_ref)].phase == "superseded"
+
+
+def test_old_create_finish_does_not_release_new_create_pending():
+    cache = ContainerStatusCache()
+    old_ref = cache.accept_action("c1", "create", "creating", create=True)
+    new_ref = cache.accept_action("c1", "create", "building", create=True)
+    assert cache._meta_for("c1")["create_pending"] is True
+
+    # 旧代 create 晚到时，新代 create 仍拥有名称，不能被旧终结释放。
+    assert cache.finish_action_ref({**old_ref, "name": "c1"}, "failed", "old_generation") is False
+
+    meta = cache._meta_for("c1")
+    assert meta["create_pending"] is True
+    assert meta["current_action"].ref == new_ref
+    assert meta["last_action"].ref == new_ref
+    assert cache.get_state("c1")["last_action"]["ref"] == new_ref
 
 
 def test_legacy_finish_action_without_current_action_cannot_write_runtime():

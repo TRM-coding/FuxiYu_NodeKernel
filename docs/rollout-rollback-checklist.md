@@ -42,7 +42,7 @@ $env:PYTHONPATH='E:\AI\Fuxi'
 E:\Miniconda3\envs\lianjue\python.exe -m pytest -q -p no:cacheprovider
 ```
 
-结果：**326 passed, 1 skipped, 16 deselected, 24 subtests passed**。
+结果：**331 passed, 1 skipped, 16 deselected, 24 subtests passed**。
 默认套件中的 1 个 skip 是 `tests/test_clean_mount.py:80` 的
 “symlink not permitted in this environment”，与 Docker/生产无关。
 
@@ -67,12 +67,28 @@ skip 项是“真实 dead 容器 unpause 不成功”，原因写在测试 marke
 `test_pause_unpause_offline_dead_never_report_success` 覆盖，未宣称真实
 dead 集成通过。
 
-补充说明：全量 `pytest -m docker` 还会选中本变更之外的 11 个旧 Docker
-测试；本机上 `test_create_container::test_happy_path` 因 `ubuntu:22.04`
-缺 `ssh-keygen` 失败，`test_docker_status_cache` 的 `pytest_sshd_fixture`
-会在旧用例中挂起。已停止该轮，只清理了这轮测试新建的
-`pytest_sshd_fixture`；没有删除任何既有容器（`pcs-verify` 未动），也没有
-把上述旧用例计入本变更通过。真实 Docker 验收以第 2 条命令为准。
+旧 Docker 测试补充定位与修复（本变更之外，未并入上面的 4 项）：
+
+- `tests/test_docker_status_cache.py`：原 fixture 固定使用
+  `pytest_sshd_fixture`/`pytest_no_sshd` 并在启动前按名称删除同名容器；
+  `apt-get update && install openssh-server` 无 timeout，本机 apt 在 25 秒
+  上限时仍未完成（rc=124），`exec_run` 又无 timeout，导致整个 marker 挂起。
+  已改为唯一名称/label、按本次 Docker ID 清理、容器内 `timeout` 包裹
+  （探针 20s、安装 240s），安装失败才按环境前置 skip。修复后
+  `pytest -m docker tests/test_docker_status_cache.py`：**6 passed in 228.16s**，
+  容器已清理。
+- `tests/test_create_container.py::test_happy_path`：原用例默认使用
+  `ubuntu:22.04`，该镜像没有 `/usr/sbin/sshd`/`ssh-keygen`（复现：
+  `docker run --rm ubuntu:22.04 sh -c 'command -v ssh-keygen || echo missing; test -x /usr/sbin/sshd || echo missing'`
+  两项均 missing），create 的 sshd 门禁在 `ssh-keygen -A` 处 exit 127。
+  已改为必须设置 `NODE_TEST_IMAGE` 指向带 sshd 的镜像，未设置/镜像缺失时
+  作为环境前置显式 skip；同时改为唯一名称、按本次 Docker ID 清理。本机
+  未提供该镜像，因此该项为 **1 skipped**，不是行为通过。
+- 其余安全旧 Docker 用例（add/remove collaborator、remove container、
+  update role，均唯一名称/自有对象清理）：
+  `pytest -m docker ...`：**4 passed**。
+- 全量 `pytest -m docker` 未合并重跑；分项结果为旧用例 10 passed + 1
+  skipped、本变更专项 4 passed + 1 skipped，**不能宣称全量 Docker green**。
 
 ```powershell
 openspec validate prevent-false-container-vanished --strict --json
@@ -89,13 +105,14 @@ git diff --check
 | --- | --- |
 | `tests/test_docker_runtime_integration.py` | 本机真实 Docker：重复 unpause、offline 不成功、pause/restart ready 失效、慢 stats、WSS 帧；唯一名称/label，仅按本次 Docker ID 清理 |
 | `tests/test_prevent_vanished.py` | 枚举中创建、在途创建、同名替换、单容器 NotFound/异常、删除候选失效、collect_error 期间不取删除候选、WSS 删帧顺序 |
-| `tests/test_runtime_guard.py` | 读面优先级、观察票 CAS、动作队列、同名换代、create 绑定/deferred、硬阻塞 ready/暂停边界、创建中 created 不提前硬阻塞、旧 finish 不回写、pause/unpause 幂等、冷启动、事件唯一入口、启动失败队列清理 |
+| `tests/test_runtime_guard.py` | 读面优先级、观察票 CAS（含旧 node_epoch、旧 unknown、metrics 票失效）、动作队列、同名换代、create 绑定/deferred 与新旧 create 所有权、硬阻塞 ready/暂停边界、创建中 created 不提前硬阻塞、旧 finish 不回写、pause/unpause 幂等、冷启动、事件唯一入口、启动失败队列清理 |
 | `tests/test_runtime_barriers.py` | 受理/ref/票/队列/Docker/HTTP/WSS/删除候选屏障与 Sylvan 慢 list/stats 回放 |
 | `tests/test_randomized_guard.py` | 固定种子交错、不变量、失败最小化 |
 | `tests/test_action_inspect_errors.py` | pause/start/stop/restart pre-inspect 的 NotFound/APIError/连接/timeout 分类，以及 post-inspect 不确定性 |
 | `tests/test_action_contracts.py` | 独立本地消费方：HTTP ACK 先到/WSS 终结先到、exact ref+方向、旧/未知 ref、缺字段、重启 epoch、状态响应不输出 action_ref |
 | `tests/test_verify_barriers.py` | 路径 A→B 与在途 du、Docker/路径/候选/缓存/WSS/消费方交错日志 |
-| `tests/test_verify_bind_mount.py` | Source/actual 核对、有界候选、改名/歧义/proc/no PID/no_bind/Mounts 不可读、路径晚回、A→B 在途 du、失败不当 0、HTTP/WSS 共用与 Ctrl 本地夹具 |
+| `tests/test_verify_bind_mount.py` | Source/actual 核对、有界候选、改名/歧义/proc/no PID/no_bind/Mounts 不可读、路径晚回、A→B 在途 du、bind 样本晚于 overlay 时取较早 measured_at、失败不当 0、HTTP/WSS 共用与 Ctrl 本地夹具 |
+| `tests/test_docker_status_cache.py` | 旧真实 Docker fixture 修复：唯一名称/label、按 ID 清理、apt 有界 timeout、sshd 冷启动/probe/终态；6 passed |
 
 ## 3. 发布顺序（本地清单核对，未执行）
 
@@ -146,6 +163,7 @@ git diff --check
 | guard 6.5 真实 dead 容器集成 | 4 项真实 Docker 通过；dead 显式 skip | 不能安全制造 dead 状态；dead 映射由单元测试覆盖，未伪造通过 |
 | Ctrl 对磁盘新字段的接收/落库 | 仅本地独立夹具 | 不修改 Ctrl，未做跨仓联调 |
 | Ctrl `guard-container-vanish-deletion` 3.1 联合验收 | Ctrl 本地 5/6 | 与 prevent 3.1 同一跨仓项 |
+| 旧 `test_create_container::test_happy_path` 真实 Docker 运行 | 1 skipped（环境前置） | 本机没有带 `/usr/sbin/sshd` 的 `NODE_TEST_IMAGE`；设置后可运行完整断言，未把行为失败改 skip |
 
 本地 Ctrl 夹具只验证字段语义，不是 Ctrl 实现，也不是端到端生产验收。
 guard 7.1 只完成发布清单/依赖核对，不是部署或上线证明。
@@ -169,6 +187,11 @@ guard 7.1 只完成发布清单/依赖核对，不是部署或上线证明。
   mounts_unreadable，不推断 no_bind、不清空已有业务路径。
 - **wire**：`ContainerStatusResponse` 不再继承受理响应，不输出恒为 null 的
   `action_ref`；磁盘模型仍只有当前允许字段，无 identity/epoch/seq。
+- **补测覆盖**：新增旧 `node_epoch` 观察票不能写新进程、metrics 票被
+  action_seq/代际更换拒绝、旧 unknown 票不能覆盖新运行态、旧 create 终结
+  不能释放新 create pending、bind 样本晚于 overlay 时 `measured_at` 仍取
+  较早组件；这些边界原先只有间接覆盖。
 - **测试安全**：真实 Docker 集成用例每次使用唯一名称和本次运行 label，只
   清理 `containers.run` 返回的 Docker ID；不再为先删同名容器而清理既有对象。
-  镜像/daemon 缺失才 skip，行为断言失败不会被 skip 吞掉。
+  旧状态缓存 fixture 的固定名称/pre-delete 与无界 apt 等待也已按同一规则
+  修正；镜像/daemon/apt 环境缺失才 skip，行为断言失败不会被 skip 吞掉。

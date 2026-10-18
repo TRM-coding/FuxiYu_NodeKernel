@@ -20,6 +20,7 @@ from FuxiYu_NodeKernel.docker_operates.disk_usage_cache import (
     BIND_DU_TIMEOUT_SEC,
     DiskUsageCache,
     _norm_path,
+    _parse_utc,
     _same_path,
     _utc_z,
 )
@@ -520,6 +521,27 @@ def test_measurement_uses_business_path_and_earlier_component_time(tmp_path, mon
     assert usage["total_bytes"] == 5120
     assert usage["measured_at"] == bind_at
     assert not (BANNED_WIRE_FIELDS & set(usage))
+
+
+def test_measured_at_uses_earlier_component_when_bind_sample_is_newer(tmp_path, monkeypatch):
+    base = _base(tmp_path, monkeypatch)
+    actual = base / "admin" / "containers" / "c1"
+    actual.mkdir()
+    cache = DiskUsageCache()
+    _proc_identity(cache, actual)
+    now = dt.datetime.now(dt.timezone.utc)
+    future_bind_at = _utc_z(now + dt.timedelta(seconds=30))
+    _seed_bind(cache, actual, 4096, measured_at=future_bind_at)
+    container = FakeRuntimeContainer("c1", mounts=_mount(actual), size_rw=1024)
+
+    _collect(cache, "c1", container, monkeypatch)
+    usage = cache.snapshot()["containers"]["c1"]
+
+    assert usage["total_bytes"] == 5120
+    assert usage["measured_at"] != future_bind_at
+    measured = _parse_utc(usage["measured_at"])
+    assert measured is not None
+    assert measured <= now + dt.timedelta(seconds=5)
 
 
 def test_path_change_drops_old_sample_until_new_path_measured(tmp_path, monkeypatch):
