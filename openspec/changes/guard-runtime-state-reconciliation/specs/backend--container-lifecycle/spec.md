@@ -130,7 +130,7 @@ Node SHALL 复用 `prevent-false-container-vanished` 的本地容器代际与观
 #### Scenario: 磁盘路径与测量诊断独立
 
 - **WHEN** pause/unpause、start/stop/restart 或容器对象代际变化
-- **THEN** 容器对象代际按本变更处理；verify-bind 的 configured_mount_path/bind_mount_path/mount_path_status/mount_path_observed_at、measurement_status/measured_at/measurement_mount_path 与 collector_epoch/observation_seq 采样会话不被推进、重置或重新解释，仍按其路径/测量契约判定
+- **THEN** 容器对象代际按本变更处理；本变更不推进、重置或重新解释 verify-bind 的业务路径和磁盘样本，不要求 Ctrl 新增磁盘列或诊断持久化，仍按其当前路径/测量契约判定
 
 #### Scenario: 不宣称跨进程代际
 
@@ -337,7 +337,7 @@ Node SHALL 在 HTTP 状态与 WSS 容器条目输出可选 last_action={ref,acti
 #### Scenario: 未确认不是完成
 
 - **WHEN** last_action.phase 为 accepted/unconfirmed/timed_out
-- **THEN** 消费方不得据此结束长期过渡、放行冻结或把容器置 failed；只有后续同 ref 终结，或实际 paused/offline 用于 pause 确认时才可收敛；unconfirmed/timed_out 本身不是完成或失败证明
+- **THEN** 选择使用该可选动作引用的独立变更不得据此结束自身动作过渡、放行其业务或把容器置 failed，须自行定义 timeout/降级；不使用该可选契约的消费方按真实运行态处理，只有 paused 才确认暂停，不因 accepted/unconfirmed/timed_out 阻挡。unconfirmed/timed_out 本身不是完成或失败证明
 
 #### Scenario: 记录有界
 

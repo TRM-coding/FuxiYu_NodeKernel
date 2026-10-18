@@ -40,7 +40,7 @@ Node SHALL 保持以下线路形状及数据来源：type='snapshot'；topic='co
 
 ### Requirement: 状态快照与旧 Ctrl 收敛
 
-Node SHALL 只使用既有线路状态值和新增的可选动作诊断字段表达运行态与动作关联，MUST NOT 依赖尚未承诺的 Ctrl 新 DB 字段或新协议。旧 Ctrl 完全可忽略 action_ref/last_action；新 Ctrl 在旧 Node 缺字段时 MUST 按缺失降级。旧 Ctrl SHALL 能依据 online/offline/paused/starting/unknown/failed 及 status_source 收敛，运行态恢复不依赖动作诊断。
+Node SHALL 只使用既有线路状态值和新增的可选动作诊断字段表达运行态与动作关联，MUST NOT 依赖尚未承诺的 Ctrl 新 DB 字段或新协议。旧 Ctrl 完全可忽略 action_ref/last_action；选择使用该可选契约的新 Ctrl/独立变更在旧 Node 缺字段时自行按缺失降级。旧 Ctrl SHALL 能依据 online/offline/paused/starting/unknown/failed 及 status_source 收敛，运行态恢复不依赖动作诊断。
 
 #### Scenario: 旧 Ctrl 忽略动作诊断
 
@@ -55,7 +55,7 @@ Node SHALL 只使用既有线路状态值和新增的可选动作诊断字段表
 #### Scenario: 旧 Node 缺字段
 
 - **WHEN** 旧 Node 的响应或快照缺少 action_ref/last_action
-- **THEN** 实际 pause 仅在 WSS paused 时确认；稳定 offline 仅解除资格过渡；其余动作绑定过渡只能 timeout unconfirmed，不假定成功或失败，也不要求 Node 补发必需回执
+- **THEN** 选择使用动作绑定的独立变更按自身 ref/方向或 timeout 规则降级，不要求 Node 补发必需回执；不使用动作绑定的消费方只按真实状态处理
 
 #### Scenario: 可选动作诊断缺失
 
@@ -69,12 +69,12 @@ Node SHALL 只使用既有线路状态值和新增的可选动作诊断字段表
 
 ### Requirement: pause 终态与 Ctrl 确认边界
 
-Node SHALL 只在运行态确实为 paused 时提供 pause 成功终态；pause 软失败 MUST NOT 使容器 status=failed，MAY 通过可选 last_action.phase=failed 提供动作诊断。消费方 MUST 只以终态 paused 确认 pause；offline MAY 解除资格过渡，但 MUST NOT 确认暂停或冻结；看到 online 或其他非终态时 MUST 继续等待，超时按 unconfirmed；MUST NOT 把 online 解释为 pause_failed。实际 pause 确认 MUST NOT 依赖动作回执；动作过渡终结只能按精确 action_ref/last_action 契约处理。当前 Docker 实态证明 dead 等硬故障仍可按既有 failed 发送，但不得伪装成 pause_failed。
+Node SHALL 只在运行态确实为 paused 时提供 pause 成功终态；pause 软失败 MUST NOT 使容器 status=failed，MAY 通过可选 last_action.phase=failed 提供动作诊断。实际 pause 确认 MUST 依赖真实 paused 状态；选择使用可选动作引用的独立变更可按精确 action_ref/last_action 契约终结其自身过渡，并自行定义 timeout/降级；Node 不规定消费方必须使用该可选契约。当前 Docker 实态证明 dead 等硬故障仍可按既有 failed 发送，但不得伪装成 pause_failed。
 
 #### Scenario: pause 软失败但容器仍在运行
 
 - **WHEN** pause 动作被记录为软失败，而新鲜 Docker 实态仍为 running/not paused
-- **THEN** WSS 发送 runtime online 与可选 `last_action.phase=failed`，不发送容器 status=failed；Ctrl 可用精确 ref 结束过渡，但不能视为 pause 已确认
+- **THEN** WSS 发送 runtime online 与可选 `last_action.phase=failed`，不发送容器 status=failed；选择使用动作引用的独立变更可按精确 ref 结束自身过渡，但不能视为 pause 已确认
 
 #### Scenario: 终态 paused 才确认
 
@@ -83,13 +83,13 @@ Node SHALL 只在运行态确实为 paused 时提供 pause 成功终态；pause 
 
 #### Scenario: online 不得被当作 pause_failed
 
-- **WHEN** Ctrl 在 pause 后看到 online 或其他非 paused 状态
-- **THEN** 只能视为尚未确认并继续等待/超时 unconfirmed，不能把 online 解释为 pause_failed
+- **WHEN** 选择使用动作引用的独立变更在 pause 后看到 online 或其他非 paused 状态
+- **THEN** 不能把 online 单独解释为 pause_failed 或暂停成功；动作绑定按消费方所属变更的 ref/方向及超时契约处理，实际暂停仍等待真实 paused
 
 #### Scenario: 缺 ref 或字段
 
 - **WHEN** 没有 action_ref/last_action，或旧 Node 缺字段
-- **THEN** 实际 pause 只能在 WSS 到达 paused 时确认；offline 仅解除资格过渡；否则超时按 unconfirmed，不假定成功或失败
+- **THEN** 实际 pause 只按真实 WSS `paused` 确认；选择使用动作引用的独立变更才按自身 ref/超时规则降级，不假定成功或失败；不使用该契约的消费方不因缺字段等待 timeout
 
 #### Scenario: confirmed 但运行态反向
 
@@ -103,7 +103,7 @@ Node SHALL 只在运行态确实为 paused 时提供 pause 成功终态；pause 
 
 ### Requirement: 动作引用与 Ctrl 过渡终结
 
-Node SHALL 在动作受理响应提供 action_ref，并在 HTTP/WSS 的 last_action 中保持同一 ref。消费方 MUST 只以精确 {node_epoch,generation,seq} 且 action 方向匹配的终结 phase 结束对应动作绑定过渡；实际 pause 仅由 paused 运行态确认；offline 仅解除资格过渡（见 pause 契约）。accepted/unconfirmed/timed_out 不得结束；缺字段/旧 ref/未知 phase MUST 按 timeout unconfirmed，不能据此放行或断言成功/失败。早到 WSS 终结可由 Ctrl 有界暂存，HTTP ACK 到达后精确匹配；Node MUST NOT 因 ACK/WSS 交错强发 failed。Node epoch 变化旧 ref 失效。
+Node SHALL 在动作受理响应提供可选 action_ref，并在 HTTP/WSS 的 last_action 中保持同一 ref；这是 Node 自身动作诊断，不规定 Ctrl 必须消费。选择使用该可选契约的独立变更在依据动作记录终结自身绑定过渡时，MUST 精确匹配 {node_epoch,generation,seq}、action 方向与终结 phase，并按自身契约处理缺字段/旧 ref/未知 phase 的 timeout 降级；不使用该契约的消费方继续按真实运行态处理，pause 只由 paused 确认，不因缺可选字段拒绝真实状态。早到 WSS 终结可由选择使用该契约的消费方按自身规则暂存；Node MUST NOT 因 ACK/WSS 交错强发 failed。Node epoch 变化旧 ref 失效。
 
 #### Scenario: ACK 先到
 
@@ -118,12 +118,12 @@ Node SHALL 在动作受理响应提供 action_ref，并在 HTTP/WSS 的 last_act
 #### Scenario: 旧 ref 或未知 phase
 
 - **WHEN** last_action 的 node_epoch/generation/seq 不匹配当前绑定，或 phase/action 未知
-- **THEN** 不能结束过渡或放行冻结，只能按 timeout unconfirmed 安全降级
+- **THEN** 选择使用该可选契约的独立变更不能结束自身过渡或放行其业务，只能按其自身 timeout 降级；不使用该契约的消费方按真实状态处理，不因 ref 不匹配/未知 phase 阻挡暂停确认
 
 #### Scenario: Node 重启 epoch 失效
 
 - **WHEN** Node 进程重启导致 node_epoch 变化
-- **THEN** 旧 action_ref 永不匹配；新 Node 无动作记录时输出 last_action:null，旧的动作绑定过渡只能 timeout unconfirmed；仅实际 paused/offline 可用于确认 pause
+- **THEN** 旧 action_ref 永不匹配；新 Node 无动作记录时输出 last_action:null；选择使用动作绑定的独立变更才按自身 timeout 降级，不使用该契约的消费方按真实 paused/online 状态处理，不因旧 ref/缺字段阻挡
 
 #### Scenario: 非 pause 动作不误匹配
 

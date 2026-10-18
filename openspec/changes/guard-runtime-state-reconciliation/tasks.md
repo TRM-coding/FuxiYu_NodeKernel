@@ -42,18 +42,18 @@
 - [ ] 6.1 建立可注入屏障的并发测试夹具，在受理、action_ref 分配、观察票签发、动作队列取出、Docker 调用前后、列表枚举、逐容器 stats、reload、响应延迟返回、事件投递、HTTP ACK 返回、WSS 快照构造和删除队列取出处设置 barrier；用测试自身的交错日志验证每个屏障都能稳定复现，不靠 sleep 猜测时序。
 - [ ] 6.2 用 2026-10-17 Sylvan 时间线做受控回放：19:33:16 首次 unpause 确认 online → 慢速对账旧快照 → 19:33:48 第二次 unpause 遇 `is not paused` → 底层已 online；断言读面不出现永久 failed、重复 unpause 为幂等确认、旧 stats/list 不回写 paused。
 - [ ] 6.3 编写随机交错/属性测试：动作序号单调、旧 finish 不改运行态、观察票 read_seq 不回退、旧读取延迟返回/后发先到不覆盖、旧代晚到观察不触发二次换代、慢列表旧对象不再成为当前身份、create 首次绑定不取消自己、硬阻塞原因属于允许集合、soft failure/unknown 不产生永久 failed、普通 metrics 不改变代际/序号；用固定种子和失败最小化输出验证不变量。
-- [ ] 6.4 用既有 WSS 帧和旧 Ctrl 状态映射夹具做消费回放，覆盖 online/unknown/paused/offline/failed 及 DB 复位后下一次快照；验证 `unpause_failed` 不再被回写、旧 Ctrl 完全忽略 action_ref/last_action 仍可恢复、新 Ctrl 面对旧 Node 缺字段时只按方向终态或 timeout unconfirmed，不修改 Ctrl 仓库文件。
+- [ ] 6.4 用既有 WSS 帧和旧 Ctrl 状态映射夹具做消费回放，覆盖 online/unknown/paused/offline/failed 及 DB 复位后下一次快照；验证 `unpause_failed` 不再被回写、旧 Ctrl 完全忽略 action_ref/last_action 仍可恢复、选择使用可选契约的独立变更在旧 Node 缺字段时自行按方向/自身 timeout 降级。不修改 Ctrl 仓库文件。
 - [ ] 6.5 在隔离本地 Docker 环境做可选集成测试：真实 unpause running/not paused 幂等、offline/dead 不成功、stats 慢时 reload 后状态正确、同 Docker ID 外部重启 Changed StartedAt 后重新门禁、WSS 快照语义；禁止使用 SSH/生产主机，无法提供 Docker 时明确标记 skipped 而不是伪造通过。
-- [ ] 6.6 做动作引用与 Ctrl 终结的受控交错测试：HTTP ACK 先到/WSS 终结先到、早到终结按 ref 暂存、精确 ref+方向匹配才结束过渡、旧/未知 ref 和缺字段只能 timeout unconfirmed、Node 不因 ACK 缺失强发 failed；覆盖 pause 软失败 online+last_action.failed、online 不被当 pause_failed、dead 硬故障仍 failed。用真实 WSS/HTTP 帧回放验收，不修改 Ctrl 文件。
-- [ ] 6.7 做动作契约矩阵测试：重复 unpause 返回新 ref + online + idempotent_confirmed；pause 失败仍 online + last_action.failed；相同 ref 终态后旧 accepted 不回退；旧 ref 晚到不覆盖新 ref；last_action 与运行态原子一致；Node 重启 last_action=null 且旧 epoch 失效；mixed-version（新 Node/旧 Ctrl、旧 Node/新 Ctrl、新 Node/新 Ctrl）均按契约降级。用 Pydantic dump、WSS JSON 帧和受控交错日志验收。
+- [ ] 6.6 做动作引用与独立消费方终结的受控交错测试：HTTP ACK 先到/WSS 终结先到、早到终结按 ref 暂存、精确 ref+方向匹配才结束自身过渡、旧/未知 ref 和缺字段只能按该消费方自身 timeout 降级、Node 不因 ACK 缺失强发 failed；覆盖 pause 软失败 online+last_action.failed、online 不被当 pause_failed、dead 硬故障仍 failed。用真实 WSS/HTTP 帧回放验收，不修改 Ctrl 文件。
+- [ ] 6.7 做动作契约矩阵测试：重复 unpause 返回新 ref + online + idempotent_confirmed；pause 失败仍 online + last_action.failed；相同 ref 终态后旧 accepted 不回退；旧 ref 晚到不覆盖新 ref；last_action 与运行态原子一致；Node 重启 last_action=null 且旧 epoch 失效；mixed-version（新 Node/旧 Ctrl、旧 Node/选择使用可选契约的独立变更、新 Node/该独立变更）按契约降级。用 Pydantic dump、WSS JSON 帧和受控交错日志验收。
 
 ## 7. 部署边界与联合验收
 
 - [ ] 7.1 核对并记录部署前置：Ctrl `guard-container-vanish-deletion` 已落地、Node `prevent-false-container-vanished` 的共享代际/观察边界/事件归一化先落地，且事件运行态只经统一观察入口（不得新增直接按事件文本写运行态的路径）；用发布清单和依赖检查验证本变更不会单独部署在旧代际实现或双写事件路径上。
 - [ ] 7.2 做 prevent + gate 联合受控交错验收：创建 pending 与旧 delete、create 首次绑定与不同 ID deferred、同名 ID 更换、慢速 list/stats、旧读取延迟返回、start/create sshd 门禁、old failed pending 与 cold start；验证本变更不另造事件解析、事件只触发新鲜 inspect、不绕过门禁、不把 prevent 删除候选发到新代。
-- [ ] 7.3 明确并验证 Ctrl `unify-disk-freeze-workflow`/`guard-long-term-container-transitions` 边界：Node 不修改 Ctrl 变更；Node 提供可选 action_ref/last_action，Ctrl 只以精确 ref+方向匹配终结过渡，实际 pause 只以 paused 确认，offline 仅解除资格过渡，online 不当 pause_failed，缺 ref/字段 timeout unconfirmed；软失败不写容器 status=failed，但可通过 last_action.failed 诊断。用部署矩阵和接口契约检查验证 Node 可选字段先于 Ctrl 完整 ref 路径可用，各变更可独立先后部署，旧 Node 缺口降级，Node 不在动作失败时强写 online，不新增必需 wire 字段。
+- [ ] 7.3 明确并验证 Ctrl 边界：Node 不修改 Ctrl 变更；长期资格静态守卫不依赖 action_ref、动作绑定或新增数据库字段；旧 Ctrl 可忽略可选字段并继续按既有运行态收敛。软失败不写容器 status=failed，但可通过 last_action.failed 诊断；不新增必需 wire 字段。
 - [ ] 7.4 验证滚动/回滚：记录 Node 版本、node_epoch、动作序号、观察票和代际为进程内存状态、无 DB/WSS 迁移；用回滚演练验证重启后 node_epoch 更换、last_action=null、旧 ref 失效、冷启动重建，旧 Ctrl 仍按既有状态语义工作，回滚不单独撤回 Ctrl 消失防护或 prevent 基础。
-- [ ] 7.5 验证 verify-bind 路径/测量诊断独立：pause/unpause、start/stop/restart、容器对象代际变化不应推进/重置 verify-bind 的 configured_mount_path/bind_mount_path/mount_path_status/mount_path_observed_at、measurement_status/measured_at/measurement_mount_path 或 collector_epoch/observation_seq 采样会话；action_ref 的 node_epoch/对象 generation/动作 seq 不得映射到这些字段。只运行其原有契约测试与字段边界检查，不修改 verify-bind 文件。runtime DockerID/ready_identity/action_ref/对象防旧写保持。
+- [ ] 7.5 验证 verify-bind 路径边界独立：本变更不改变其业务路径校正及磁盘测量契约，不把 action_ref 的 node_epoch/对象 generation/动作 seq 映射成磁盘业务字段，不要求 Ctrl 新增磁盘列。按 verify-bind 当前提案验收，不预设采样会话或诊断持久化结构；不修改 verify-bind 文件。runtime DockerID/ready_identity/action_ref/对象防旧写保持。
 
 ## Workflow follow-up
 

@@ -139,7 +139,7 @@ start/stop/restart 的规则：
 
 ### 7. 与 verify-bind 路径诊断/采样会话的边界
 
-`verify-bind-mount-identity` 现在提供 `configured_mount_path`、业务 `bind_mount_path`、`mount_path_status`、`mount_path_observed_at`、`measurement_status`、`measured_at`、`measurement_mount_path` 以及仅用于采样会话排序的 `collector_epoch`/`observation_seq`；这些是磁盘路径/测量诊断，不是运行时对象身份、动作引用或目录业务门禁。本变更 MUST NOT 共享、推进、重置或重新解释这些字段。`action_ref` 使用独立的 `node_epoch` + 对象 generation + 动作 seq，MUST NOT 混用或映射磁盘路径诊断/采样会话字段。pause/unpause/start/stop 及容器对象换代 MUST NOT 被当作新的磁盘采样会话，也不得让旧磁盘样本因运行态变化显得新鲜。运行态 DockerID、ready_identity、action_ref 和对象防旧写保持不变；磁盘缓存仍按其 `measurement_status`/`measured_at`/`measurement_mount_path` 契约判定。本变更不修改 verify-bind 的任何文件或路径/测量协议。
+`verify-bind-mount-identity` 负责校正业务路径，其磁盘测量契约独立于运行态动作。`action_ref` 使用独立的 `node_epoch` + 对象 generation + 动作 seq，不映射成磁盘字段，不要求 Ctrl 新增磁盘列或诊断持久化。pause/unpause/start/stop 及容器对象换代不得让旧磁盘样本显得新鲜。运行态 DockerID、ready_identity、action_ref 和对象防旧写保持不变；本变更不修改 verify-bind 文件，不预设其采样会话结构。
 
 ### 8. API、WSS 与旧 Ctrl 兼容
 
@@ -147,11 +147,11 @@ start/stop/restart 的规则：
 
 WSS `build_status_snapshot` 仍读 `list_container_status`；其条目必须来自上述读面优先级，不能出现“底层 cache online、条目却因动作失败返回 failed”。运行态与 `last_action` 必须来自同一原子读面，可同时出现 `last_action.phase=failed` 与 `status=online`。`collect_error` 全局形状保持不变。旧 Ctrl 的恢复路径就是既有 online/unknown 语义，不依赖本变更的新字段。
 
-pause 终态契约：Node 只在运行态确实为 paused 时提供 pause 成功终态；pause 软失败 MUST NOT 使容器 status=failed，MAY 以 `last_action.phase=failed` 提供动作诊断。消费方实际确认 pause 只以终态 `paused`；稳定 offline 仅能解除长期资格过渡，不能确认暂停或冻结；看到 `online` 或其他非终态继续等待，超时按 `unconfirmed`，不得把 `online` 当 `pause_failed`。动作过渡可按 §9 的精确 ref+方向匹配终结，但 `last_action.failed` 不改变运行态；当前 Docker 实态证明 dead 等硬故障仍可按既有 failed 发送，但不得伪装成 `pause_failed`。start/create 就绪硬阻塞和真实 Docker 故障不被泛化清除。
+pause 终态契约：Node 只在运行态确实为 paused 时提供 pause 成功终态；pause 软失败 MUST NOT 使容器 status=failed，MAY 以 `last_action.phase=failed` 提供动作诊断。可选动作诊断按 §9 关联具体尝试，实际暂停只由真实 `paused` 确认；`online` 不推断 `pause_failed`，不得把 `last_action.failed` 当成运行态 failed。当前 Docker 实态证明 dead 等硬故障仍可按既有 failed 发送，但不得伪装成 `pause_failed`。start/create 就绪硬阻塞和真实 Docker 故障不被泛化清除。
 
 ### 9. 动作引用与 last_action 兼容 wire
 
-Node 在六个动作（create/start/stop/restart/pause/unpause）受理前分配 `action_ref`，并随受理响应返回；`action` 记录对应动作名。字段形状与 Ctrl `guard-long-term-container-transitions` 一致：
+Node 在六个动作（create/start/stop/restart/pause/unpause）受理前分配 `action_ref`，并随受理响应返回；`action` 记录对应动作名。本变更定义的可选诊断字段形状如下：
 
 ```json
 action_ref = {
@@ -172,8 +172,8 @@ last_action = {
 - `last_action` 只代表该容器最新本地受理动作；新受理替换旧记录。终态为 `confirmed`、`idempotent_confirmed`、`failed`、`superseded`；`accepted`、`unconfirmed`、`timed_out` 非完成证明，不能结束过渡、放行冻结或清除硬阻塞。相同 ref 进入终态后，旧 accepted/unconfirmed/timed_out 不得回退；旧 ref 的 finish 不得覆盖新 ref。`unconfirmed`/`timed_out` 可在同 ref 仍为最新时随后转终结，但不因 TTL 释放。
 - `last_action` 与运行态在同一读锁内投影，保证原子一致；可同时出现 `failed + online`、`confirmed + online` 等历史动作与当前实际状态组合。`last_action.failed` MUST NOT 使运行态 status 变成 failed。读面只保留每容器最新动作；终结、相位变化和旧 ref 拒绝写有界结构化日志，避免无界历史。
 - 同名对象换代时，旧代未终结的 latest action 置 `superseded` 并保留旧 ref 作为终结诊断，供旧绑定按精确 ref 释放；已终结 phase 不回归，新代动作使用新 ref。Node 重启后无内存记录，`last_action:null`，旧 epoch/ref 失效。删除/忘记容器代际时清理该容器动作记录。
-- Ctrl 集成：HTTP ACK 绑定 `action_ref`；只有精确 `{node_epoch,generation,seq}` 且 action 方向匹配的终结 phase 可结束对应长期过渡/冻结请求。`paused` 仍可按实际运行态确认暂停；`online` 不得推断 `pause_failed`。缺 ref/字段、旧 ref、未知 phase 只能 timeout unconfirmed，不得放行。早到 WSS 终结由 Ctrl 按 ref 有界暂存、ACK 到达后精确匹配；Node 不因 ACK 缺失强发 failed。非 pause/unpause 的 last_action 不匹配 pause/unpause 过渡。普通 unpause accepted 后立即授宽限仍是 Ctrl 遗留行为，不在本变更修复。
-- Pydantic 响应模型必须声明 `action_ref: ActionRef | None` 与 `last_action: LastAction | None`：`ContainerOperationAcceptedResponse` 与 `CreateContainerResponse` 提供 action_ref，`ContainerStatusResponse` 与 WSS 容器条目提供 last_action；WSS 条目构造必须显式复制字段。`null` 不得被 response model、exclude 逻辑或 JSON 序列化丢弃。旧 Ctrl 忽略新字段；旧 Node 缺字段时新 Ctrl 降级为 timeout unconfirmed。
+- Ctrl 边界：Node 只提供可选动作诊断，不规定 Ctrl 必须消费。长期资格静态守卫不依赖动作引用、绑定或新增持久化字段。Node 只保证可选字段形状与自身动作记录，不规定消费方的暂存/匹配/超时。Node 不因 ACK 缺失强发 failed。普通 unpause accepted 后立即授宽限仍是 Ctrl 遗留行为，不在本变更修复。
+- Pydantic 响应模型必须声明 `action_ref: ActionRef | None` 与 `last_action: LastAction | None`：`ContainerOperationAcceptedResponse` 与 `CreateContainerResponse` 提供 action_ref，`ContainerStatusResponse` 与 WSS 容器条目提供 last_action；WSS 条目构造必须显式复制字段。`null` 不得被 response model、exclude 逻辑或 JSON 序列化丢弃。旧 Ctrl 忽略新字段；选择使用该可选契约的独立变更自行按缺失降级。
 
 ## Risks / Trade-offs
 
@@ -183,19 +183,19 @@ last_action = {
 - [只允许很窄的硬阻塞会让部分真实故障停留在 unknown/诊断] → 宁可报告未知与日志，也不把动作失败或 OOM 永久写成 failed；当前 dead 和既有门禁仍能形成明确硬阻塞。
 - [旧 Ctrl 对通用 unknown 的落库行为未必与 cold_start_verify 完全一致] → 只使用既有 unknown + status_source 语义，并把旧 Ctrl 消费快照作为受控联调门禁；不新增 DB 字段，不以强写 online 规避。
 - [同名 Docker ID 更换仍可能有在途旧帧] → 本地代际只保护 Node 读面；删除帧/跨进程隔离仍受 Q70 边界约束，不能宣称绝对安全。
-- [last_action 只保留最新动作] → 旧 ref 的终结在中途被新动作替换后不会出现在读面；旧 Ctrl 绑定会因 ref 不匹配保持 unconfirmed，由新动作/方向状态收敛，不伪造成功或失败。
-- [旧 Node 缺 action_ref/last_action] → 新 Ctrl 只能按方向终态或 timeout unconfirmed；部署说明必须记录旧 Node 覆盖率，不承诺同等恢复能力。
+- [last_action 只保留最新动作] → 旧 ref 的终结在中途被新动作替换后不会出现在读面；不得以新动作记录伪造旧动作的成功或失败，当前运行态仍按实际观察收敛。
+- [旧 Node 缺 action_ref/last_action] → 现有 Ctrl 继续按真实运行态处理，不把缺少可选诊断转成长期资格或其他业务前置。
 - [action_ref 被误用为跨进程身份] → 仅单 Node 动作关联；不与 Q70 删除授权、对象身份或 verify-bind 磁盘路径诊断/采样会话混用。
-- [early WSS/ACK 交错] → Node 在受理前分配 ref，HTTP/WSS 同源；Ctrl 按 ref 有界暂存并精确匹配，Node 不因 ACK 缺失强发 failed。
+- [early WSS/ACK 交错] → Node 在受理前分配 ref，HTTP/WSS 同源；Node 不因 ACK 缺失强发 failed，现有 Ctrl 仍按真实运行态处理。
 - [动作诊断序列化丢失] → Pydantic 响应模型和 WSS 构造都显式保留可选字段及 null；任务用模型 dump/JSON 帧测试验证。
 
 ## Migration Plan
 
 1. 前置：Ctrl `guard-container-vanish-deletion` 已部署；Node `prevent-false-container-vanished` 的共享代际、观察边界、创建 pending 和事件归一化先落地。事件运行态只能经统一观察入口：prevent 不得新增直接写运行态的路径，guard 落地后事件只触发新鲜 inspect；若两变更分开发布，联合验收以唯一入口为准，不允许双写并存。两者是共享基础，不把 `guard-runtime-state-reconciliation` 单独部署在旧代际实现上。
-2. 部署 Node 本变更（与 prevent 可同一版本发布，但内部必须先生效代际/观察基础，再启用动作序号、observation ticket 与可选 action_ref/last_action）。旧 Ctrl 可忽略新字段并继续按既有状态恢复；旧 Node 缺字段时新 Ctrl 按 timeout unconfirmed 降级。无数据库迁移、无 WSS 必需字段升级。建议 Node 可选字段先于 Ctrl `guard-long-term-container-transitions`/`unify-disk-freeze-workflow` 可用，以取得完整精确 ref；若 Ctrl 先部署，旧 Node 缺字段按 timeout unconfirmed 降级，不承诺同等恢复能力。
+2. 部署 Node 本变更（与 prevent 可同一版本发布，但内部必须先生效代际/观察基础，再启用动作序号、observation ticket 与可选 action_ref/last_action）。旧 Ctrl 可忽略新字段并继续按既有状态恢复。无数据库迁移、无 WSS 必需字段升级，不以动作诊断作为长期资格静态守卫的部署前置。
 3. 与既有 start/create 就绪门禁共享验收：门禁仍然阻挡 running→online；本变更不得以 Docker running 绕过 sshd 检查或 created 半成品保护；start/restart 或同 Docker ID 外部重启后必须按 `StartedAt` 重新验证，pause 可保留同一进程的已就绪证明。
-4. 与 Ctrl `guard-long-term-container-transitions`/`unify-disk-freeze-workflow` 的边界：本仓不修改 Ctrl，也不新增必需 wire 字段。Node 提供可选 action_ref/last_action；Ctrl 精确 ref+方向匹配终结过渡，实际 pause 只以 paused 确认，offline 仅解除资格过渡，online 不当 pause_failed，缺 ref/字段 timeout unconfirmed。软失败只提供动作诊断，不写容器 failed。普通 unpause accepted 后立即授宽限仍是 Ctrl 遗留行为。该 Ctrl 变更应在 Node 可选字段覆盖率核对后启用完整精确 ref 路径，旧 Node 缺口只能降级。
-5. 与 `verify-bind-mount-identity` 的边界：其磁盘路径诊断、采样会话 `collector_epoch`/`observation_seq`、`measurement_status`/`measured_at`/`measurement_mount_path` 与本变更对象代际/action_ref 独立；本变更不修改该协议、不推进其采样会话，pause/unpause 不冒充新的磁盘路径/测量身份。验收时保留其原有契约测试，不做跨字段映射；runtime DockerID、ready_identity、action_ref 和对象防旧写不在本次修正范围。
+4. 与 Ctrl 的边界：本仓不修改 Ctrl，也不新增必需 wire 字段。Node 提供可选 action_ref/last_action；Ctrl 长期资格继续按既有业务事实执行静态守卫，不新增动作绑定或表字段。软失败只提供动作诊断，不写容器 failed。普通 unpause accepted 后立即授宽限仍是 Ctrl 遗留行为。
+5. 与 `verify-bind-mount-identity` 的边界：其业务路径校正与磁盘测量独立于本变更对象代际/action_ref；本变更不修改该契约，不用运行态动作冒充磁盘采样，不要求 Ctrl 新增磁盘列或诊断持久化。验收遵从 verify-bind 当前提案，不预设采样会话结构；runtime DockerID、ready_identity、action_ref 和对象防旧写保留。
 6. 观察窗口内核对：动作 accepted→confirmed、对账旧对象不回退、重复 unpause 幂等、pause 失败+online+last_action.failed、旧 ref 晚到、ACK/WSS 早到、Node 重启 last_action=null、dead/created/sshd 硬阻塞、unknown/collect_error 和冷启动恢复。回滚时回滚 Node 代码并重启服务；内存动作状态随重启清空，不单独回滚 Ctrl 防护或 prevent 基础；旧 Ctrl 仍按既有状态语义工作。
 
 ## Verification Strategy
