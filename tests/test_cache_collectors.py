@@ -24,6 +24,14 @@ from FuxiYu_NodeKernel.network import wss
 from .runtime_fakes import FakeRuntimeContainer, install_runtime, not_found
 
 
+def _seed_online(cache, name="c1", container=None):
+    """用真实观察票发布 seed 运行态，避免测试走旧直写口。"""
+    container = container or FakeRuntimeContainer(name, status="running")
+    ticket = cache.issue_observation(name, "test-seed")
+    assert cache.publish_observed(name, ticket, fact_from_container(container), mark_ready=True)
+    return container
+
+
 class _FakeCtrlLink:
     """Ctrl 拨入侧的最小替身：记录 accept / close / 发出的帧。
 
@@ -158,13 +166,16 @@ def test_status_cache_applies_events_pending_ready_and_deleted(monkeypatch):
 
     cache._apply_event({"Action": "start", "Actor": {"Attributes": {"name": "c1"}}})
     assert cache.get_state("c1")["status"] == "starting"
-    cache.update("c1", "online")
+    _seed_online(cache)
 
     cache.begin_action("c1", "restart", "stopping")
     assert cache.get_state("c1")["source"] == "pending"
     assert cache.get_state("c1")["status"] == "stopping"
 
     cache.finish_action("c1", "online")
+    # 旧 finish 不再回写运行态；运行态由新鲜事实 + 观察票发布。
+    ticket = cache.issue_observation("c1", "legacy-finish-runtime")
+    assert cache.publish_observed("c1", ticket, fact_from_container(c1), mark_ready=True)
     assert cache.get_state("c1")["source"] == "cache"
     assert cache.get_state("c1")["status"] == "online"
 
@@ -308,7 +319,7 @@ def test_status_cache_snapshot_includes_runtime_metrics(monkeypatch):
 def test_status_cache_noise_events_never_touch_cache():
     # 数据通路对账契约 C2：噪声事件（attach/top/exec_*/resize/...）绝不落缓存
     cache = ContainerStatusCache()
-    cache.update("c1", "online")
+    _seed_online(cache)
     for ev in ["attach", "top", "exec_start", "exec_detach", "resize", "copy", "health_status", "update"]:
         cache._apply_event({"status": ev, "Actor": {"Attributes": {"name": "c1"}}})
     assert cache.get_state("c1")["status"] == "online"
@@ -317,7 +328,7 @@ def test_status_cache_noise_events_never_touch_cache():
 def test_status_cache_unrecognized_event_ignored_without_pollution():
     # 数据通路对账契约 C2：不可识别事件 → 忽略（unknown 不再回填缓存）
     cache = ContainerStatusCache()
-    cache.update("c1", "online")
+    _seed_online(cache)
     cache._apply_event({"status": "some_future_event", "Actor": {"Attributes": {"name": "c1"}}})
     assert cache.get_state("c1")["status"] == "online"
 
@@ -491,7 +502,7 @@ def test_status_cache_state_events_still_update_cache(monkeypatch):
     cache = ContainerStatusCache()
     container = _Container("c1", status="running")
     install_runtime(monkeypatch, [container])
-    cache.update("c1", "online")
+    _seed_online(cache, container=container)
     container.status = "exited"
     container.attrs["State"]["Status"] = "exited"
     container.attrs["State"]["Running"] = False

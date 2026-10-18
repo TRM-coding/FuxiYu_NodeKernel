@@ -208,6 +208,9 @@ def test_mixed_version_missing_optional_fields_and_restart_epoch():
     old_ctrl = ContainerStatusResponse(**old_ctrl_visible, last_action=None)
     assert old_ctrl.model_dump()["last_action"] is None
     assert old_ctrl.model_dump()["container_status"] == ContainerStatus.ONLINE.value
+    # 状态查询不是动作受理响应，不输出恒为 null 的 action_ref。
+    assert "action_ref" not in ContainerStatusResponse.model_fields
+    assert "action_ref" not in old_ctrl.model_dump()
 
     accepted = ContainerOperationAcceptedResponse(
         success=1,

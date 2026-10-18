@@ -986,6 +986,127 @@ def test_hard_block_classification_is_bounded(monkeypatch):
     assert cache.get_state("sshd")["status"] == ContainerStatus.ONLINE.value
 
 
+def test_hard_block_invalidates_ready_and_pause_does_not_clear_it():
+    """硬阻塞成立后，旧 ready 不能放行 running；暂停也不证明故障消失。"""
+    cache = ContainerStatusCache()
+    container = FakeRuntimeContainer("c1", status="running", docker_id="A")
+    _seed_online(cache, "c1", container)
+    assert cache.get("c1")["ready_verified"] is True
+
+    cache.set_hard_block("c1", "sshd_not_installed", "missing")
+    entry = cache.get("c1")
+    assert entry["ready_verified"] is False
+    assert "ready_identity" not in entry
+
+    # 同一进程的 running 事实不能凭旧 ready 清除硬阻塞。
+    _publish(cache, "c1", container)
+    state = cache.get_state("c1")
+    assert state["status"] == ContainerStatus.FAILED.value
+    assert state["failed_reason"] == "sshd_not_installed"
+
+    # paused 是真实事实，但不是 sshd 已修复的证据；硬阻塞必须保留。
+    paused = FakeRuntimeContainer("c1", status="paused", docker_id="A")
+    _publish(cache, "c1", paused)
+    state = cache.get_state("c1")
+    assert state["status"] == ContainerStatus.FAILED.value
+    assert state["failed_reason"] == "sshd_not_installed"
+    assert cache.get("c1")["hard_block"] is True
+
+    # unpause 后 running 仍须通过 probe，而非直接 online。
+    _publish(cache, "c1", container)
+    assert cache.get_state("c1")["status"] == ContainerStatus.FAILED.value
+
+
+def test_create_pending_created_fact_is_not_hard_blocked_until_create_finishes():
+    cache = ContainerStatusCache()
+    ref = cache.accept_action("c1", "create", "creating", create=True)
+    created = FakeRuntimeContainer("c1", status="created")
+    ticket = cache.issue_observation(
+        "c1",
+        "create",
+        generation=ref["generation"],
+        action_seq=ref["seq"],
+        from_create_confirmation=True,
+    )
+    assert cache.publish_observed("c1", ticket, fact_from_container(created)) is True
+
+    during = cache.get_state("c1")
+    assert during["status"] == ContainerStatus.CREATING.value
+    assert during.get("failed_reason") is None
+    assert cache.get("c1").get("hard_block") is not True
+    assert cache.get("c1")["docker_id"] == created.id
+
+    # create 结束后对象仍停在 created，才形成半成品硬阻塞。
+    assert cache.finish_action_ref({**ref, "name": "c1"}, "confirmed") is True
+    after = cache.get_state("c1")
+    assert after["status"] == ContainerStatus.FAILED.value
+    assert after["failed_reason"] == "created_half_built"
+    assert cache.get("c1")["hard_block"] is True
+
+
+def test_create_superseded_by_non_create_releases_pending_when_create_finishes():
+    cache = ContainerStatusCache()
+    create_ref = cache.accept_action("c1", "create", "creating", create=True)
+    start_ref = cache.accept_action("c1", "start", "starting")
+    assert cache._meta_for("c1")["create_pending"] is True
+    assert cache.get_state("c1")["last_action"]["ref"] == start_ref
+
+    # 原 create 后台意图晚到：phase 保持 superseded，但名称所有权必须释放。
+    assert cache.finish_action_ref({**create_ref, "name": "c1"}, "confirmed") is False
+
+    meta = cache._meta_for("c1")
+    assert meta["create_pending"] is False
+    assert meta["last_action"].ref == start_ref
+    assert cache._meta_for("c1")["actions"][cache._action_key(create_ref)].phase == "superseded"
+
+
+def test_legacy_finish_action_without_current_action_cannot_write_runtime():
+    cache = ContainerStatusCache()
+    container = FakeRuntimeContainer("c1", status="running")
+    _seed_online(cache, "c1", container)
+    ref = cache.accept_action("c1", "pause", "pausing")
+    assert _finish(cache, "c1", ref, "failed", "docker_api_error")
+
+    cache.finish_action("c1", "offline")
+
+    state = cache.get_state("c1")
+    assert state["status"] == ContainerStatus.ONLINE.value
+    assert state["last_action"]["phase"] == "failed"
+    assert cache.get("c1")["status"] == ContainerStatus.ONLINE.value
+
+
+def test_legacy_finish_action_with_current_action_does_not_write_runtime():
+    cache = ContainerStatusCache()
+    container = FakeRuntimeContainer("c1", status="running")
+    _seed_online(cache, "c1", container)
+    cache.begin_action("c1", "pause", "pausing")
+
+    cache.finish_action("c1", "offline")
+
+    state = cache.get_state("c1")
+    assert state["status"] == ContainerStatus.ONLINE.value
+    assert state["last_action"]["phase"] == "confirmed"
+    assert cache.get("c1")["status"] == ContainerStatus.ONLINE.value
+
+
+def test_inconsistent_failed_without_allowed_reason_is_unknown_without_reason_as_last_known():
+    cache = ContainerStatusCache()
+    # 模拟旧采集落下的非法 failed 条目；读面不得把原因当状态值。
+    with cache._lock:
+        cache._cache["c1"] = {
+            "status": ContainerStatus.FAILED.value,
+            "hard_block": True,
+            "failed_reason": "legacy_failed",
+        }
+
+    state = cache.get_state("c1")
+    assert state["status"] == ContainerStatus.UNKNOWN.value
+    assert state["status_source"] == "inconsistent_failed"
+    assert state.get("last_known_status") is None
+    assert state["failed_reason"] is None
+    assert state["error_reason"] is None
+
+
 def test_probe_success_clears_sshd_hard_block_only_after_same_process_confirmation(monkeypatch):
     cache = ContainerStatusCache()
     container = FakeRuntimeContainer("c1", status="running", docker_id="A")

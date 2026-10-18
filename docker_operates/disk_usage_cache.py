@@ -205,7 +205,10 @@ class DiskUsageCache:
         if "Mounts" not in attrs:
             return result("unresolved", existing, reason="mounts_unreadable", pid=state.get("Pid"))
 
-        mounts = attrs.get("Mounts") or []
+        mounts = attrs.get("Mounts")
+        if not isinstance(mounts, list) or any(not isinstance(mount, dict) for mount in mounts):
+            # Mounts 存在但不可读/形状损坏时不能推断 no_bind，只保留诊断。
+            return result("unresolved", existing, reason="mounts_unreadable", pid=state.get("Pid"))
         root_bind = None
         for mount in mounts:
             if mount.get("Destination") == "/root" and mount.get("Type") == "bind":

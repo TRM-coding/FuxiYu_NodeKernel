@@ -464,6 +464,42 @@ def test_lightweight_path_diagnostic_updates_snapshot_without_touching_measureme
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.parametrize(
+    "bad_mounts",
+    [
+        None,
+        "not-a-list",
+        [None],
+        [[]],
+    ],
+)
+def test_unreadable_mounts_are_unresolved_not_no_bind(tmp_path, monkeypatch, bad_mounts):
+    base = _base(tmp_path, monkeypatch)
+    existing = base / "admin" / "containers" / "c1"
+    existing.mkdir()
+    cache = DiskUsageCache()
+    cache._path_state["c1"] = {
+        "bind_mount_path": str(existing),
+        "last_confirmed_path": str(existing),
+        "source_path": str(existing),
+        "check_seq": 0,
+        "path_version": 0,
+    }
+    container = FakeRuntimeContainer("c1", status="running", mounts=_mount(existing))
+    container.attrs["Mounts"] = bad_mounts
+
+    result = cache.verify_mount_path(
+        "c1",
+        container=container,
+        client=FakeRuntimeClient([container]),
+    )
+
+    assert result["status"] == "unresolved"
+    assert result["reason"] == "mounts_unreadable"
+    assert result["bind_mount_path"] == str(existing)
+    assert cache._path_state["c1"]["bind_mount_path"] == str(existing)
+
+
 def test_measurement_uses_business_path_and_earlier_component_time(tmp_path, monkeypatch):
     base = _base(tmp_path, monkeypatch)
     actual = base / "admin" / "containers" / "c1"

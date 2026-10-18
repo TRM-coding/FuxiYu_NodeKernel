@@ -92,6 +92,24 @@ def test_create_acceptance_cancels_queued_delete_candidate():
     assert cache.get_state("c1")["last_action"]["ref"] == ref
 
 
+def test_delete_candidates_are_held_while_collect_error_is_set(monkeypatch):
+    cache = ContainerStatusCache()
+    install_runtime(monkeypatch, [])
+    with cache._lock:
+        cache._deleted = [{"name": "gone", "generation": 0}]
+        cache._collect_error = "collect_failed"
+
+    assert cache.take_confirmed_deleted() == []
+    assert cache._deleted == [{"name": "gone", "generation": 0}]
+
+    with cache._lock:
+        cache._collect_error = None
+    monkeypatch.setattr(cache, "_confirm_absent", lambda name, client: True)
+
+    assert cache.take_confirmed_deleted() == ["gone"]
+    assert cache._deleted == []
+
+
 def test_docker_still_exists_keeps_cache_and_does_not_queue(monkeypatch):
     cache = ContainerStatusCache()
     known = FakeRuntimeContainer("c1", status="running")

@@ -415,6 +415,13 @@ class ContainerStatusCache:
             entry["ready_verified"] = False
             entry.pop("ready_identity", None)
 
+    def _create_transition_locked(self, name: str) -> str:
+        """create pending 时对外仍展示受理时的 building/creating 过渡。"""
+        current = self._meta_for(name).get("current_action")
+        if current is not None and current.action == "create" and not current.terminal:
+            return current.transition
+        return ContainerStatus.CREATING.value
+
     def _set_unknown_locked(
         self,
         name: str,
@@ -487,12 +494,20 @@ class ContainerStatusCache:
         hard_block = old.get("hard_block") is True and old.get("failed_reason") in HARD_BLOCK_REASONS
 
         if fact.paused:
-            entry["status"] = ContainerStatus.PAUSED.value
-            entry.pop("failed_reason", None)
-            entry.pop("failed_detail", None)
-            entry.pop("hard_block", None)
             entry.pop("ready_check", None)
-            # pause 保留同一进程的就绪证明
+            if hard_block:
+                # 已证实的硬阻塞不因暂停事实自动解除；保留到门禁通过/新代/删除。
+                # 暂停不提供 sshd/created/dead 条件消失的证据。
+                entry["status"] = ContainerStatus.FAILED.value
+                entry["hard_block"] = True
+                entry["ready_verified"] = False
+                entry.pop("ready_identity", None)
+            else:
+                entry["status"] = ContainerStatus.PAUSED.value
+                entry.pop("failed_reason", None)
+                entry.pop("failed_detail", None)
+                entry.pop("hard_block", None)
+                # pause 保留同一进程的就绪证明
         elif fact.dead:
             entry["status"] = ContainerStatus.FAILED.value
             entry["hard_block"] = True
@@ -500,11 +515,22 @@ class ContainerStatusCache:
             entry["failed_detail"] = fact.error
             entry.pop("ready_check", None)
         elif fact.status == "created":
-            entry["status"] = ContainerStatus.FAILED.value
-            entry["hard_block"] = True
-            entry["failed_reason"] = "created_half_built"
-            entry["failed_detail"] = "container object exists in docker 'created' state"
-            entry.pop("ready_check", None)
+            if self._meta_for(name).get("create_pending"):
+                # 创建仍在进行时，created 只是尚未 start 的中间态；不能提前
+                # 抢先形成硬阻塞（否则读面会在合法 create 期间显示 failed）。
+                entry["status"] = self._create_transition_locked(name)
+                entry["ready_verified"] = False
+                entry.pop("ready_identity", None)
+                entry.pop("ready_check", None)
+                entry.pop("hard_block", None)
+                entry.pop("failed_reason", None)
+                entry.pop("failed_detail", None)
+            else:
+                entry["status"] = ContainerStatus.FAILED.value
+                entry["hard_block"] = True
+                entry["failed_reason"] = "created_half_built"
+                entry["failed_detail"] = "container object exists in docker 'created' state"
+                entry.pop("ready_check", None)
         elif fact.restarting:
             entry["status"] = ContainerStatus.RESTARTING.value
             entry["ready_check"] = True
@@ -752,16 +778,23 @@ class ContainerStatusCache:
                     raw_status = ContainerStatus.UNKNOWN.value
                     status_source = "inconsistent_failed"
                     unknown_since = unknown_since or runtime.get("updated_at")
-                    last_known = last_known or runtime.get("failed_reason")
+                    # failed_reason 不是状态值；不得写进 last_known_status。
+                    last_known = last_known if last_known in {
+                        ContainerStatus.ONLINE.value,
+                        ContainerStatus.OFFLINE.value,
+                        ContainerStatus.PAUSED.value,
+                        ContainerStatus.STARTING.value,
+                        ContainerStatus.RESTARTING.value,
+                    } else None
             result = {
                 "source": "cache",
                 "status": raw_status,
-                "failed_reason": runtime.get("failed_reason"),
-                "failed_detail": runtime.get("failed_detail"),
+                "failed_reason": runtime.get("failed_reason") if raw_status == ContainerStatus.FAILED.value else None,
+                "failed_detail": runtime.get("failed_detail") if raw_status == ContainerStatus.FAILED.value else None,
                 "runtime_metrics": runtime.get("runtime_metrics"),
                 "port": runtime.get("port"),
                 "port_mappings": runtime.get("port_mappings"),
-                "error_reason": runtime.get("failed_reason"),
+                "error_reason": runtime.get("failed_reason") if raw_status == ContainerStatus.FAILED.value else None,
                 "cache_updated_at": runtime.get("updated_at"),
                 "last_action": last_action,
             }
@@ -1193,6 +1226,23 @@ class ContainerStatusCache:
                 phase = "failed"
                 error_reason = error_reason or "invalid_phase"
             if record.terminal:
+                # create 被同代新动作取代后，原 record 已是终态；但其后台 Docker
+                # 意图仍会跑完。跑完后必须释放 create 对名称的 pending 所有权，
+                # 否则后续观察永远无法绑定/换代，删除候选也被永久挡住。
+                if (
+                    record.action == "create"
+                    and record.from_create
+                    and pure.get("generation") == meta.get("generation")
+                    and meta.get("create_pending")
+                ):
+                    current = meta.get("current_action")
+                    if current is None or current.ref != pure:
+                        meta["create_pending"] = False
+                        logger.info(
+                            "status-cache create ownership released after terminal create: name=%s ref=%s",
+                            name,
+                            pure,
+                        )
                 if phase in NON_TERMINAL_PHASES:
                     logger.info(
                         "status-cache finish ignored: terminal not regressed name=%s ref=%s phase=%s current=%s",
@@ -1225,13 +1275,21 @@ class ContainerStatusCache:
                 self._pending.pop(name, None)
                 if record.from_create:
                     meta["create_pending"] = False
-                if record.action == "create" and phase == "failed":
+                if record.action == "create" and phase in {"confirmed", "idempotent_confirmed", "failed"}:
                     runtime = self._cache.get(name) or {}
-                    if runtime.get("status") in (ContainerStatus.BUILDING.value, ContainerStatus.CREATING.value) \
-                            and not runtime.get("docker_id"):
-                        self._set_unknown_locked(name, "create_failed", reason=error_reason)
-                        runtime = self._cache.get(name) or {}
-                        runtime.pop("last_known_status", None)
+                    if runtime.get("status") in (ContainerStatus.BUILDING.value, ContainerStatus.CREATING.value):
+                        if runtime.get("docker_id"):
+                            # create 结束时 Docker 对象仍停在 created（没有运行进程）：
+                            # 此时才形成半成品硬阻塞。创建进行中不提前阻塞。
+                            self.set_hard_block(
+                                name,
+                                "created_half_built",
+                                "container object remains in docker 'created' state after create finished",
+                            )
+                        elif phase == "failed":
+                            self._set_unknown_locked(name, "create_failed", reason=error_reason)
+                            runtime = self._cache.get(name) or {}
+                            runtime.pop("last_known_status", None)
             logger.info(
                 "status-cache finish_action: name=%s action=%s ref=%s phase=%s reason=%s",
                 name,
@@ -1242,10 +1300,10 @@ class ContainerStatusCache:
             )
             return True
 
-    def begin_action(self, name: str, action: str, ing_status: str) -> None:
-        """兼容旧调用：受理一个不自动执行的过渡动作。"""
+    def begin_action(self, name: str, action: str, ing_status: str) -> dict:
+        """兼容旧调用：受理一个不自动执行的过渡动作，返回 action_ref。"""
         with self._lock:
-            self._build_action_locked(name, action, ing_status, create=(action == "create"))
+            return dict(self._build_action_locked(name, action, ing_status, create=(action == "create")).ref)
 
     def finish_action(
         self,
@@ -1254,22 +1312,28 @@ class ContainerStatusCache:
         failed_reason: str | None = None,
         failed_detail: str | None = None,
     ) -> None:
-        """兼容旧调用：只更新动作诊断；非 failed 的终态按旧语义回填运行态。"""
+        """兼容旧调用：只终结当前动作，绝不直接回写运行态。
+
+        生产动作走 ``submit_action`` + 观察票发布；运行态只能由新鲜 Docker
+        事实经 ``publish_observed`` 写入。``status`` 仅用于兼容签名和失败相位
+        识别，不再被当作运行态事实。
+        """
         with self._lock:
             meta = self._meta_for(name)
             record = meta.get("current_action")
-            ref = ({**dict(record.ref), "name": name} if record is not None else None)
-            if status == ContainerStatus.FAILED.value:
-                if ref:
-                    self.finish_action_ref(ref, "failed", failed_reason)
+            if record is None:
+                logger.warning("status-cache finish_action ignored: no current action name=%s", name)
                 return
-            if status is None:
-                if ref:
-                    self.finish_action_ref(ref, "confirmed", failed_reason)
+            ref = {**dict(record.ref), "name": name}
+            phase = "failed" if status == ContainerStatus.FAILED.value else "confirmed"
+            if not self.finish_action_ref(ref, phase, failed_reason):
+                logger.warning("status-cache finish_action ignored: stale action name=%s ref=%s", name, ref)
                 return
-            if ref:
-                self.finish_action_ref(ref, "confirmed", failed_reason)
-        self.update(name, status)
+            logger.info(
+                "status-cache finish_action compat: name=%s phase=%s (runtime not written)",
+                name,
+                phase,
+            )
 
     def clear_pending(self, name: str) -> None:
         with self._lock:
@@ -1432,46 +1496,11 @@ class ContainerStatusCache:
             )
             entry.pop("ready_check", None)
             self._cache[name] = entry
+            # 硬阻塞成立后，旧的 ready 证明不能成为后续 running 事实直接
+            # 解除阻塞的旁路；必须重新通过 probe/门禁。
+            self._invalidate_ready_locked(name)
         logger.warning("status-cache hard block: name=%s reason=%s detail=%s", name, reason, detail)
         return True
-
-    # ------------------------------------------------------------------
-    # 兼容采集回填口（生产采集路径走 issue/publish）
-    # ------------------------------------------------------------------
-    def update(
-        self,
-        name: str,
-        status: str,
-        runtime_metrics: dict | None = None,
-        attrs: dict | None = None,
-    ) -> None:
-        with self._lock:
-            old_entry = self._cache.get(name, {})
-            old = old_entry.get("status")
-            entry = {
-                "status": status,
-                "updated_at": _utc_iso(),
-            }
-            for key in ("docker_id", "ready_verified", "ready_identity", "port", "port_mappings"):
-                if old_entry.get(key) is not None:
-                    entry[key] = old_entry[key]
-            if status == ContainerStatus.FAILED.value:
-                entry["hard_block"] = True
-                entry["failed_reason"] = old_entry.get("failed_reason") or "legacy_failed"
-            else:
-                entry.pop("hard_block", None)
-            if runtime_metrics is not None:
-                entry["runtime_metrics"] = runtime_metrics
-            elif old_entry.get("runtime_metrics") is not None:
-                entry["runtime_metrics"] = old_entry.get("runtime_metrics")
-            if attrs is not None:
-                port, port_mappings = extract_port_info(attrs)
-                if port is not None:
-                    entry["port"] = port
-                entry["port_mappings"] = port_mappings
-            self._cache[name] = entry
-        if old != status:
-            logger.info("status-cache update: name=%s %s -> %s", name, old, status)
 
     def set_port_info(
         self,
@@ -1696,8 +1725,20 @@ class ContainerStatusCache:
         return items
 
     def take_confirmed_deleted(self) -> list[str]:
-        """WSS 发送前：代际复核 + Docker 单容器再次确认，只有明确 NotFound 才发送。"""
-        candidates = self.take_delete_candidates()
+        """WSS 发送前：代际复核 + Docker 单容器再次确认，只有明确 NotFound 才发送。
+
+        本轮 Docker 采集已失败时不得发送删除帧；候选保留在内部队列，等下一次
+        成功对账后再确认。这里与 ``_collect_error`` 在同一锁内判断/取出，避免
+        采集错误刚置位时把候选取走。
+        """
+        with self._lock:
+            if self._collect_error:
+                logger.warning(
+                    "status-cache delete candidates held: collect_error=%s",
+                    self._collect_error,
+                )
+                return []
+            candidates, self._deleted = self._deleted, []
         confirmed: list[str] = []
         retry: list[dict] = []
         if not candidates:

@@ -116,7 +116,11 @@ class ContainerStatusMessage(BaseModel):
     config: ContainerNameConfig
 
 
-class ContainerStatusResponse(ContainerOperationAcceptedResponse):
+class ContainerStatusResponse(SuccessResponse):
+    # 状态查询不是动作受理响应：不继承 action_ref，避免在每帧状态里输出
+    # 恒为 null 的动作引用字段。
+    container_status: ContainerStatus
+    container_name: str
     cache_updated_at: str | None = None
     error: str | None = None
     error_reason: str | None = None
