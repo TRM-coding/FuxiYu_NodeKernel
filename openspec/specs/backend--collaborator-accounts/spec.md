@@ -324,4 +324,4 @@ Node SHALL 通过 Pydantic 模型处理此对象，保留嵌套类型、继承�
 - [schemas/container.py](../../../schemas/container.py)
 - [services/container_service.py](../../../services/container_service.py)
 - [network/api.py](../../../network/api.py)
-- [tests/](../../../tests/)：Linux 安全默认套件 152 passed、11 deselected；未运行 Docker 集成测试。
+- [tests/](../../../tests/)：默认套件 331 passed, 1 skipped, 16 deselected, 24 subtests passed；Docker 分项：旧用例 10 passed + 1 skipped、本变更专项 4 passed + 1 skipped；未合并重跑全量 `-m docker`。

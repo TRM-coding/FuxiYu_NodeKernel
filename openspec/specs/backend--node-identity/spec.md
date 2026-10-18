@@ -95,4 +95,4 @@ Node SHALL 保持以下线路形状及数据来源：响应包含 uid（可空�
 ## Source references
 
 - [network/wss.py](../../../network/wss.py)
-- [tests/](../../../tests/)：Linux 安全默认套件 152 passed、11 deselected；未运行 Docker 集成测试。
+- [tests/](../../../tests/)：默认套件 331 passed, 1 skipped, 16 deselected, 24 subtests passed；Docker 分项：旧用例 10 passed + 1 skipped、本变更专项 4 passed + 1 skipped；未合并重跑全量 `-m docker`。

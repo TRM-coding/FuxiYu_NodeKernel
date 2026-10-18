@@ -1,15 +1,17 @@
 # Node 本地验收、部署顺序与回滚清单（2026-10-18）
 
-本清单覆盖本仓三个 OpenSpec change 的**本地隔离实现与测试**：
+本清单覆盖本仓三个 OpenSpec change 的**本地隔离实现、测试、主规格同步与归档**：
 
 - `prevent-false-container-vanished`
 - `guard-runtime-state-reconciliation`
 - `verify-bind-mount-identity`
 
-本阶段没有执行 SSH、生产操作、部署、push、archive 或正式
-`openspec/specs/` 同步；没有修改 Ctrl/Web/Global/skills，也没有修改
+三个 change 已同步到 `openspec/specs/` 并归档到
+`openspec/changes/archive/2026-10-18-*`；没有执行 SSH、生产操作、部署或
+push，没有修改 Ctrl/Web/Global/skills，也没有修改
 `.git/aborted-implementation-20261018/` 备份。本文是本地验收与发布顺序
-核对记录，**不是生产联调通过证明，也不表示已经上线**。
+核对记录，**不是生产联调通过证明，也不表示已经上线**。归档警告：
+`prevent 3.2` 的生产部署/回滚演练仍未执行。
 
 ## 1. 当前线路边界
 
@@ -117,11 +119,13 @@ git diff --check
 ## 3. 发布顺序（本地清单核对，未执行）
 
 1. **Ctrl 消失防护先落地**：Ctrl `guard-container-vanish-deletion` 的本地
-   快照为 HEAD `5099cc1`、tasks 5/6、`openspec validate --strict` 通过；
+   快照为 HEAD `d2ba7be`、tasks 6/6、`openspec validate --strict` 通过；
    `test/container/test_vanish_guard.py` 覆盖快照缺席待核实、显式 delete
    帧、旧帧晚于同名新建、跨机同名、unknown/过渡保留、成功状态清除标记。
-   该变更余 3.1 为与 Node prevent 的跨仓联合验收，尚未完成。**本地代码
-   存在不等于已部署。**
+   `test/container/test_cross_repo_protocol_replay.py` 使用实际 Node 帧构造器
+   + Ctrl 隔离 SQLite 回放，日志 `crossrepo-2.log` 为 13 passed，覆盖
+   prevent 3.1 的 creating/snapshot_missing/collect_error/delete+snapshot
+   以及磁盘 payload。**这是本地只读联合验收，不等于已部署。**
 2. **Node prevent 基础**：先启用创建可见过渡态、共享本地代际、对账观察边界、
    Docker 单容器存在性再确认、删除候选代际和 `Action`/`status` 事件归一化。
 3. **Node guard**：再启用动作序号、读取前 observation ticket/CAS、
@@ -158,14 +162,11 @@ git diff --check
 
 | 项 | 当前状态 | 原因 |
 | --- | --- | --- |
-| prevent 3.1 与 Ctrl `guard-container-vanish-deletion` 快照缺席用例联合验收 | Node 侧时序/删除候选测试完成；Ctrl 侧本地 guard 测试 5/6 | Ctrl 变更余 3.1 联合验收，未做跨仓联合运行 |
 | prevent 3.2 实际部署顺序与旧 Node 名称线索验证/生产回滚演练 | 本文记录顺序与回滚，本地模拟完成 | 没有 Ctrl 部署权限与生产环境，未 SSH/部署 |
 | guard 6.5 真实 dead 容器集成 | 4 项真实 Docker 通过；dead 显式 skip | 不能安全制造 dead 状态；dead 映射由单元测试覆盖，未伪造通过 |
-| Ctrl 对磁盘新字段的接收/落库 | 仅本地独立夹具 | 不修改 Ctrl，未做跨仓联调 |
-| Ctrl `guard-container-vanish-deletion` 3.1 联合验收 | Ctrl 本地 5/6 | 与 prevent 3.1 同一跨仓项 |
 | 旧 `test_create_container::test_happy_path` 真实 Docker 运行 | 1 skipped（环境前置） | 本机没有带 `/usr/sbin/sshd` 的 `NODE_TEST_IMAGE`；设置后可运行完整断言，未把行为失败改 skip |
 
-本地 Ctrl 夹具只验证字段语义，不是 Ctrl 实现，也不是端到端生产验收。
+本地跨仓回放不等于生产联调；Ctrl 磁盘消费和消失防护仍未有生产部署证据。
 guard 7.1 只完成发布清单/依赖核对，不是部署或上线证明。
 
 ## 6. 本轮复审与修复（本地已验证）
@@ -195,3 +196,16 @@ guard 7.1 只完成发布清单/依赖核对，不是部署或上线证明。
   清理 `containers.run` 返回的 Docker ID；不再为先删同名容器而清理既有对象。
   旧状态缓存 fixture 的固定名称/pre-delete 与无界 apt 等待也已按同一规则
   修正；镜像/daemon/apt 环境缺失才 skip，行为断言失败不会被 skip 吞掉。
+
+## 7. 主规格同步与归档
+
+- 同步到主规格：`backend--container-creation`、`backend--container-lifecycle`、
+  `backend--wss-snapshots`、`backend--storage-and-mounts`；共新增 27 个
+  requirement、修改 7 个 requirement、新增 135 个 scenario 块。
+- 归档路径：
+  - `openspec/changes/archive/2026-10-18-guard-runtime-state-reconciliation`
+  - `openspec/changes/archive/2026-10-18-prevent-false-container-vanished`
+  - `openspec/changes/archive/2026-10-18-verify-bind-mount-identity`
+- 归档时 `prevent-false-container-vanished` 仍余 3.2 未完成：生产部署顺序、
+  旧 Node 名称线索验证与生产回滚演练未执行；不勾选，生产发布清单留待后续。
+- 本阶段没有 archive 之后的部署或生产验证。

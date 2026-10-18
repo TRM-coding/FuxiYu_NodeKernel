@@ -13,8 +13,10 @@
 
 ## 3. 跨路径回归
 
-- [ ] 3.1 用 jyz/test2 等价时序的模拟：Docker 创建成功、慢速逐容器采集、缓存回填及 WSS 推送交错，验证不产生误删帧，真实外部删除仍产生一次删帧；与 Ctrl `guard-container-vanish-deletion` 的快照缺席用例联合验收，运行 Node 安全默认测试套件并记录结果。
+- [x] 3.1 用 jyz/test2 等价时序的模拟：Docker 创建成功、慢速逐容器采集、缓存回填及 WSS 推送交错，验证不产生误删帧，真实外部删除仍产生一次删帧；与 Ctrl `guard-container-vanish-deletion` 的快照缺席用例联合验收，运行 Node 安全默认测试套件并记录结果。（本地只读联合验收：Ctrl `d2ba7be` 的 `test/container/test_cross_repo_protocol_replay.py` 使用实际 Node 帧构造器 + Ctrl SQLite 回放，日志 `crossrepo-2.log` 为 13 passed；覆盖 creating、snapshot_missing、collect_error、delete+snapshot、磁盘 payload。未部署。）
 - [ ] 3.2 核对部署顺序与回滚：先部署 Ctrl `guard-container-vanish-deletion` 防护，再用旧 Node 名称线索验证 Ctrl 只标待核实、不软删；随后部署 Node 对账修复。与 `guard-runtime-state-reconciliation` 联合验收事件运行态唯一入口，确保事件只触发新鲜 inspect、不与旧直写路径双写。回滚 Node 时保留 Ctrl 防护，不单独回滚 Ctrl。
+
+> 归档警告：3.2 的生产部署顺序、旧 Node 名称线索验证与生产回滚演练**未执行**；本阶段只有本地清单和跨仓本地回放，不表示已上线。生产发布仍按 `docs/rollout-rollback-checklist.md` 后续执行。
 
 ## Workflow follow-up
 

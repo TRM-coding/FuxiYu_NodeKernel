@@ -72,12 +72,17 @@ Node SHALL 通过 Pydantic 模型处理此对象，保留嵌套类型、继承�
 
 字段与成员见文末同名数据附录。
 
-系统 SHALL 保持以下已实现的职责：仅表示创建已受理，状态为 building 或 creating；端口和挂载路径稍后由快照同步，成功受理不等同容器已 online。
+系统 SHALL 保持以下已实现的职责：仅表示创建已受理，状态为 building 或 creating；端口和挂载路径稍后由快照同步，成功受理不等同容器已 online。新增可选 `action_ref: ActionRef | None`，新 Node 对成功受理的创建 MUST 在响应前分配并输出，旧 Node 可以缺失。
 
 #### Scenario: 字段校验与缺省值
 
 - **WHEN** 消费者构造该模型且提供有效必填字段
 - **THEN** 模型采用声明的缺省值并保持继承字段；违反类型或 Field 边界的输入不作为有效实例
+
+#### Scenario: 创建受理返回动作引用
+
+- **WHEN** 创建请求已被受理并返回 building/creating
+- **THEN** 响应包含本进程分配的 `action_ref`，其 generation 与本次 create 使用的对象代际一致，seq 为同代本地动作序号；旧 Node 缺字段时新 Ctrl 按缺失降级
 
 来源：[schemas/container.py](../../../schemas/container.py)。
 
@@ -247,6 +252,15 @@ Node SHALL 以 `image_build.image_tag` 作为本机 Docker 制品的缓存键：
 | `success` | `int \| bool` | `Field(default=1)` |
 | `container_status` | `Literal['building', 'creating']` | `必填` |
 | `container_name` | `str` | `必填` |
+| `action_ref` | `ActionRef \| None` | `None`；新 Node 成功受理时输出，旧 Node 可缺省 |
+
+### ActionRef 数据契约 [schemas/container.py]
+
+| 字段/成员 | 类型或值 | 默认值/约束 |
+| --- | --- | --- |
+| `node_epoch` | `str` | `必填` |
+| `generation` | `int` | `Field(ge=0)` |
+| `seq` | `int` | `Field(ge=0)` |
 
 ### Container.Config_info 数据契约 [utils/Container.py]
 
@@ -276,4 +290,4 @@ Node SHALL 以 `image_build.image_tag` 作为本机 Docker 制品的缓存键：
 - [services/container_service.py](../../../services/container_service.py)
 - [network/api.py](../../../network/api.py)
 - [utils/Container.py](../../../utils/Container.py)
-- [tests/](../../../tests/)：Linux 安全默认套件 152 passed、11 deselected；未运行 Docker 集成测试。
+- [tests/](../../../tests/)：默认套件 331 passed, 1 skipped, 16 deselected, 24 subtests passed；Docker 分项：旧用例 10 passed + 1 skipped、本变更专项 4 passed + 1 skipped；未合并重跑全量 `-m docker`。

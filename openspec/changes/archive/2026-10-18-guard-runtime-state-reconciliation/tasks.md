@@ -49,7 +49,7 @@
 
 ## 7. 部署边界与联合验收
 
-- [x] 7.1 核对并记录部署前置：Ctrl `guard-container-vanish-deletion` 已落地、Node `prevent-false-container-vanished` 的共享代际/观察边界/事件归一化先落地，且事件运行态只经统一观察入口（不得新增直接按事件文本写运行态的路径）；用发布清单和依赖检查验证本变更不会单独部署在旧代际实现或双写事件路径上。（本地核对快照：Ctrl HEAD `5099cc1` 的 guard 变更 5/6 且 `openspec validate --strict` 通过，余 3.1 为跨仓联合验收；Node 仅 `_meta[].generation` 一套代际，事件只经 `_apply_event → issue_observation → _inspect_fact → publish_observed`。本项是发布清单核对，未部署、未上线；跨仓联合验收见 prevent 3.1。）
+- [x] 7.1 核对并记录部署前置：Ctrl `guard-container-vanish-deletion` 已落地、Node `prevent-false-container-vanished` 的共享代际/观察边界/事件归一化先落地，且事件运行态只经统一观察入口（不得新增直接按事件文本写运行态的路径）；用发布清单和依赖检查验证本变更不会单独部署在旧代际实现或双写事件路径上。（本地核对：Ctrl HEAD `d2ba7be` 的 guard 变更 6/6 且 `openspec validate --strict` 通过，`test_cross_repo_protocol_replay.py` 隔离 SQLite 回放 13 passed；Node 仅 `_meta[].generation` 一套代际，事件只经 `_apply_event → issue_observation → _inspect_fact → publish_observed`。本项是发布清单核对，未部署、未上线；跨仓联合验收见 prevent 3.1。）
 - [x] 7.2 做 prevent + gate 联合受控交错验收：创建 pending 与旧 delete、create 首次绑定与不同 ID deferred、同名 ID 更换、慢速 list/stats、旧读取延迟返回、start/create sshd 门禁、old failed pending 与 cold start；验证本变更不另造事件解析、事件只触发新鲜 inspect、不绕过门禁、不把 prevent 删除候选发到新代。
 - [x] 7.3 明确并验证 Ctrl 边界：Node 不修改 Ctrl 变更；长期资格静态守卫不依赖 action_ref、动作绑定或新增数据库字段；旧 Ctrl 可忽略可选字段并继续按既有运行态收敛。软失败不写容器 status=failed，但可通过 last_action.failed 诊断；不新增必需 wire 字段。
 - [x] 7.4 验证滚动/回滚：记录 Node 版本、node_epoch、动作序号、观察票和代际为进程内存状态、无 DB/WSS 迁移；用回滚演练验证重启后 node_epoch 更换、last_action=null、旧 ref 失效、冷启动重建，旧 Ctrl 仍按既有状态语义工作，回滚不单独撤回 Ctrl 消失防护或 prevent 基础。
