@@ -10,7 +10,21 @@ from FuxiYu_NodeKernel import extensions
 from FuxiYu_NodeKernel.constant import ContainerStatus
 from FuxiYu_NodeKernel.docker_operates.status_cache import ContainerStatusCache
 
-pytestmark = pytest.mark.docker
+def _local_docker_available() -> bool:
+    try:
+        import docker as _docker
+
+        client = _docker.from_env()
+        client.ping()
+        return True
+    except Exception:
+        return False
+
+
+pytestmark = [
+    pytest.mark.docker,
+    pytest.mark.skipif(not _local_docker_available(), reason="local Docker daemon unavailable"),
+]
 
 RUN_IMAGE = "ubuntu:22.04"
 

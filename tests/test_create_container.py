@@ -757,7 +757,17 @@ def test_create_container_explains_image_that_exits_immediately(monkeypatch):
         create_container("admin", Container.Config_info(**VALID_CFG))
 
 
+def _local_docker_available() -> bool:
+    try:
+        client = docker.from_env()
+        client.ping()
+        return True
+    except Exception:
+        return False
+
+
 @pytest.mark.docker
+@pytest.mark.skipif(not _local_docker_available(), reason="local Docker daemon unavailable")
 def test_happy_path(monkeypatch, tmp_path):
     """真实 docker：创建 → 校验返回 → 校验容器参数 → 校验 sshd 守门 → 清理。"""
     import docker as docker_pkg

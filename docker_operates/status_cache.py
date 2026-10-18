@@ -1,26 +1,30 @@
 # docker_operates/status_cache.py（Node 侧）
 """容器状态缓存：docker events 订阅（主）+ 定时对账（兜底）→ 内存缓存。
 
-与 disk_usage_cache/last_ssh_cache 同构的「采集 & 读缓存」模式：
-- 采集侧（update/_apply_event/_apply_container/_events_loop/_reconcile_loop）：
-  docker 状态 → 缓存回填。API 层不负责任何形式的内容采集。
-- 读取侧（get/get_state/snapshot）：只读缓存 + 状态语义，不做任何 IO。
-- 转换态（begin_action/finish_action/clear_pending/get_pending）：独立变量字段，
-  覆盖"动作已触发、返回值未到"的等待阶段。
+本模块同时维护三条相互独立但共用同一把锁的边界：
 
-Ctrl 侧高频轮询/订阅的是本缓存，而不是直接打 docker——
-docker 状态映射到应用枚举语义与 blueprints/__init__.py 的 /container_status 对齐
-（running→online 等；sshd 就绪细节由动作追踪 creation/action status 覆盖，缓存不做 exec 检查）。
+- RuntimeState：当前可解释的运行态（online/offline/paused/starting/failed/unknown）。
+- ActionRecord：每次 create/start/stop/restart/pause/unpause 的受理与结果；
+  动作失败只写动作诊断，绝不直接成为运行态 failed。
+- Observation：读取 Docker **之前**签发的 ``{generation, action_seq, read_seq}``
+  票据；发布时先校验票据，再允许比较 Docker ID 或写运行态。
+
+本地 generation 只在当前 Node 进程/缓存内有效，不是 Docker 对象身份，也不是
+Global Q70 的跨进程代际。所有状态写入都必须经过观察票校验；动作队列按名称串行。
 """
+import collections
+import dataclasses
 import datetime
 import logging
 import subprocess
 import threading
 import time
+import uuid
 
 import docker
 
 from ..constant import ContainerStatus
+from .docker_fact import DockerFact, fact_from_attrs, fact_from_container
 from .port_mappings import extract_port_info
 
 logger = logging.getLogger(__name__)
@@ -29,7 +33,6 @@ logger = logging.getLogger(__name__)
 RECONCILE_INTERVAL = 15
 
 # sshd 就绪探测间隔（秒）：对「创建完成、等待就绪确认」的容器做 exec probe。
-# 就绪确认中的容器数量极少（创建中的那几台），10s 节流成本可控。
 PROBE_INTERVAL = 10
 
 # sshd 就绪判定：容器内 :22 监听检查（四路合并，一次 exec）
@@ -40,19 +43,31 @@ _SSHD_READY_CMD = (
     "ps aux 2>/dev/null | grep -q [s]shd"
 )
 
-# 转换态超时兜底（秒）：后台任务异常退出时防止永久卡 ing。
-# 必须宽于正常流程耗时上限（创建含镜像 build + sshd gate，可达数十分钟），按操作分级：
+# 转换态超时兜底（秒）。TTL 只停止受理过渡遮挡读面，不删除动作记录、
+# 不清硬阻塞、也不把动作失败写成运行态 failed。
 _ACTION_TTL = {
-    "create": 1800,   # 镜像构建/创建/sshd gate，最长 30 分钟
+    "create": 1800,
     "start": 300,
     "stop": 300,
     "restart": 300,
     "pause": 300,
     "unpause": 300,
 }
-PENDING_TTL_SEC = 300  # 未知操作的兜底
+PENDING_TTL_SEC = 300
 
-# docker 终态（containers.list 的 c.status）→ 应用状态字符串
+# 终结/非终结动作相位。unconfirmed/timed_out 不是完成证明。
+TERMINAL_PHASES = {"confirmed", "idempotent_confirmed", "failed", "superseded"}
+NON_TERMINAL_PHASES = {"accepted", "unconfirmed", "timed_out"}
+VALID_PHASES = TERMINAL_PHASES | NON_TERMINAL_PHASES
+
+# 运行态 failed 只允许由这些既有门禁/真实 Docker 故障形成（外加 created 半成品）。
+HARD_BLOCK_REASONS = {
+    "sshd_not_installed",
+    "created_half_built",
+    "docker_dead",
+    "startup_command_exited",
+}
+
 _DOCKER_STATUS_TO_APP = {
     "running": ContainerStatus.ONLINE.value,
     "exited": ContainerStatus.OFFLINE.value,
@@ -63,43 +78,121 @@ _DOCKER_STATUS_TO_APP = {
     "removing": ContainerStatus.OFFLINE.value,
 }
 
-# docker events 的 status 字段 → 应用状态字符串（状态事件：改变容器状态）
-_EVENT_STATUS_MAP = {
-    "start": ContainerStatus.ONLINE.value,
-    "unpause": ContainerStatus.ONLINE.value,
-    "stop": ContainerStatus.OFFLINE.value,
-    "die": ContainerStatus.OFFLINE.value,
-    "kill": ContainerStatus.OFFLINE.value,
-    "destroy": ContainerStatus.OFFLINE.value,
-    "oom": ContainerStatus.OFFLINE.value,
-    "pause": ContainerStatus.PAUSED.value,
-    "create": ContainerStatus.STARTING.value,
-    "restart": ContainerStatus.RESTARTING.value,
+# docker events 的动作（Action 优先，status 兼容）→ 是否需要触发新鲜观察。
+_EVENT_STATE_ACTIONS = {
+    "start",
+    "unpause",
+    "stop",
+    "die",
+    "kill",
+    "destroy",
+    "oom",
+    "pause",
+    "create",
+    "restart",
 }
 
-# 噪声事件（不改变容器状态，绝不落缓存/event_log；数据通路对账契约 C2）
+# 噪声事件（不改变容器状态，绝不落缓存/event_log；数据通路对账契约 C2）。
 _EVENT_NOISE = {
-    "attach", "detach", "top", "exec_create", "exec_start", "exec_detach",
-    "resize", "copy", "export", "import", "update", "rename", "commit",
+    "attach",
+    "detach",
+    "top",
+    "exec_create",
+    "exec_start",
+    "exec_detach",
+    "exec_die",
+    "resize",
+    "copy",
+    "export",
+    "import",
+    "update",
+    "rename",
+    "commit",
     "health_status",
 }
 
-# 采集失败标记：对账/采集异常时置位，WSS 快照以显式 collect_error 形状发出，
-# 绝不发空 dict（避免 Ctrl 误判容器全部消失；数据通路对账契约 C1）。
 COLLECT_ERROR_MARKER = "collect_failed"
 
 
-def _map_container_to_status(container) -> str:
-    """docker 容器对象（c.status）→ 应用状态字符串。
+def _utc_iso() -> str:
+    return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
 
-    docker c.status 枚举 7 项全映射；未映射（理论不可达）→ unknown + warning。
-    """
-    raw = str(getattr(container, 'status', '') or '')
+
+def _utc_now() -> datetime.datetime:
+    return datetime.datetime.now(datetime.timezone.utc)
+
+
+@dataclasses.dataclass(frozen=True)
+class ActionRef:
+    """Node 本进程内的动作引用。"""
+
+    node_epoch: str
+    generation: int
+    seq: int
+
+    def as_dict(self) -> dict:
+        return {"node_epoch": self.node_epoch, "generation": self.generation, "seq": self.seq}
+
+
+@dataclasses.dataclass(frozen=True)
+class Observation:
+    """读取 Docker 前签发的观察票。"""
+
+    node_epoch: str
+    generation: int
+    action_seq: int
+    read_seq: int
+    source: str = "inspect"
+    from_create_confirmation: bool = False
+    metrics: bool = False
+
+
+@dataclasses.dataclass
+class ActionOutcome:
+    """动作执行结果（由 runner 返回，worker 负责 CAS 收尾）。"""
+
+    phase: str
+    error_reason: str | None = None
+
+
+@dataclasses.dataclass
+class _ActionRecord:
+    ref: dict
+    action: str
+    phase: str
+    transition: str
+    accepted_at: datetime.datetime
+    ttl: float
+    error_reason: str | None = None
+    finished_at: datetime.datetime | None = None
+    docker_id: str | None = None
+    from_create: bool = False
+
+    @property
+    def terminal(self) -> bool:
+        return self.phase in TERMINAL_PHASES
+
+    @property
+    def expires_at(self) -> float:
+        return self.accepted_at.timestamp() + self.ttl
+
+    def projection(self) -> dict:
+        return {
+            "ref": dict(self.ref),
+            "action": self.action,
+            "phase": self.phase,
+            "error_reason": self.error_reason,
+        }
+
+
+def _map_container_to_status(container) -> str:
+    """docker 容器对象（c.status）→ 应用状态字符串；未映射 → unknown。"""
+    raw = str(getattr(container, "status", "") or "")
     status = _DOCKER_STATUS_TO_APP.get(raw)
     if status is None:
         logger.warning(
             "status-cache: unmapped docker container status: name=%s status=%r",
-            getattr(container, 'name', '?'),
+            getattr(container, "name", "?"),
             raw,
         )
         return ContainerStatus.UNKNOWN.value
@@ -107,8 +200,6 @@ def _map_container_to_status(container) -> str:
 
 
 def _round_or_none(value, digits: int = 1):
-    """数值展示统一保留一位；异常值不进快照。"""
-
     try:
         return round(float(value), digits)
     except (TypeError, ValueError):
@@ -124,8 +215,6 @@ def _sum_blkio_bytes(stats: dict, op_name: str) -> int:
 
 
 def _allocated_gpu_devices(container) -> list[str]:
-    """从 Docker HostConfig 读取容器声明挂载的 GPU id。"""
-
     try:
         attrs = getattr(container, "attrs", {}) or {}
         requests = ((attrs.get("HostConfig") or {}).get("DeviceRequests") or [])
@@ -140,11 +229,6 @@ def _allocated_gpu_devices(container) -> list[str]:
 
 
 def _nvidia_gpu_runtime_by_index() -> dict[str, dict]:
-    """采集宿主机 NVIDIA GPU 动态指标，按 index 建表。
-
-    这是一轮 reconcile 共享的一次性采集；无 nvidia-smi/无 GPU 时返回空表。
-    """
-
     try:
         r = subprocess.run(
             [
@@ -189,16 +273,10 @@ def _nvidia_gpu_runtime_by_index() -> dict[str, dict]:
 
 
 def _container_runtime_metrics(container, gpu_runtime_by_index: dict[str, dict] | None = None) -> dict:
-    """采集 Docker daemon 可直接提供的容器运行指标。
-
-    Docker stats 不包含 GPU 利用率；GPU 动态值由本轮 reconcile 预采的
-    nvidia-smi map 按容器 DeviceIDs 切片。
-    """
-
     gpu_device_ids = _allocated_gpu_devices(container)
     gpu_runtime_by_index = gpu_runtime_by_index or {}
     metrics = {
-        "collected_at": datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%S'),
+        "collected_at": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S"),
         "gpu": {
             "device_ids": gpu_device_ids,
             "devices": [
@@ -246,7 +324,9 @@ def _container_runtime_metrics(container, gpu_runtime_by_index: dict[str, dict] 
     if memory_limit:
         metrics["memory_limit_mb"] = _round_or_none(int(memory_limit) / (1024 ** 2))
         if memory_usage is not None:
-            metrics["memory_usage_percent"] = _round_or_none((max(0, int(memory_usage) - int(cache_bytes)) / int(memory_limit)) * 100)
+            metrics["memory_usage_percent"] = _round_or_none(
+                (max(0, int(memory_usage) - int(cache_bytes)) / int(memory_limit)) * 100
+            )
 
     rx = tx = 0
     for net in (stats.get("networks") or {}).values():
@@ -266,49 +346,987 @@ def _container_runtime_metrics(container, gpu_runtime_by_index: dict[str, dict] 
 
 class ContainerStatusCache:
     def __init__(self):
-        self._cache = {}    # name -> {"status": str, "updated_at": str, "ready_check"?}
-        self._pending = {}  # name -> {"action", "status", "failed_reason", "failed_detail", "started_at"}
-        self._build_pending = {}  # name -> build 阶段状态；不参与 vanished 检测
-        self._deleted = []  # 对账发现的消失容器名（待 WSS pusher 取走推 delete 帧）
-        self._collect_error = None  # 采集失败标记（None=正常；非 None=快照发 collect_error 形状）
-        self._lock = threading.Lock()
+        # 每进程启动生成一次；Node 重启后旧 action_ref 永不匹配。
+        self.node_epoch = str(uuid.uuid4())
+        self._cache = {}      # name -> RuntimeState
+        self._pending = {}    # legacy view: name -> transition dict
+        self._build_pending = {}  # legacy build 读面；不参与 vanished 检测
+        self._deleted = []    # [{"name", "generation"}]
+        self._collect_error = None
+        self._lock = threading.RLock()
+        self._meta = {}       # name -> generation/action_seq/read_seq/current_action/last_action
+        self._action_queues = {}
+        self._action_workers = set()
 
-    def take_deleted(self) -> list[str]:
-        """取走待推送的消失容器名（取后清空）。"""
-        with self._lock:
-            deleted, self._deleted = self._deleted, []
-        return deleted
+    # ------------------------------------------------------------------
+    # 内部小工具
+    # ------------------------------------------------------------------
+    def _meta_for(self, name: str) -> dict:
+        meta = self._meta.get(name)
+        if meta is None:
+            meta = {
+                "generation": 0,
+                "action_seq": 0,
+                "read_seq": 0,
+                "last_applied_read_seq": 0,
+                "metrics_read_seq": 0,
+                "last_applied_metrics_read_seq": 0,
+                "current_action": None,
+                "last_action": None,
+                "actions": collections.OrderedDict(),
+                "create_pending": False,
+                "path_version": 0,
+            }
+            self._meta[name] = meta
+        return meta
 
-    def forget_container_generation(self, name: str) -> None:
-        """同名容器代际失效：清理旧 cache/pending 与待推 delete。
+    @staticmethod
+    def _action_key(ref: dict) -> str:
+        return f"{ref.get('node_epoch')}:{ref.get('generation')}:{ref.get('seq')}"
 
-        Ctrl 同步删除成功或同名新建开始时调用。delete 队列只表达外部消失；
-        同步链路已闭环后，旧 delete 不应跨代作用到新同名容器。
-        """
-        with self._lock:
+    def _remember_action_locked(self, meta: dict, record: "_ActionRecord") -> None:
+        actions = meta.setdefault("actions", collections.OrderedDict())
+        actions[self._action_key(record.ref)] = record
+        while len(actions) > 32:
+            oldest_key, oldest = next(iter(actions.items()))
+            if not oldest.terminal:
+                break
+            actions.pop(oldest_key, None)
+
+    def _reset_meta_locked(self, name: str, *, bump_generation: bool = True) -> dict:
+        meta = self._meta_for(name)
+        if bump_generation:
+            meta["generation"] += 1
+        meta["action_seq"] = 0
+        meta["last_applied_read_seq"] = 0
+        meta["last_applied_metrics_read_seq"] = 0
+        meta["current_action"] = None
+        meta["last_action"] = None
+        meta["create_pending"] = False
+        return meta
+
+    def _runtime_identity(self, name: str) -> str | None:
+        entry = self._cache.get(name) or {}
+        return entry.get("docker_id")
+
+    def _invalidate_ready_locked(self, name: str) -> None:
+        entry = self._cache.get(name)
+        if entry is not None:
+            entry["ready_verified"] = False
+            entry.pop("ready_identity", None)
+
+    def _set_unknown_locked(
+        self,
+        name: str,
+        source: str,
+        *,
+        reason: str | None = None,
+        keep_metrics: bool = True,
+    ) -> None:
+        old = self._cache.get(name) or {}
+        last_known = old.get("last_known_status") or (
+            old.get("status") if old.get("status") not in (None, ContainerStatus.UNKNOWN.value) else None
+        )
+        entry = dict(old)
+        entry["status"] = ContainerStatus.UNKNOWN.value
+        entry["status_source"] = source
+        entry.setdefault("unknown_since", _utc_iso())
+        if last_known:
+            entry["last_known_status"] = last_known
+        entry["updated_at"] = _utc_iso()
+        entry.pop("ready_check", None)
+        if reason:
+            entry["collect_error"] = reason
+        if not keep_metrics:
+            entry.pop("runtime_metrics", None)
+        self._cache[name] = entry
+
+    def _classify_fact_locked(
+        self,
+        name: str,
+        fact: DockerFact,
+        *,
+        mark_ready: bool,
+        source: str,
+    ) -> str:
+        """把已验证票据的新鲜事实映射为运行态，返回写入的 status。"""
+        old = self._cache.get(name) or {}
+        old_status = old.get("status")
+        old_ready = old.get("ready_identity") or {}
+        same_process = bool(
+            fact.docker_id
+            and fact.started_at
+            and old_ready.get("docker_id") == fact.docker_id
+            and old_ready.get("started_at") == fact.started_at
+        )
+        ready_ok = bool(old.get("ready_verified")) and same_process and fact.started_at is not None
+
+        entry = dict(old)
+        entry["updated_at"] = _utc_iso()
+        entry.pop("status_source", None)
+        entry.pop("unknown_since", None)
+        entry.pop("cold_verify_since", None)
+        entry.pop("collect_error", None)
+        if fact.docker_id:
+            entry["docker_id"] = fact.docker_id
+
+        if mark_ready and fact.docker_id and fact.started_at:
+            entry["ready_identity"] = {"docker_id": fact.docker_id, "started_at": fact.started_at}
+            entry["ready_verified"] = True
+            ready_ok = True
+        elif fact.started_at and fact.docker_id and same_process and old.get("ready_verified"):
+            entry["ready_identity"] = {"docker_id": fact.docker_id, "started_at": fact.started_at}
+            entry["ready_verified"] = True
+        elif not same_process:
+            # 运行进程已变化（restart/外部重启/新对象/缺 StartedAt）：旧就绪证明失效。
+            if fact.docker_id != old.get("docker_id") or fact.started_at != old_ready.get("started_at"):
+                entry["ready_verified"] = False
+                entry.pop("ready_identity", None)
+                ready_ok = False
+
+        hard_block = old.get("hard_block") is True and old.get("failed_reason") in HARD_BLOCK_REASONS
+
+        if fact.paused:
+            entry["status"] = ContainerStatus.PAUSED.value
+            entry.pop("failed_reason", None)
+            entry.pop("failed_detail", None)
+            entry.pop("hard_block", None)
+            entry.pop("ready_check", None)
+            # pause 保留同一进程的就绪证明
+        elif fact.dead:
+            entry["status"] = ContainerStatus.FAILED.value
+            entry["hard_block"] = True
+            entry["failed_reason"] = "docker_dead"
+            entry["failed_detail"] = fact.error
+            entry.pop("ready_check", None)
+        elif fact.status == "created":
+            entry["status"] = ContainerStatus.FAILED.value
+            entry["hard_block"] = True
+            entry["failed_reason"] = "created_half_built"
+            entry["failed_detail"] = "container object exists in docker 'created' state"
+            entry.pop("ready_check", None)
+        elif fact.restarting:
+            entry["status"] = ContainerStatus.RESTARTING.value
+            entry["ready_check"] = True
+            entry["ready_verified"] = False
+            entry.pop("ready_identity", None)
+            entry.pop("hard_block", None)
+            entry.pop("failed_reason", None)
+            entry.pop("failed_detail", None)
+        elif fact.running:
+            if hard_block and entry.get("failed_reason") == "sshd_not_installed" and not ready_ok:
+                # Docker running 不能证明 sshd 已修复：保持硬阻塞，等 probe 通过。
+                entry["status"] = ContainerStatus.FAILED.value
+                entry["hard_block"] = True
+                entry.pop("ready_check", None)
+            elif ready_ok:
+                entry["status"] = ContainerStatus.ONLINE.value
+                entry.pop("ready_check", None)
+                entry.pop("hard_block", None)
+                entry.pop("failed_reason", None)
+                entry.pop("failed_detail", None)
+            else:
+                entry["status"] = ContainerStatus.STARTING.value
+                entry["ready_check"] = True
+                entry.pop("hard_block", None)
+                entry.pop("failed_reason", None)
+                entry.pop("failed_detail", None)
+        elif fact.status in {"exited", "stopped", "removing"}:
+            entry["status"] = ContainerStatus.OFFLINE.value
+            entry.pop("ready_check", None)
+            entry.pop("hard_block", None)
+            entry.pop("failed_reason", None)
+            entry.pop("failed_detail", None)
+        else:
+            entry["status"] = ContainerStatus.UNKNOWN.value
+            entry["status_source"] = source or "inspect_unknown"
+            entry["unknown_since"] = old.get("unknown_since") or _utc_iso()
+            if old_status and old_status != ContainerStatus.UNKNOWN.value:
+                entry["last_known_status"] = old_status
+            entry.pop("ready_check", None)
+
+        if entry.get("status") != ContainerStatus.UNKNOWN.value:
+            entry["last_known_status"] = entry["status"]
+        self._cache[name] = entry
+        return entry["status"]
+
+    def _publish_locked(self, name: str, ticket: Observation, fact: DockerFact | None, *, mark_ready: bool = False) -> bool:
+        meta = self._meta_for(name)
+        if ticket.node_epoch != self.node_epoch:
+            logger.info("status-cache publish rejected: stale node epoch name=%s", name)
+            return False
+        if ticket.generation != meta["generation"]:
+            logger.info(
+                "status-cache publish rejected: name=%s stale generation ticket=%s current=%s",
+                name,
+                ticket.generation,
+                meta["generation"],
+            )
+            return False
+        if ticket.action_seq != meta["action_seq"]:
+            logger.info(
+                "status-cache publish rejected: name=%s superseded action ticket=%s current=%s",
+                name,
+                ticket.action_seq,
+                meta["action_seq"],
+            )
+            return False
+        if ticket.read_seq <= meta["last_applied_read_seq"]:
+            logger.info(
+                "status-cache publish rejected: name=%s stale read ticket=%s applied=%s",
+                name,
+                ticket.read_seq,
+                meta["last_applied_read_seq"],
+            )
+            return False
+        if fact is None:
+            self._set_unknown_locked(name, ticket.source or "inspect_unknown", reason="inspect_unavailable")
+            meta["last_applied_read_seq"] = ticket.read_seq
+            return True
+
+        entry = self._cache.get(name) or {}
+        current_docker = entry.get("docker_id")
+        if fact.docker_id and current_docker and fact.docker_id != current_docker:
+            if meta["create_pending"]:
+                logger.info(
+                    "status-cache identity_change_deferred: name=%s current=%s observed=%s create_pending=true",
+                    name,
+                    current_docker,
+                    fact.docker_id,
+                )
+                return False
+            # 票已通过 generation/action_seq/read_seq 校验，才允许推进新代际。
+            old_action = meta.get("current_action")
+            if old_action is not None and not old_action.terminal:
+                old_action.phase = "superseded"
+                old_action.error_reason = old_action.error_reason or "identity_changed"
+                old_action.finished_at = _utc_now()
+            meta["generation"] += 1
+            meta["action_seq"] = 0
+            meta["last_applied_read_seq"] = 0
+            meta["last_applied_metrics_read_seq"] = 0
+            meta["current_action"] = None
+            meta["create_pending"] = False
             self._cache.pop(name, None)
             self._pending.pop(name, None)
-            self._build_pending.pop(name, None)
-            self._deleted = [item for item in self._deleted if item != name]
-        logger.info("status-cache forget_container_generation: name=%s", name)
+            self._deleted = [item for item in self._deleted if self._deleted_name(item) != name]
+            logger.warning(
+                "status-cache identity changed: name=%s old=%s new=%s generation=%s",
+                name,
+                current_docker,
+                fact.docker_id,
+                meta["generation"],
+            )
+            self._classify_fact_locked(name, fact, mark_ready=mark_ready, source=ticket.source)
+        else:
+            if fact.docker_id and not current_docker:
+                if meta["create_pending"] and not ticket.from_create_confirmation:
+                    logger.info(
+                        "status-cache identity_bind_deferred: name=%s observed=%s create_pending=true",
+                        name,
+                        fact.docker_id,
+                    )
+                    return False
+                entry = self._cache.setdefault(name, {"status": ContainerStatus.UNKNOWN.value, "updated_at": _utc_iso()})
+                entry["docker_id"] = fact.docker_id
+            self._classify_fact_locked(name, fact, mark_ready=mark_ready, source=ticket.source)
 
+        # create 自身确认的首次 docker_id 绑定：不推进代际、不取消 create。
+        if meta["create_pending"] and ticket.from_create_confirmation:
+            logger.info("status-cache create first bind: name=%s docker_id=%s", name, fact.docker_id)
+        meta["last_applied_read_seq"] = ticket.read_seq
+        return True
+
+    def _inspect_fact(self, name: str, client=None) -> DockerFact:
+        from .. import extensions
+
+        if client is None:
+            client = extensions.docker_client
+        if client is None:
+            client = docker.from_env()
+        container = client.containers.get(name)
+        reload = getattr(container, "reload", None)
+        if callable(reload):
+            reload()
+        return fact_from_container(container)
+
+    def _confirm_absent(self, name: str, client) -> bool:
+        try:
+            client.containers.get(name)
+            return False
+        except docker.errors.NotFound:
+            return True
+
+    # ------------------------------------------------------------------
+    # 读面
+    # ------------------------------------------------------------------
     def get_collect_error(self) -> str | None:
-        """读采集失败标记（None=采集正常；非 None=快照应发 collect_error 形状）。"""
         with self._lock:
             return self._collect_error
 
+    def get(self, name: str) -> dict | None:
+        with self._lock:
+            entry = self._cache.get(name)
+            return dict(entry) if entry is not None else None
 
-    ##################
-    # 转换态管理
+    def snapshot(self) -> dict:
+        with self._lock:
+            return dict(self._cache)
 
-    def begin_build(self, name: str) -> None:
-        """标记镜像构建开始。
+    def _last_action_projection(self, meta: dict) -> dict | None:
+        record = meta.get("last_action")
+        return record.projection() if record is not None else None
 
-        build 阶段还没有 Docker 容器对象，因此只进入读面，不参与 reconcile
-        的 known 集合，避免构建失败被误判为 vanished/delete。
+    def _project_state_locked(self, name: str) -> dict:
+        meta = self._meta_for(name)
+        runtime = self._cache.get(name)
+        last_action = self._last_action_projection(meta)
+
+        if runtime is not None and runtime.get("status") == ContainerStatus.FAILED.value:
+            reason = runtime.get("failed_reason")
+            if runtime.get("hard_block") and reason in HARD_BLOCK_REASONS:
+                return {
+                    "source": "cache",
+                    "status": ContainerStatus.FAILED.value,
+                    "failed_reason": reason,
+                    "failed_detail": runtime.get("failed_detail"),
+                    "error_reason": reason,
+                    "runtime_metrics": runtime.get("runtime_metrics"),
+                    "port": runtime.get("port"),
+                    "port_mappings": runtime.get("port_mappings"),
+                    "cache_updated_at": runtime.get("updated_at"),
+                    "last_action": last_action,
+                }
+
+        if runtime is not None and runtime.get("ready_check"):
+            return {
+                "source": "cache",
+                "status": runtime.get("status") or ContainerStatus.STARTING.value,
+                "ready_check": True,
+                "runtime_metrics": runtime.get("runtime_metrics"),
+                "port": runtime.get("port"),
+                "port_mappings": runtime.get("port_mappings"),
+                "cache_updated_at": runtime.get("updated_at"),
+                "last_action": last_action,
+            }
+
+        # 当前动作受理过渡态；过期后不再遮挡运行态，但动作记录仍保留。
+        current = meta.get("current_action")
+        if current is not None and not current.terminal:
+            if time.time() <= current.expires_at:
+                return {
+                    "source": "pending",
+                    "status": current.transition,
+                    "runtime_metrics": (runtime or {}).get("runtime_metrics"),
+                    "port": (runtime or {}).get("port"),
+                    "port_mappings": (runtime or {}).get("port_mappings"),
+                    "last_action": last_action,
+                }
+            current.phase = "timed_out"
+            last_action = self._last_action_projection(meta)
+
+        build = self._build_pending.get(name)
+        if build is not None:
+            status = build.get("status") or ContainerStatus.BUILDING.value
+            if status != ContainerStatus.FAILED.value and time.time() > build.get("expires_at", 0):
+                status = ContainerStatus.BUILDING.value
+            return {
+                "source": "build",
+                "status": status,
+                "failed_reason": build.get("failed_reason"),
+                "failed_detail": build.get("failed_detail"),
+                "error_reason": build.get("failed_reason"),
+                "last_action": last_action,
+            }
+
+        if runtime is not None:
+            raw_status = runtime.get("status") or ContainerStatus.UNKNOWN.value
+            status_source = runtime.get("status_source")
+            unknown_since = runtime.get("unknown_since")
+            last_known = runtime.get("last_known_status")
+            if raw_status == ContainerStatus.FAILED.value:
+                # 只有允许集合内的硬阻塞可以占用运行态 failed；历史/动作失败
+                # 痕迹不得继续冒充当前运行态。
+                reason = runtime.get("failed_reason")
+                if not (runtime.get("hard_block") and reason in HARD_BLOCK_REASONS):
+                    raw_status = ContainerStatus.UNKNOWN.value
+                    status_source = "inconsistent_failed"
+                    unknown_since = unknown_since or runtime.get("updated_at")
+                    last_known = last_known or runtime.get("failed_reason")
+            result = {
+                "source": "cache",
+                "status": raw_status,
+                "failed_reason": runtime.get("failed_reason"),
+                "failed_detail": runtime.get("failed_detail"),
+                "runtime_metrics": runtime.get("runtime_metrics"),
+                "port": runtime.get("port"),
+                "port_mappings": runtime.get("port_mappings"),
+                "error_reason": runtime.get("failed_reason"),
+                "cache_updated_at": runtime.get("updated_at"),
+                "last_action": last_action,
+            }
+            if status_source:
+                result["status_source"] = status_source
+            if unknown_since:
+                result["unknown_since"] = unknown_since
+            if last_known:
+                result["last_known_status"] = last_known
+            return result
+
+        if last_action is not None:
+            return {"source": "miss", "status": ContainerStatus.UNKNOWN.value, "last_action": last_action}
+        return {"source": "miss", "last_action": None}
+
+    def get_state(self, name: str) -> dict:
+        with self._lock:
+            return self._project_state_locked(name)
+
+    def list_states(self) -> dict:
+        with self._lock:
+            names = set(self._cache) | set(self._pending) | set(self._build_pending)
+            result = {}
+            for name in names:
+                st = self._project_state_locked(name)
+                if st.get("source") == "miss":
+                    continue
+                result[name] = st
+            return result
+
+    # ------------------------------------------------------------------
+    # 观察票与发布 CAS
+    # ------------------------------------------------------------------
+    def issue_observation(
+        self,
+        name: str,
+        source: str = "inspect",
+        *,
+        generation: int | None = None,
+        action_seq: int | None = None,
+        from_create_confirmation: bool = False,
+        metrics: bool = False,
+    ) -> Observation:
+        """签发读取前票据。
+
+        ``generation``/``action_seq`` 必须由动作受理时的 ref 显式固定；不传才取
+        当前值（对账/事件等无动作上下文的观察）。旧动作不能借新代票。
         """
         with self._lock:
-            self._deleted = [item for item in self._deleted if item != name]
+            meta = self._meta_for(name)
+            ticket_generation = meta["generation"] if generation is None else generation
+            ticket_action_seq = meta["action_seq"] if action_seq is None else action_seq
+            if metrics:
+                meta["metrics_read_seq"] += 1
+                return Observation(
+                    node_epoch=self.node_epoch,
+                    generation=ticket_generation,
+                    action_seq=ticket_action_seq,
+                    read_seq=meta["metrics_read_seq"],
+                    source=source,
+                    from_create_confirmation=from_create_confirmation,
+                    metrics=True,
+                )
+            meta["read_seq"] += 1
+            return Observation(
+                node_epoch=self.node_epoch,
+                generation=ticket_generation,
+                action_seq=ticket_action_seq,
+                read_seq=meta["read_seq"],
+                source=source,
+                from_create_confirmation=from_create_confirmation,
+            )
+
+    def publish_fact(
+        self,
+        name: str,
+        ticket: Observation,
+        fact: DockerFact | None,
+        *,
+        runtime_metrics: dict | None = None,
+        mark_ready: bool = False,
+    ) -> bool:
+        """兼容别名：返回 CAS 是否发布。"""
+        return self.publish_observed(
+            name,
+            ticket,
+            fact,
+            runtime_metrics=runtime_metrics,
+            mark_ready=mark_ready,
+        )
+
+    def publish_observed(
+        self,
+        name: str,
+        ticket: Observation,
+        fact: DockerFact | None,
+        *,
+        runtime_metrics: dict | None = None,
+        mark_ready: bool = False,
+        attrs: dict | None = None,
+    ) -> bool:
+        with self._lock:
+            if ticket.metrics:
+                return False
+            ok = self._publish_locked(name, ticket, fact, mark_ready=mark_ready)
+            if ok:
+                entry = self._cache.get(name)
+                if entry is not None:
+                    if runtime_metrics is not None:
+                        entry["runtime_metrics"] = runtime_metrics
+                    if attrs is not None:
+                        port, port_mappings = extract_port_info(attrs)
+                        if port is not None:
+                            entry["port"] = port
+                        entry["port_mappings"] = port_mappings
+            return ok
+
+    def publish_unknown(self, name: str, ticket: Observation, *, reason: str | None = None) -> bool:
+        with self._lock:
+            if ticket.metrics:
+                return False
+            ok = self._publish_locked(name, ticket, None)
+            if ok:
+                entry = self._cache.get(name)
+                if entry is not None and reason:
+                    entry["status_source"] = reason
+            return ok
+
+    def publish_metrics(self, name: str, ticket: Observation, runtime_metrics: dict) -> bool:
+        if not ticket.metrics:
+            return False
+        with self._lock:
+            meta = self._meta_for(name)
+            if ticket.node_epoch != self.node_epoch:
+                return False
+            if ticket.generation != meta["generation"]:
+                return False
+            if ticket.action_seq != meta["action_seq"]:
+                return False
+            if ticket.read_seq <= meta["last_applied_metrics_read_seq"]:
+                return False
+            entry = self._cache.get(name)
+            if entry is None:
+                return False
+            entry["runtime_metrics"] = runtime_metrics
+            entry["updated_at"] = _utc_iso()
+            meta["last_applied_metrics_read_seq"] = ticket.read_seq
+            return True
+
+    def refresh_from_docker(
+        self,
+        name: str,
+        *,
+        source: str = "inspect",
+        action_ref: dict | None = None,
+        generation: int | None = None,
+        action_seq: int | None = None,
+        from_create_confirmation: bool = False,
+        runtime_metrics: dict | None = None,
+        mark_ready: bool = False,
+        client=None,
+    ) -> DockerFact | None:
+        """读取前签票 → 新鲜 inspect → 发布 CAS。inspect 失败转 unknown。
+
+        动作后置观察必须传 ``action_ref``（受理时的 epoch/generation/seq），
+        不能只固定 seq 而让 generation 取当前值。
+        """
+        if action_ref is not None:
+            if action_ref.get("node_epoch") != self.node_epoch:
+                logger.info("status-cache action observation rejected: stale epoch name=%s ref=%s", name, action_ref)
+                return None
+            generation = action_ref.get("generation")
+            action_seq = action_ref.get("seq")
+        ticket = self.issue_observation(
+            name,
+            source,
+            generation=generation,
+            action_seq=action_seq,
+            from_create_confirmation=from_create_confirmation,
+        )
+        try:
+            fact = self._inspect_fact(name, client=client)
+        except docker.errors.NotFound:
+            self.publish_unknown(name, ticket, reason="not_found")
+            return None
+        except Exception as e:
+            logger.warning("status-cache fresh inspect failed: name=%s err=%s", name, e)
+            self.publish_unknown(name, ticket, reason="inspect_failed")
+            return None
+        self.publish_observed(
+            name,
+            ticket,
+            fact,
+            runtime_metrics=runtime_metrics,
+            mark_ready=mark_ready,
+            attrs=getattr(fact, "attrs", None) if fact is not None else None,
+        )
+        return fact
+
+    # ------------------------------------------------------------------
+    # 动作受理 / 动作队列 / 动作结果
+    # ------------------------------------------------------------------
+    def _build_action_locked(
+        self,
+        name: str,
+        action: str,
+        transition: str,
+        *,
+        create: bool,
+    ) -> _ActionRecord:
+        meta = self._meta_for(name)
+        if create:
+            meta["generation"] += 1
+            meta["action_seq"] = 0
+            meta["last_applied_read_seq"] = 0
+            meta["last_applied_metrics_read_seq"] = 0
+            old = meta.get("current_action")
+            if old is not None and not old.terminal:
+                old.phase = "superseded"
+                old.error_reason = old.error_reason or "new_create"
+                old.finished_at = _utc_now()
+            meta["current_action"] = None
+            meta["create_pending"] = True
+            # create 受理先于后台线程可见；reconcile 不会把 building/creating 当证据。
+            self._cache[name] = {
+                "status": transition,
+                "updated_at": _utc_iso(),
+            }
+            self._pending.pop(name, None)
+            self._build_pending.pop(name, None)
+            self._deleted = [item for item in self._deleted if self._deleted_name(item) != name]
+            self._invalidate_ready_locked(name)
+            # 旧代尚未执行的队列项由 worker 的代际检查跳过。
+        else:
+            prev = meta.get("current_action")
+            if prev is not None and not prev.terminal:
+                prev.phase = "superseded"
+                prev.error_reason = "superseded_by_new_action"
+                prev.finished_at = _utc_now()
+        meta["action_seq"] += 1
+        seq = meta["action_seq"]
+        ref = ActionRef(self.node_epoch, meta["generation"], seq)
+        ttl = _ACTION_TTL.get(action, PENDING_TTL_SEC)
+        record = _ActionRecord(
+            ref=ref.as_dict(),
+            action=action,
+            phase="accepted",
+            transition=transition,
+            accepted_at=_utc_now(),
+            ttl=ttl,
+            docker_id=self._runtime_identity(name),
+            from_create=create,
+        )
+        if action == "restart":
+            # 显式 restart 受理即清除旧 ready 证明；StartedAt 变化后不得复用。
+            self._invalidate_ready_locked(name)
+        self._remember_action_locked(meta, record)
+        meta["current_action"] = record
+        meta["last_action"] = record
+        self._pending[name] = {
+            "action": action,
+            "status": transition,
+            "failed_reason": None,
+            "failed_detail": None,
+            "started_at": datetime.datetime.utcnow(),
+            "ttl": ttl,
+            "ref": ref.as_dict(),
+        }
+        return record
+
+    def accept_action(self, name: str, action: str, transition: str, *, create: bool = False) -> dict:
+        """在返回受理响应前分配 action_seq/action_ref 并登记过渡态。"""
+        with self._lock:
+            record = self._build_action_locked(name, action, transition, create=create)
+            logger.info(
+                "status-cache accept_action: name=%s action=%s ref=%s transition=%s",
+                name,
+                action,
+                record.ref,
+                transition,
+            )
+            return dict(record.ref)
+
+    def submit_action(self, name: str, action: str, transition: str, runner, *, create: bool = False) -> dict:
+        """受理动作并按名称串行执行。runner(full_ref) 返回 ActionOutcome。
+
+        返回值只含 wire 三元组；内部队列/runner 的 ref 额外带 ``name`` 供收尾定位。
+        """
+        with self._lock:
+            record = self._build_action_locked(name, action, transition, create=create)
+            ref = dict(record.ref)
+            full_ref = {**ref, "name": name, "action": action}
+            queue = self._action_queues.setdefault(name, collections.deque())
+            queued = (full_ref, runner)
+            queue.append(queued)
+            if name not in self._action_workers:
+                self._action_workers.add(name)
+                try:
+                    threading.Thread(
+                        target=self._action_worker,
+                        args=(name,),
+                        daemon=True,
+                        name=f"status-action-{name}",
+                    ).start()
+                except Exception:
+                    # 本项已被标记 failed；必须把它从队列移除，否则下一次成功启动
+                    # worker 时会把这次从未执行的副作用重新跑一遍。
+                    try:
+                        queue.remove(queued)
+                    except ValueError:
+                        pass
+                    if not queue:
+                        self._action_queues.pop(name, None)
+                    self._action_workers.discard(name)
+                    self.finish_action_ref(full_ref, "failed", "background_thread_failed")
+                    raise
+        logger.info("status-cache submit_action: name=%s action=%s ref=%s", name, action, ref)
+        return ref
+
+    def _action_worker(self, name: str) -> None:
+        while True:
+            with self._lock:
+                queue = self._action_queues.get(name)
+                if not queue:
+                    self._action_queues.pop(name, None)
+                    self._action_workers.discard(name)
+                    return
+                ref, runner = queue.popleft()
+                meta = self._meta_for(name)
+                if ref.get("node_epoch") != self.node_epoch or ref.get("generation") != meta["generation"]:
+                    logger.info("status-cache action skipped (generation changed): name=%s ref=%s", name, ref)
+                    self.finish_action_ref(ref, "superseded", "generation_changed")
+                    continue
+                record = self._find_action_locked(meta, self._pure_ref(ref))
+                if record is None:
+                    logger.info("status-cache action skipped (missing record): name=%s ref=%s", name, ref)
+                    continue
+                if record.phase == "failed":
+                    # 受理后的启动/执行失败已终结该动作；绝不因后续 worker 重跑副作用。
+                    logger.info("status-cache action skipped (already failed): name=%s ref=%s", name, ref)
+                    continue
+            try:
+                outcome = runner(ref)
+                phase = getattr(outcome, "phase", None) or "failed"
+                reason = getattr(outcome, "error_reason", None)
+                detail = getattr(outcome, "detail", None)
+                if detail:
+                    logger.warning(
+                        "status-cache action detail: name=%s action=%s ref=%s phase=%s reason=%s detail=%s",
+                        name,
+                        ref.get("action") or "unknown",
+                        ref,
+                        phase,
+                        reason,
+                        detail,
+                    )
+            except Exception as e:
+                logger.warning("status-cache action runner failed: name=%s ref=%s err=%s", name, ref, e)
+                phase, reason = "failed", "action_runner_error"
+            self.finish_action_ref(ref, phase, reason)
+
+    @staticmethod
+    def _deleted_name(item) -> str | None:
+        if isinstance(item, dict):
+            return item.get("name")
+        return str(item)
+
+    @staticmethod
+    def _pure_ref(ref: dict) -> dict:
+        return {key: ref.get(key) for key in ("node_epoch", "generation", "seq")}
+
+    def action_generation_valid(self, ref: dict) -> bool:
+        """动作代际是否仍有效（同一代际内被新动作取代时仍可执行其 Docker 意图）。"""
+        name = ref.get("name")
+        if not name:
+            return False
+        with self._lock:
+            meta = self._meta_for(name)
+            return (
+                ref.get("node_epoch") == self.node_epoch
+                and ref.get("generation") == meta["generation"]
+            )
+
+    def action_is_current(self, ref: dict) -> bool:
+        name = ref.get("name")
+        if not name:
+            return False
+        with self._lock:
+            meta = self._meta_for(name)
+            current = meta.get("current_action")
+            return (
+                ref.get("node_epoch") == self.node_epoch
+                and ref.get("generation") == meta["generation"]
+                and ref.get("seq") == meta["action_seq"]
+                and current is not None
+                and current.ref == self._pure_ref(ref)
+                and not current.terminal
+            )
+
+    def _find_action_locked(self, meta: dict, ref: dict):
+        key = self._action_key(ref)
+        record = (meta.get("actions") or {}).get(key)
+        if record is not None:
+            return record
+        current = meta.get("current_action")
+        if current is not None and current.ref == ref:
+            return current
+        last = meta.get("last_action")
+        if last is not None and last.ref == ref:
+            return last
+        return None
+
+    def finish_action_ref(self, ref: dict, phase: str, error_reason: str | None = None) -> bool:
+        name = ref.get("name")
+        if not name:
+            logger.warning("status-cache finish_action_ref missing name: ref=%s", ref)
+            return False
+        pure = self._pure_ref(ref)
+        with self._lock:
+            meta = self._meta_for(name)
+            if pure.get("node_epoch") != self.node_epoch:
+                logger.info("status-cache finish rejected: stale epoch name=%s ref=%s", name, pure)
+                return False
+            record = self._find_action_locked(meta, pure)
+            if record is None:
+                logger.info("status-cache finish rejected: unknown/old ref name=%s ref=%s", name, pure)
+                return False
+            if phase not in VALID_PHASES:
+                phase = "failed"
+                error_reason = error_reason or "invalid_phase"
+            if record.terminal:
+                if phase in NON_TERMINAL_PHASES:
+                    logger.info(
+                        "status-cache finish ignored: terminal not regressed name=%s ref=%s phase=%s current=%s",
+                        name,
+                        pure,
+                        phase,
+                        record.phase,
+                    )
+                else:
+                    logger.info(
+                        "status-cache finish ignored: terminal already set name=%s ref=%s current=%s incoming=%s",
+                        name,
+                        pure,
+                        record.phase,
+                        phase,
+                    )
+                return False
+            if pure.get("seq") != meta["action_seq"] or pure.get("generation") != meta["generation"]:
+                record.phase = "superseded"
+                record.error_reason = record.error_reason or "superseded"
+                record.finished_at = _utc_now()
+                logger.info("status-cache action superseded: name=%s ref=%s", name, pure)
+                return False
+            record.phase = phase
+            record.error_reason = error_reason
+            if phase in TERMINAL_PHASES:
+                record.finished_at = _utc_now()
+                if meta.get("current_action") is record:
+                    meta["current_action"] = None
+                self._pending.pop(name, None)
+                if record.from_create:
+                    meta["create_pending"] = False
+                if record.action == "create" and phase == "failed":
+                    runtime = self._cache.get(name) or {}
+                    if runtime.get("status") in (ContainerStatus.BUILDING.value, ContainerStatus.CREATING.value) \
+                            and not runtime.get("docker_id"):
+                        self._set_unknown_locked(name, "create_failed", reason=error_reason)
+                        runtime = self._cache.get(name) or {}
+                        runtime.pop("last_known_status", None)
+            logger.info(
+                "status-cache finish_action: name=%s action=%s ref=%s phase=%s reason=%s",
+                name,
+                record.action,
+                pure,
+                phase,
+                error_reason,
+            )
+            return True
+
+    def begin_action(self, name: str, action: str, ing_status: str) -> None:
+        """兼容旧调用：受理一个不自动执行的过渡动作。"""
+        with self._lock:
+            self._build_action_locked(name, action, ing_status, create=(action == "create"))
+
+    def finish_action(
+        self,
+        name: str,
+        status: str | None,
+        failed_reason: str | None = None,
+        failed_detail: str | None = None,
+    ) -> None:
+        """兼容旧调用：只更新动作诊断；非 failed 的终态按旧语义回填运行态。"""
+        with self._lock:
+            meta = self._meta_for(name)
+            record = meta.get("current_action")
+            ref = ({**dict(record.ref), "name": name} if record is not None else None)
+            if status == ContainerStatus.FAILED.value:
+                if ref:
+                    self.finish_action_ref(ref, "failed", failed_reason)
+                return
+            if status is None:
+                if ref:
+                    self.finish_action_ref(ref, "confirmed", failed_reason)
+                return
+            if ref:
+                self.finish_action_ref(ref, "confirmed", failed_reason)
+        self.update(name, status)
+
+    def clear_pending(self, name: str) -> None:
+        with self._lock:
+            meta = self._meta_for(name)
+            record = meta.get("current_action")
+            if record is not None and not record.terminal:
+                record.phase = "superseded"
+                record.error_reason = "cleared"
+                record.finished_at = _utc_now()
+            meta["current_action"] = None
+            meta["create_pending"] = False
+            self._pending.pop(name, None)
+            self._build_pending.pop(name, None)
+        logger.info("status-cache clear_pending: name=%s", name)
+
+    def get_pending(self, name: str) -> dict | None:
+        with self._lock:
+            meta = self._meta_for(name)
+            record = meta.get("current_action")
+            if record is not None and not record.terminal:
+                if time.time() > record.expires_at:
+                    record.phase = "timed_out"
+                    logger.warning(
+                        "status-cache pending timeout: name=%s action=%s ttl=%s (transition hidden)",
+                        name,
+                        record.action,
+                        record.ttl,
+                    )
+                    return None
+                return {
+                    "action": record.action,
+                    "status": record.transition,
+                    "failed_reason": record.error_reason,
+                    "failed_detail": None,
+                    "started_at": datetime.datetime.utcfromtimestamp(record.accepted_at.timestamp()),
+                    "ttl": record.ttl,
+                    "ref": dict(record.ref),
+                }
+            legacy = self._pending.get(name)
+            return dict(legacy) if legacy is not None else None
+
+    def get_build_pending(self, name: str) -> dict | None:
+        with self._lock:
+            entry = self._build_pending.get(name)
+            if entry is None:
+                return None
+            if entry["status"] != ContainerStatus.FAILED.value:
+                age = (datetime.datetime.utcnow() - entry["started_at"]).total_seconds()
+                if age > entry.get("ttl", PENDING_TTL_SEC):
+                    entry["status"] = ContainerStatus.FAILED.value
+                    entry["failed_reason"] = "build_timeout"
+                    entry["failed_detail"] = f"image build timed out after {entry.get('ttl', PENDING_TTL_SEC)} seconds"
+            return dict(entry)
+
+    def begin_build(self, name: str) -> None:
+        with self._lock:
+            self._deleted = [item for item in self._deleted if self._deleted_name(item) != name]
             self._build_pending[name] = {
                 "action": "build",
                 "status": ContainerStatus.BUILDING.value,
@@ -316,25 +1334,20 @@ class ContainerStatusCache:
                 "failed_detail": None,
                 "started_at": datetime.datetime.utcnow(),
                 "ttl": _ACTION_TTL.get("create", PENDING_TTL_SEC),
+                "expires_at": time.time() + _ACTION_TTL.get("create", PENDING_TTL_SEC),
             }
         logger.info("status-cache begin_build: name=%s status=%s", name, ContainerStatus.BUILDING.value)
 
-    def finish_build_failed(
-        self,
-        name: str,
-        failed_reason: str | None = None,
-        failed_detail: str | None = None,
-    ) -> None:
-        """build 阶段失败：保留 failed 给读面，但不参与 vanished。"""
+    def finish_build_failed(self, name: str, failed_reason: str | None = None, failed_detail: str | None = None) -> None:
         with self._lock:
             entry = self._build_pending.get(name)
             if entry is None:
-                self._build_pending[name] = {
+                entry = {
                     "action": "build",
                     "started_at": datetime.datetime.utcnow(),
                     "ttl": _ACTION_TTL.get("create", PENDING_TTL_SEC),
                 }
-                entry = self._build_pending[name]
+                self._build_pending[name] = entry
             entry["status"] = ContainerStatus.FAILED.value
             entry["failed_reason"] = failed_reason
             entry["failed_detail"] = failed_detail
@@ -346,144 +1359,85 @@ class ContainerStatusCache:
         )
 
     def clear_build(self, name: str) -> None:
-        """清理 build 阶段读面状态。"""
         with self._lock:
             self._build_pending.pop(name, None)
         logger.info("status-cache clear_build: name=%s", name)
 
-    def begin_action(self, name: str, action: str, ing_status: str) -> None:
-        """标记转换开始：等待返回值期间保持 ing 状态（creating/starting/stopping...）。
-
-        *ing_status* 为等待阶段对外暴露的状态（如 'starting'）。
-        """
-        with self._lock:
-            self._deleted = [item for item in self._deleted if item != name]
-            self._build_pending.pop(name, None)
-            self._pending[name] = {
-                "action": action,
-                "status": ing_status,
-                "failed_reason": None,
-                "failed_detail": None,
-                "started_at": datetime.datetime.utcnow(),
-                "ttl": _ACTION_TTL.get(action, PENDING_TTL_SEC),
-            }
-        logger.info("status-cache begin_action: name=%s action=%s status=%s", name, action, ing_status)
-
-    def finish_action(
+    def mark_ready_check(
         self,
         name: str,
-        status: str | None,
-        failed_reason: str | None = None,
-        failed_detail: str | None = None,
+        status: str = ContainerStatus.STARTING.value,
+        *,
+        cold_verify: bool = False,
     ) -> None:
-        """转换结束，按返回值更新状态。
-
-        - status=None：仅清 pending（创建完成场景：端点 miss 后走实时+sshd 检查回填）
-        - status='failed'：pending 保留为终态语义（Ctrl 读取失败原因），等下次 begin 覆盖
-        - 其他终态（online/offline...）：清 pending + 回填缓存（无缝衔接空闲态）
-        """
-        if status == ContainerStatus.FAILED.value:
-            with self._lock:
-                entry = self._pending.get(name)
-                if entry is not None:
-                    entry["status"] = ContainerStatus.FAILED.value
-                    entry["failed_reason"] = failed_reason
-                    entry["failed_detail"] = failed_detail
-            logger.warning(
-                "status-cache finish_action failed: name=%s reason=%s detail=%s",
-                name,
-                failed_reason,
-                failed_detail,
-            )
-            return
-        with self._lock:
-            self._pending.pop(name, None)
-        if status is not None:
-            self.update(name, status)
-        logger.info("status-cache finish_action: name=%s status=%s", name, status)
-
-    def clear_pending(self, name: str) -> None:
-        """直接清除 pending（如删除容器后清理遗留的 failed 标记）。"""
-        with self._lock:
-            self._pending.pop(name, None)
-            self._build_pending.pop(name, None)
-        logger.info("status-cache clear_pending: name=%s", name)
-
-    def mark_ready_check(self, name: str, status: str = ContainerStatus.STARTING.value, *, cold_verify: bool = False) -> None:
-        """创建完成入口：清 pending + 落 starting + 标记 sshd 就绪确认中。
-
-        docker 层看到 running 早于 sshd 就绪，就绪确认由采集侧 probe 循环负责
-        （exec 检查 :22 监听，就绪后升 online 并清标记）。
-
-        *cold_verify*：node 重启/首连后的冷启动复核（容器非"刚被操作启动"而是
-        cache 丢失后的复查）。此时对外推送 unknown + status_source=cold_start_verify，
-        由 Ctrl 落容器轴 unknown 标记（不污染最后已知状态）；probe 通过升 online 时
-        update() 整条重建自然清除该标记。
-        """
         with self._lock:
             old_entry = self._cache.get(name, {})
+            meta = self._meta_for(name)
+            if meta.get("current_action") is not None and not meta["current_action"].terminal:
+                meta["current_action"].phase = "confirmed"
+                meta["current_action"].finished_at = _utc_now()
+                meta["current_action"] = None
+            meta["create_pending"] = False
             self._pending.pop(name, None)
             entry = {
                 "status": status,
                 "ready_check": True,
-                "updated_at": datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%S'),
+                "updated_at": _utc_iso(),
             }
+            if old_entry.get("docker_id"):
+                entry["docker_id"] = old_entry["docker_id"]
+            if old_entry.get("ready_verified") and old_entry.get("ready_identity"):
+                entry["ready_verified"] = True
+                entry["ready_identity"] = old_entry["ready_identity"]
             if cold_verify:
                 entry["cold_verify_since"] = entry["updated_at"]
-            # 端口信息（创建后 inspect 回填）随就绪确认保留
             if old_entry.get("port") is not None:
                 entry["port"] = old_entry.get("port")
             if old_entry.get("port_mappings") is not None:
                 entry["port_mappings"] = old_entry.get("port_mappings")
+            if old_entry.get("runtime_metrics") is not None:
+                entry["runtime_metrics"] = old_entry.get("runtime_metrics")
             self._cache[name] = entry
         logger.info("status-cache mark_ready_check: name=%s status=%s ready_check=true", name, status)
 
-    def get_pending(self, name: str) -> dict | None:
-        """读转换态；等待中的 ing 态超时（PENDING_TTL_SEC）强制转 failed，防止永久卡 ing。"""
+    def mark_ready_verified(
+        self,
+        name: str,
+        fact: DockerFact,
+        *,
+        ticket: Observation,
+        runtime_metrics: dict | None = None,
+    ) -> bool:
+        """发布就绪证明；ticket 必须在读取该事实 **之前** 签发。
+
+        生产 probe 由 ``_probe_ready_once`` 保证 pre-inspect→probe→post-inspect
+        同一进程；本方法不再自行“读完事实后补票”。
+        """
+        return self.publish_observed(name, ticket, fact, runtime_metrics=runtime_metrics, mark_ready=True)
+
+    def set_hard_block(self, name: str, reason: str, detail: str | None = None) -> bool:
+        if reason not in HARD_BLOCK_REASONS:
+            logger.warning("status-cache hard block rejected (not in allowed set): name=%s reason=%s", name, reason)
+            return False
         with self._lock:
-            entry = self._pending.get(name)
-            if entry is None:
-                return None
-            if entry["status"] != ContainerStatus.FAILED.value:
-                age = (datetime.datetime.utcnow() - entry["started_at"]).total_seconds()
-                if age > entry.get("ttl", PENDING_TTL_SEC):
-                    self._pending.pop(name, None)
-                    logger.warning(
-                        "status-cache pending timeout: name=%s action=%s age=%s ttl=%s",
-                        name,
-                        entry["action"],
-                        round(age, 3),
-                        entry.get("ttl", PENDING_TTL_SEC),
-                    )
-                    return {"action": entry["action"], "status": ContainerStatus.FAILED.value,
-                            "failed_reason": "operation_timeout",
-                            "failed_detail": f"operation timed out after {entry.get('ttl', PENDING_TTL_SEC)} seconds",
-                            "timed_out": True}
-            return dict(entry)
+            entry = dict(self._cache.get(name) or {})
+            entry.update(
+                {
+                    "status": ContainerStatus.FAILED.value,
+                    "hard_block": True,
+                    "failed_reason": reason,
+                    "failed_detail": detail,
+                    "updated_at": _utc_iso(),
+                }
+            )
+            entry.pop("ready_check", None)
+            self._cache[name] = entry
+        logger.warning("status-cache hard block: name=%s reason=%s detail=%s", name, reason, detail)
+        return True
 
-    def get_build_pending(self, name: str) -> dict | None:
-        """读 build 转换态；超时后转 failed，但不进入 vanished 候选。"""
-        with self._lock:
-            entry = self._build_pending.get(name)
-            if entry is None:
-                return None
-            if entry["status"] != ContainerStatus.FAILED.value:
-                age = (datetime.datetime.utcnow() - entry["started_at"]).total_seconds()
-                if age > entry.get("ttl", PENDING_TTL_SEC):
-                    entry["status"] = ContainerStatus.FAILED.value
-                    entry["failed_reason"] = "build_timeout"
-                    entry["failed_detail"] = f"image build timed out after {entry.get('ttl', PENDING_TTL_SEC)} seconds"
-                    logger.warning(
-                        "status-cache build timeout: name=%s age=%s ttl=%s",
-                        name,
-                        round(age, 3),
-                        entry.get("ttl", PENDING_TTL_SEC),
-                    )
-            return dict(entry)
-
-    ##################
-    # 采集侧（docker 事件/对账 → 缓存回填；API 层不可调用）
-
+    # ------------------------------------------------------------------
+    # 兼容采集回填口（生产采集路径走 issue/publish）
+    # ------------------------------------------------------------------
     def update(
         self,
         name: str,
@@ -491,256 +1445,377 @@ class ContainerStatusCache:
         runtime_metrics: dict | None = None,
         attrs: dict | None = None,
     ) -> None:
-        """采集回填口（events/对账/转换态终态共用）：
-        存在则更新、不存在则创建（填充器语义：events/对账发现新容器也要能落缓存）。
-
-        *attrs*：这一轮从 docker 读到的容器 attrs。**给了就从里面重算端口**——端口是
-        docker 的事实，重算才不会把创建那一刻的旧值一直推给 Ctrl（2026-09：库里手改
-        成 docker 事实的值会被旧值盖回去）。没给（如 events 路径拿不到 attrs）则沿用旧值。
-        """
         with self._lock:
             old_entry = self._cache.get(name, {})
             old = old_entry.get("status")
             entry = {
                 "status": status,
-                "updated_at": datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%S'),
+                "updated_at": _utc_iso(),
             }
+            for key in ("docker_id", "ready_verified", "ready_identity", "port", "port_mappings"):
+                if old_entry.get(key) is not None:
+                    entry[key] = old_entry[key]
+            if status == ContainerStatus.FAILED.value:
+                entry["hard_block"] = True
+                entry["failed_reason"] = old_entry.get("failed_reason") or "legacy_failed"
+            else:
+                entry.pop("hard_block", None)
             if runtime_metrics is not None:
                 entry["runtime_metrics"] = runtime_metrics
             elif old_entry.get("runtime_metrics") is not None:
                 entry["runtime_metrics"] = old_entry.get("runtime_metrics")
             if attrs is not None:
-                # 每轮重算：端口以 docker 当前事实为准（含去重，见 port_mappings 模块）
                 port, port_mappings = extract_port_info(attrs)
                 if port is not None:
                     entry["port"] = port
                 entry["port_mappings"] = port_mappings
-            else:
-                # 端口信息（创建后 inspect 回填）随状态推进保留
-                if old_entry.get("port") is not None:
-                    entry["port"] = old_entry.get("port")
-                if old_entry.get("port_mappings") is not None:
-                    entry["port_mappings"] = old_entry.get("port_mappings")
             self._cache[name] = entry
         if old != status:
             logger.info("status-cache update: name=%s %s -> %s", name, old, status)
 
-    def set_port_info(self, name: str, port: int | None, port_mappings: list | None) -> None:
-        """创建完成后回填端口映射（**docker 实际绑定的结果**），随快照推给 Ctrl。
-
-        号是创建时 Node 分配并显式绑定的（见 port_allocator），但这里填的是 docker 回读
-        出来的那一份——分配是意图，这份是事实，两者不一致时以这份为准。
-
-        注：若缓存里还没有这个容器，这里会建一条最小条目——**必须带上 updated_at**，
-        否则 `get_state` 取它时会 KeyError（读侧按契约假定条目完整）。
-        """
+    def set_port_info(
+        self,
+        name: str,
+        port: int | None,
+        port_mappings: list | None,
+        *,
+        ref: dict | None = None,
+    ) -> bool:
         with self._lock:
-            entry = self._cache.setdefault(name, {
-                "status": ContainerStatus.UNKNOWN.value,
-                "updated_at": datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%S'),
-            })
+            if ref is not None and not self.action_is_current({**ref, "name": name}):
+                logger.info("status-cache set_port_info rejected: stale action name=%s ref=%s", name, ref)
+                return False
+            entry = self._cache.setdefault(
+                name,
+                {
+                    "status": ContainerStatus.UNKNOWN.value,
+                    "updated_at": _utc_iso(),
+                },
+            )
             if port is not None:
                 entry["port"] = port
             if port_mappings is not None:
                 entry["port_mappings"] = port_mappings
         logger.info("status-cache set_port_info: name=%s port=%s mappings=%s", name, port, port_mappings)
+        return True
 
     def update_runtime_metrics(self, name: str, runtime_metrics: dict) -> None:
-        """只更新运行指标，不改变当前状态。"""
-
         with self._lock:
             if name not in self._cache:
                 return
             self._cache[name]["runtime_metrics"] = runtime_metrics
-            self._cache[name]["updated_at"] = datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%S')
+            self._cache[name]["updated_at"] = _utc_iso()
+
+    # ------------------------------------------------------------------
+    # Docker 事件（只触发新鲜 inspect，不直接写运行态）
+    # ------------------------------------------------------------------
+    @staticmethod
+    def normalize_event_action(event: dict) -> str | None:
+        raw = event.get("Action")
+        if raw is None or str(raw).strip() == "":
+            raw = event.get("status")
+        if raw is None:
+            return None
+        # exec_create: /bin/sh / exec_start: ... 等带后缀动作按基础 exec_* 噪声处理。
+        base = str(raw).split(":", 1)[0].strip().lower()
+        return base or None
 
     def _apply_event(self, event: dict) -> None:
-        """采集侧：单条 docker event → 状态缓存 + 事件轨迹（event_log）。
-
-        事件按性质分类（数据通路对账契约 C2）：
-        - 状态事件（start/stop/die/...）→ 更新缓存 + 记录 event_log
-        - 噪声事件（attach/top/exec_*/...）→ 忽略，绝不落缓存/event_log
-        - 其余不可识别 → log warning + 忽略（unknown 不再回填缓存）
-        """
         actor = event.get("Actor") or {}
         attrs = actor.get("Attributes") or {}
-        name = attrs.get("name")
+        name = attrs.get("name") or event.get("name")
         if not name:
             return
-        event_status = str(event.get("status", ""))
-        if event_status in _EVENT_NOISE:
+        action = self.normalize_event_action(event)
+        if not action:
+            logger.warning("status-cache: docker event without action ignored: name=%s event=%r", name, event)
             return
-        status = _EVENT_STATUS_MAP.get(event_status)
-        if status is None:
-            logger.warning(
-                "status-cache: unrecognized docker event ignored: name=%s event=%s",
-                name,
-                event_status,
-            )
+        if action in _EVENT_NOISE:
             return
-        keep_ready_check = False
-        with self._lock:
-            entry = self._cache.get(name)
-            if entry is not None and entry.get("ready_check") and status == ContainerStatus.ONLINE.value:
-                keep_ready_check = True
-        if keep_ready_check:
-            logger.debug("status-cache event kept ready_check: name=%s event=%s", name, event.get("status"))
-        else:
-            self.update(name, status)
-        # 事件轨迹：状态事件同步记录到 event_log（时间轴/告警/推送素材）
+        if action not in _EVENT_STATE_ACTIONS:
+            logger.warning("status-cache: unrecognized docker event ignored: name=%s action=%s", name, action)
+            return
+
+        # 事件轨迹（只记录已声明的状态动作；噪声/unknown 不进入）。
         from .. import extensions
+
         extensions.event_log.record(
             name,
-            event.get("status", ""),
+            action,
             exit_code=attrs.get("exitCode"),
-            reason="oom" if event_status == "oom" else None,
+            reason="oom" if action == "oom" else None,
         )
 
-    def _apply_container(self, container, gpu_runtime_by_index: dict[str, dict] | None = None) -> None:
-        """采集侧：单容器对账 → 状态缓存。
-
-        - 就绪确认中（ready_check）+ docker running → 保持 starting（等 probe 确认 sshd）
-        - 冷启动/新容器（缓存无条目）+ docker running → **不直接 online**：落 starting +
-          ready_check，由 probe 循环验 :22（不通补启动）后才 online——崩溃恢复复合确认，
-          防"docker running 但 sshd 未就绪"的过早 ONLINE（契约 C1 延伸）
-        - 冷启动/新容器 + docker "created"（从未运行）→ 陈旧半成品（create 中途炸/从未启动，
-          无进程会推进）→ 终态 FAILED，等人工处置
-        - 已有 FAILED 条目 → 终态守卫：不被对账从 docker 状态复活（恢复路径 = 平台操作 restart/删除重建）
-        - 其余：按 docker 状态覆盖（update 整条目覆盖，自动清标记）
-        """
-        keep_ready_check = False
-        with self._lock:
-            entry = self._cache.get(container.name)
-            if entry is not None and entry.get("ready_check") \
-                    and str(getattr(container, 'status', '') or '') == 'running':
-                keep_ready_check = True
-        runtime_metrics = _container_runtime_metrics(container, gpu_runtime_by_index)
-        if keep_ready_check:
-            self.update_runtime_metrics(container.name, runtime_metrics)
-            return  # 保持 starting + ready_check，等 probe 升 online
-        if entry is None:
-            raw = _map_container_to_status(container)
-            if raw == ContainerStatus.ONLINE.value:
-                # 冷启动复核：不直接 ONLINE（见 mark_ready_check cold_verify 说明）
-                self.mark_ready_check(container.name, cold_verify=True)
-                self.update_runtime_metrics(container.name, runtime_metrics)
-                return
-            if raw == ContainerStatus.STARTING.value:
-                # docker "created"：从未运行的陈旧半成品，终态 FAILED（恢复 = 删除重建/平台操作）
-                logger.warning(
-                    "status-cache: cold-start container %r is docker 'created' (stale half-create); marking FAILED",
-                    container.name,
-                )
-                self.update(container.name, ContainerStatus.FAILED.value, runtime_metrics=runtime_metrics)
-                return
-        elif entry.get("status") == ContainerStatus.FAILED.value:
-            # 终态守卫：FAILED 不被对账复活（操作/事件路径仍可恢复：restart → ready_check 门禁）
-            self.update_runtime_metrics(container.name, runtime_metrics)
+        # 事件只作为触发器和诊断；观察票必须在新鲜 inspect 之前签发。
+        # 事件时间/接收顺序不参与事实排序，inspect 不可判定时保留最后已知。
+        ticket = self.issue_observation(name, f"event:{action}")
+        try:
+            fact = self._inspect_fact(name)
+        except docker.errors.NotFound:
+            logger.info("status-cache event inspect not_found (delete path owns removal): name=%s action=%s", name, action)
             return
-        # 带上 attrs：本轮从 docker 重算端口（不再沿用创建时的旧值）
-        self.update(
-            container.name,
-            _map_container_to_status(container),
-            runtime_metrics=runtime_metrics,
-            attrs=getattr(container, "attrs", None),
-        )
+        except Exception as e:
+            logger.warning("status-cache event fresh inspect failed, keep last known: name=%s action=%s err=%s", name, action, e)
+            return
+        self.publish_observed(name, ticket, fact)
 
-    ##################
-    # 读缓存
+    # ------------------------------------------------------------------
+    # 对账（Docker.list 只用于发现；最终事实按名称新鲜解析）
+    # ------------------------------------------------------------------
+    def _apply_container(self, container, gpu_runtime_by_index: dict[str, dict] | None = None) -> None:
+        """单容器对账兼容入口：指标后按名称新鲜解析；旧对象不回写状态。"""
+        name = container.name
+        metrics_ticket = self.issue_observation(name, "reconcile_metrics", metrics=True)
+        metrics = _container_runtime_metrics(container, gpu_runtime_by_index)
+        ticket = self.issue_observation(name, "reconcile")
+        try:
+            fact = self._inspect_fact(name)
+        except Exception as e:
+            logger.warning("status-cache _apply_container fresh resolve failed: name=%s err=%s", name, e)
+            self.publish_unknown(name, ticket, reason="collect_error")
+            return
+        if self.publish_observed(name, ticket, fact, attrs=getattr(fact, "attrs", None)):
+            self.publish_metrics(name, metrics_ticket, metrics)
 
-    def get(self, name: str) -> dict | None:
-        """读空闲态缓存（返回拷贝，防外部篡改）。"""
+    def _reconcile_once(self) -> None:
+        """单轮全量对账：只评价本轮开始前已知的代际，消失须单容器再确认。"""
+        try:
+            client = docker.from_env()
+            with self._lock:
+                baseline = {}
+                for name, entry in self._cache.items():
+                    if entry.get("docker_id") or entry.get("status") not in (
+                        ContainerStatus.UNKNOWN.value,
+                        ContainerStatus.BUILDING.value,
+                        ContainerStatus.CREATING.value,
+                    ):
+                        baseline[name] = self._meta_for(name)["generation"]
+            live = set()
+            gpu_runtime_by_index = _nvidia_gpu_runtime_by_index()
+            for c in client.containers.list(all=True):
+                name = c.name
+                live.add(name)
+                # 指标与状态使用独立 read_seq；stats 慢不能抬高状态观察票。
+                metrics_ticket = self.issue_observation(name, "reconcile_metrics", metrics=True)
+                metrics = _container_runtime_metrics(c, gpu_runtime_by_index)
+                # stats 可能耗时很久；最终状态必须在 stats 后按名称新鲜解析。
+                ticket = self.issue_observation(name, "reconcile")
+                try:
+                    fresh = client.containers.get(name)
+                    reload = getattr(fresh, "reload", None)
+                    if callable(reload):
+                        reload()
+                    fact = fact_from_container(fresh)
+                except docker.errors.NotFound:
+                    logger.info("status-cache reconcile: container vanished during enumeration: name=%s", name)
+                    continue
+                except Exception as e:
+                    logger.warning("status-cache reconcile fresh resolve failed: name=%s err=%s", name, e)
+                    self.publish_unknown(name, ticket, reason="collect_error")
+                    continue
+                if self.publish_observed(
+                    name,
+                    ticket,
+                    fact,
+                    attrs=getattr(fresh, "attrs", None),
+                ):
+                    self.publish_metrics(name, metrics_ticket, metrics)
+
+            confirm_failed = False
+            for name in sorted(set(baseline) - live):
+                with self._lock:
+                    meta = self._meta_for(name)
+                    if meta["generation"] != baseline[name]:
+                        logger.info("status-cache vanish candidate skipped (generation changed): name=%s", name)
+                        continue
+                    if meta.get("create_pending") or name in self._build_pending or name in self._pending:
+                        logger.info("status-cache vanish candidate skipped (create pending): name=%s", name)
+                        continue
+                try:
+                    absent = self._confirm_absent(name, client)
+                except Exception as e:
+                    confirm_failed = True
+                    logger.warning("status-cache vanish confirmation failed, keep cache: name=%s err=%s", name, e)
+                    continue
+                if not absent:
+                    logger.info("status-cache vanish candidate still exists in docker, keep cache: name=%s", name)
+                    continue
+                with self._lock:
+                    meta = self._meta_for(name)
+                    if meta["generation"] != baseline[name] or meta.get("create_pending") \
+                            or name in self._build_pending:
+                        logger.info("status-cache vanish candidate invalidated before queue: name=%s", name)
+                        continue
+                    self._cache.pop(name, None)
+                    self._pending.pop(name, None)
+                    if not any(self._deleted_name(item) == name for item in self._deleted):
+                        self._deleted.append({"name": name, "generation": meta["generation"]})
+                    runtime = meta.get("current_action")
+                    if runtime is not None and not runtime.terminal:
+                        runtime.phase = "superseded"
+                        runtime.error_reason = "container_vanished"
+                        runtime.finished_at = _utc_now()
+                        meta["current_action"] = None
+                logger.warning("status-cache reconcile: container %r vanished (delete candidate queued)", name)
+            with self._lock:
+                self._collect_error = COLLECT_ERROR_MARKER if confirm_failed else None
+        except Exception as e:
+            with self._lock:
+                self._collect_error = COLLECT_ERROR_MARKER
+            logger.warning("status-cache reconcile failed (collect_error set): %s", e)
+
+    # ------------------------------------------------------------------
+    # 删除候选（携带本地代际；发送前再次确认）
+    # ------------------------------------------------------------------
+    def forget_container_generation(self, name: str) -> None:
         with self._lock:
-            entry = self._cache.get(name)
-        return dict(entry) if entry is not None else None
+            self._cache.pop(name, None)
+            self._pending.pop(name, None)
+            self._build_pending.pop(name, None)
+            meta = self._meta_for(name)
+            meta["generation"] += 1
+            meta["action_seq"] = 0
+            meta["last_applied_read_seq"] = 0
+            meta["last_applied_metrics_read_seq"] = 0
+            meta["current_action"] = None
+            meta["last_action"] = None
+            meta["create_pending"] = False
+            meta.setdefault("actions", collections.OrderedDict()).clear()
+            self._deleted = [item for item in self._deleted if self._deleted_name(item) != name]
+        logger.info("status-cache forget_container_generation: name=%s", name)
 
-    def get_state(self, name: str) -> dict:
-        """统一读状态：pending 优先（含超时兜底），缓存兜底。
-
-        返回: {"source": "pending"|"cache"|"miss", "status", ...}
-        """
-        pending = self.get_pending(name)
-        if pending is not None:
-            cached = self.get(name) or {}
-            return {"source": "pending", "status": pending["status"],
-                    "failed_reason": pending.get("failed_reason"),
-                    "failed_detail": pending.get("failed_detail"),
-                    "runtime_metrics": cached.get("runtime_metrics"),
-                    "port": cached.get("port"),
-                    "port_mappings": cached.get("port_mappings"),
-                    "error_reason": pending.get("failed_reason")}
-        build_pending = self.get_build_pending(name)
-        if build_pending is not None:
-            return {"source": "build", "status": build_pending["status"],
-                    "failed_reason": build_pending.get("failed_reason"),
-                    "failed_detail": build_pending.get("failed_detail"),
-                    "error_reason": build_pending.get("failed_reason")}
-        cached = self.get(name)
-        if cached is not None:
-            return {"source": "cache", "status": cached["status"],
-                    "failed_reason": cached.get("failed_reason"),
-                    "failed_detail": cached.get("failed_detail"),
-                    "runtime_metrics": cached.get("runtime_metrics"),
-                    "port": cached.get("port"),
-                    "port_mappings": cached.get("port_mappings"),
-                    "error_reason": cached.get("failed_reason"),
-                    "cache_updated_at": cached["updated_at"]}
-        return {"source": "miss"}
-
-    def snapshot(self) -> dict:
+    def take_deleted(self) -> list[str]:
+        """兼容旧测试/调用的候选名读取；WSS MUST 使用 take_confirmed_deleted。"""
         with self._lock:
-            return dict(self._cache)
+            items, self._deleted = self._deleted, []
+        return [self._deleted_name(item) for item in items]
 
-    def list_states(self) -> dict:
-        """全量状态快照（读侧 list 用）：pending 优先 + cache 兜底合并。
-
-        返回: {name: {"source": "pending"|"cache", "status", "error_reason"?, "cache_updated_at"?}}
-        复用 get_state 语义（含 pending 超时兜底），缓存无条目的容器不进列表。
-        """
+    def take_delete_candidates(self) -> list[dict]:
         with self._lock:
-            names = set(self._cache) | set(self._pending) | set(self._build_pending)
-        result = {}
-        for name in names:
-            st = self.get_state(name)
-            if st["source"] != "miss":
-                if st["source"] == "cache":
-                    with self._lock:
-                        cache_entry = self._cache.get(name)
-                    if cache_entry and cache_entry.get("cold_verify_since"):
-                        # 冷启动复核中：对外状态 unknown + 触发源，Ctrl 落容器轴 unknown 标记
-                        st["status"] = ContainerStatus.UNKNOWN.value
-                        st["status_source"] = "cold_start_verify"
-                        st["unknown_since"] = cache_entry["cold_verify_since"]
-                result[name] = st
-        return result
+            items, self._deleted = self._deleted, []
+        return items
 
-    #################
-    # 循环维护
-
-    def start(self):
-        # warm-up（数据通路对账契约 C1）：先同步全量对账一次再起采集线程，
-        # 确保 WSS 首帧不是空快照；docker daemon 挂起时对账失败 → collect_error 置位，
-        # 由 pusher 以显式 collect_error 形状发出，绝不发空 dict。
-        self._reconcile_once()
-        threading.Thread(target=self._events_loop, daemon=True, name="status-cache-events").start()
-        threading.Thread(target=self._reconcile_loop, daemon=True, name="status-cache-reconcile").start()
-        threading.Thread(target=self._probe_loop, daemon=True, name="status-cache-probe").start()
-
-    def _probe_sshd(self, name: str) -> bool:
-        """exec 检查容器内 sshd 是否就绪（:22 监听）。任何异常视为未就绪。"""
+    def take_confirmed_deleted(self) -> list[str]:
+        """WSS 发送前：代际复核 + Docker 单容器再次确认，只有明确 NotFound 才发送。"""
+        candidates = self.take_delete_candidates()
+        confirmed: list[str] = []
+        retry: list[dict] = []
+        if not candidates:
+            return confirmed
         try:
             from .. import extensions
-            if extensions.docker_client is None:
-                extensions.init_docker()
-            container = extensions.docker_client.containers.get(name)
+
+            client = extensions.docker_client
+            if client is None:
+                client = docker.from_env()
+        except Exception as e:
+            logger.warning("status-cache delete confirm unavailable, keep candidates: %s", e)
+            with self._lock:
+                self._deleted.extend(candidates)
+                self._collect_error = COLLECT_ERROR_MARKER
+            return confirmed
+
+        for candidate in candidates:
+            if not isinstance(candidate, dict):
+                candidate = {"name": str(candidate), "generation": None}
+            name = candidate["name"]
+            with self._lock:
+                meta = self._meta_for(name)
+                if candidate.get("generation") is None:
+                    candidate["generation"] = meta["generation"]
+                if meta["generation"] != candidate["generation"] or meta.get("create_pending") \
+                        or name in self._build_pending:
+                    logger.info("status-cache delete candidate invalidated before send: name=%s", name)
+                    continue
+            try:
+                absent = self._confirm_absent(name, client)
+            except Exception as e:
+                logger.warning("status-cache delete confirm failed, keep candidate: name=%s err=%s", name, e)
+                retry.append(candidate)
+                continue
+            if not absent:
+                logger.info("status-cache delete candidate reappeared, dropped: name=%s", name)
+                continue
+            with self._lock:
+                meta = self._meta_for(name)
+                if meta["generation"] != candidate["generation"] or meta.get("create_pending") \
+                        or name in self._build_pending:
+                    continue
+                self._cache.pop(name, None)
+                self._pending.pop(name, None)
+                # 删除也是一次对象代际结束：推进代际并清空动作诊断，让在途旧票/
+                # 旧 finish 不能再重建该名称的运行态或复活旧 last_action。
+                meta["generation"] += 1
+                meta["action_seq"] = 0
+                meta["last_applied_read_seq"] = 0
+                meta["last_applied_metrics_read_seq"] = 0
+                meta["current_action"] = None
+                meta["last_action"] = None
+                meta["create_pending"] = False
+                meta.setdefault("actions", collections.OrderedDict()).clear()
+            confirmed.append(name)
+            logger.warning("status-cache delete confirmed: name=%s generation=%s", name, candidate["generation"])
+        if retry:
+            with self._lock:
+                for candidate in retry:
+                    if not any(self._deleted_name(item) == candidate["name"] for item in self._deleted):
+                        self._deleted.append(candidate)
+        return confirmed
+
+    # ------------------------------------------------------------------
+    # 就绪确认/自愈
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _probe_client():
+        from .. import extensions
+        if extensions.docker_client is None:
+            extensions.init_docker()
+        return extensions.docker_client
+
+    def _probe_sshd_container(self, container) -> bool:
+        try:
             r = container.exec_run(["/bin/sh", "-c", _SSHD_READY_CMD], user="root")
-            return getattr(r, 'exit_code', r[0]) == 0
+            return getattr(r, "exit_code", r[0]) == 0
         except Exception:
             return False
 
-    def _runtime_metrics_for_name(self, name: str, gpu_runtime_by_index: dict[str, dict] | None = None) -> dict | None:
-        """按容器名采集一次运行指标；probe 升 online 时补齐首个可用快照。"""
+    def _probe_sshd(self, name: str) -> bool:
+        try:
+            container = self._probe_client().containers.get(name)
+            return self._probe_sshd_container(container)
+        except Exception:
+            return False
 
+    def _ensure_sshd_started_container(self, container, name: str) -> str:
+        try:
+            r = container.exec_run(
+                ["/bin/sh", "-c", "mkdir -p /run/sshd && /usr/sbin/sshd"],
+                user="root",
+            )
+            exit_code = getattr(r, "exit_code", None)
+            if exit_code is None:
+                try:
+                    exit_code = int(r[0])
+                except Exception:
+                    exit_code = -1
+            if exit_code == 0:
+                logger.info("status-cache sshd started (ensure): name=%s", name)
+                return "started"
+            out = ""
+            try:
+                out = r.output.decode("utf-8", errors="ignore") if isinstance(r.output, bytes) else str(r.output or "")
+            except Exception:
+                pass
+            if exit_code == 127 or "not found" in (out or "").lower():
+                logger.warning("status-cache sshd NOT installed in %s (exit=%s): %s", name, exit_code, out.strip()[:120])
+                return "not_installed"
+            logger.debug("status-cache sshd start exit=%s (transient, will retry): name=%s out=%s", exit_code, name, out.strip()[:120])
+            return "transient"
+        except Exception as e:
+            logger.debug("status-cache sshd start attempt failed (will retry): name=%s err=%s", name, e)
+            return "transient"
+
+    def _runtime_metrics_for_name(self, name: str, gpu_runtime_by_index: dict[str, dict] | None = None) -> dict | None:
         try:
             from .. import extensions
             if extensions.docker_client is None:
@@ -754,100 +1829,155 @@ class ContainerStatusCache:
             return None
 
     def _ensure_sshd_started(self, name: str) -> str:
-        """保障：exec 拉起容器内 sshd（无 init 容器下 /usr/sbin/sshd 是唯一可靠入口，create 同款）。
-
-        /usr/sbin/sshd 幂等：已在运行时报错退出，无害。
-        返回: "started" | "not_installed"（sshd 未安装 → 终态 FAILED，等人工处置）| "transient"（可重试）
-        """
         try:
-            from .. import extensions
-            if extensions.docker_client is None:
-                extensions.init_docker()
-            container = extensions.docker_client.containers.get(name)
-            # 注意：docker-py exec_run 不支持 timeout 参数（真实环境传了会 TypeError，
-            # 被吞后永远走 transient，FAILED 路径失效——真 docker 集成测试抓到的坑）
-            r = container.exec_run(
-                ["/bin/sh", "-c", "mkdir -p /run/sshd && /usr/sbin/sshd"],
-                user="root",
-            )
-            exit_code = getattr(r, 'exit_code', None)
-            if exit_code is None:
-                try:
-                    exit_code = int(r[0])
-                except Exception:
-                    exit_code = -1
-            if exit_code == 0:
-                logger.info("status-cache sshd started (ensure): name=%s", name)
-                return "started"
-            out = ""
-            try:
-                out = r.output.decode('utf-8', errors='ignore') if isinstance(r.output, bytes) else str(r.output or '')
-            except Exception:
-                pass
-            if exit_code == 127 or 'not found' in (out or '').lower():
-                # sshd 未安装（create 半成品/安装失败）：平台不可用终态，FAILED 等人工处置
-                logger.warning(
-                    "status-cache sshd NOT installed in %s (exit=%s): %s",
-                    name, exit_code, out.strip()[:120],
-                )
-                return "not_installed"
-            logger.debug(
-                "status-cache sshd start exit=%s (transient, will retry): name=%s out=%s",
-                exit_code, name, out.strip()[:120],
-            )
-            return "transient"
+            return self._ensure_sshd_started_container(self._probe_client().containers.get(name), name)
         except Exception as e:
             logger.debug("status-cache sshd start attempt failed (will retry): name=%s err=%s", name, e)
             return "transient"
 
-    def _probe_ready_checks_once(self) -> None:
-        """单轮就绪确认（保障）：对 ready_check 容器探测，就绪升 online；未就绪尝试拉起。
+    @staticmethod
+    def _same_probe_process(pre: DockerFact, post: DockerFact) -> bool:
+        return bool(
+            pre.docker_id
+            and pre.started_at
+            and pre.docker_id == post.docker_id
+            and pre.started_at == post.started_at
+        )
 
-        - 就绪（:22 监听）→ update 整条目覆盖为 online，自动清 ready_check
-        - 未就绪 → _ensure_sshd_started 尝试拉起（无 init 容器下 sshd 不自启的兜底），保持 starting
-        """
+    def _set_hard_block_if_current(
+        self,
+        name: str,
+        ticket: Observation,
+        fact: DockerFact,
+        reason: str,
+        detail: str | None,
+    ) -> bool:
+        """probe 失败晚到：只有票仍当前且对象/进程未变时才写硬阻塞。"""
+        with self._lock:
+            meta = self._meta_for(name)
+            if ticket.node_epoch != self.node_epoch:
+                return False
+            if ticket.generation != meta["generation"] or ticket.action_seq != meta["action_seq"]:
+                logger.info("status-cache probe hard block dropped (superseded): name=%s", name)
+                return False
+            if ticket.read_seq <= meta["last_applied_read_seq"]:
+                logger.info("status-cache probe hard block dropped (stale read): name=%s", name)
+                return False
+            entry = self._cache.get(name) or {}
+            if entry.get("docker_id") and fact.docker_id and entry["docker_id"] != fact.docker_id:
+                logger.info("status-cache probe hard block dropped (object changed): name=%s", name)
+                return False
+            ready = entry.get("ready_identity") or {}
+            if fact.started_at and ready.get("started_at") and ready["started_at"] != fact.started_at:
+                logger.info("status-cache probe hard block dropped (process changed): name=%s", name)
+                return False
+            entry = dict(entry)
+            entry.update(
+                {
+                    "status": ContainerStatus.FAILED.value,
+                    "hard_block": True,
+                    "failed_reason": reason,
+                    "failed_detail": detail,
+                    "docker_id": fact.docker_id or entry.get("docker_id"),
+                    "ready_verified": False,
+                    "updated_at": _utc_iso(),
+                }
+            )
+            entry.pop("ready_identity", None)
+            entry.pop("ready_check", None)
+            self._cache[name] = entry
+            meta["last_applied_read_seq"] = ticket.read_seq
+            return True
+
+    def _probe_ready_once(self, name: str, gpu_runtime_by_index: dict[str, dict] | None = None) -> None:
+        """对同一 Docker 进程完成“inspect→probe→同进程 post-inspect”后才 ready。"""
+        ticket = self.issue_observation(name, "probe")
+        try:
+            client = self._probe_client()
+            container = client.containers.get(name)
+            reload = getattr(container, "reload", None)
+            if callable(reload):
+                reload()
+            pre = fact_from_container(container)
+        except Exception as e:
+            logger.warning("status-cache probe pre-inspect failed: name=%s err=%s", name, e)
+            return
+        if not pre.running or pre.dead or pre.paused or pre.status in {
+            "created", "restarting", "exited", "stopped", "removing"
+        }:
+            # 非 running 事实仍要先收敛运行态；不得对已变化对象继续 probe。
+            self.publish_observed(name, ticket, pre)
+            return
+
+        if self._probe_sshd_container(container):
+            try:
+                post_container = client.containers.get(name)
+                post_reload = getattr(post_container, "reload", None)
+                if callable(post_reload):
+                    post_reload()
+                post = fact_from_container(post_container)
+            except Exception as e:
+                logger.warning("status-cache probe post-inspect failed: name=%s err=%s", name, e)
+                return
+            if not self._same_probe_process(pre, post) or not post.running or post.paused:
+                logger.info(
+                    "status-cache probe result dropped (process changed): name=%s pre=%s post=%s",
+                    name,
+                    pre.identity,
+                    post.identity,
+                )
+                return
+            metrics = _container_runtime_metrics(container, gpu_runtime_by_index)
+            if self.publish_observed(name, ticket, post, runtime_metrics=metrics, mark_ready=True):
+                logger.info("status-cache sshd probe ready: name=%s", name)
+            return
+
+        ensure_status = self._ensure_sshd_started_container(container, name)
+        if ensure_status != "not_installed":
+            logger.warning("status-cache sshd probe not ready, trying to start sshd: name=%s", name)
+            return
+        try:
+            post_container = client.containers.get(name)
+            post_reload = getattr(post_container, "reload", None)
+            if callable(post_reload):
+                post_reload()
+            post = fact_from_container(post_container)
+        except Exception as e:
+            logger.warning("status-cache probe not-installed post-inspect failed: name=%s err=%s", name, e)
+            return
+        if not self._same_probe_process(pre, post):
+            logger.info("status-cache not-installed result dropped (process changed): name=%s", name)
+            return
+        if self._set_hard_block_if_current(
+            name,
+            ticket,
+            post,
+            "sshd_not_installed",
+            "container image does not provide /usr/sbin/sshd",
+        ):
+            logger.warning("status-cache: sshd missing in %s; marking FAILED (manual handling)", name)
+
+    def _probe_ready_checks_once(self) -> None:
         try:
             with self._lock:
-                targets = [name for name, e in self._cache.items() if e.get("ready_check")]
+                targets = [
+                    name
+                    for name, e in self._cache.items()
+                    if e.get("ready_check")
+                    or (e.get("hard_block") and e.get("failed_reason") == "sshd_not_installed")
+                ]
             gpu_runtime_by_index = None
             for name in targets:
-                if self._probe_sshd(name):
-                    logger.info("status-cache sshd probe ready: name=%s", name)
-                    if gpu_runtime_by_index is None:
-                        gpu_runtime_by_index = _nvidia_gpu_runtime_by_index()
-                    self.update(
-                        name,
-                        ContainerStatus.ONLINE.value,
-                        runtime_metrics=self._runtime_metrics_for_name(name, gpu_runtime_by_index),
-                    )
-                else:
-                    # 自愈（保障）：sshd 未就绪 → 尝试拉起。无 init 容器下 /usr/sbin/sshd
-                    # 是唯一可靠入口（create 同款启动方式）；幂等，已在运行时报错但无害。
-                    ensure_status = self._ensure_sshd_started(name)
-                    if ensure_status == "not_installed":
-                        # sshd 未安装 = 平台不可用终态：FAILED，等人工处置（删除重建/修复）
-                        logger.warning(
-                            "status-cache: sshd missing in %s; marking FAILED (manual handling)",
-                            name,
-                        )
-                        with self._lock:
-                            self._cache[name] = {
-                                "status": ContainerStatus.FAILED.value,
-                                "failed_reason": "sshd_not_installed",
-                                "failed_detail": "container image does not provide /usr/sbin/sshd",
-                                "updated_at": datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%S'),
-                            }
-                    else:
-                        logger.warning("status-cache sshd probe not ready, trying to start sshd: name=%s", name)
+                self._probe_ready_once(name, gpu_runtime_by_index)
         except Exception as e:
             logger.warning("status-cache probe loop interrupted (will retry): %s", e)
 
-    def _probe_loop(self):  # sshd 就绪确认 + 自愈：对 ready_check 容器节流探测，就绪升 online
+    def _probe_loop(self):
         while True:
             time.sleep(PROBE_INTERVAL)
             self._probe_ready_checks_once()
 
-    def _events_loop(self):  # 主通道：docker events 订阅（push）
+    def _events_loop(self):
         while True:
             try:
                 client = docker.from_env()
@@ -855,40 +1985,15 @@ class ContainerStatusCache:
                     self._apply_event(event)
             except Exception as e:
                 logger.warning("status-cache events loop interrupted (will retry): %s", e)
-                time.sleep(2)  # docker daemon 断连重试
+                time.sleep(2)
 
-    def _reconcile_once(self) -> None:
-        """单次全量对账（采集兜底 + 幽灵容器感知 + collect_error 置位/清除）。
-
-        成功 → 清除 collect_error（快照恢复正常全量）；异常 → 置位
-        COLLECT_ERROR_MARKER（快照以显式 collect_error 形状发出，Ctrl 置 FAILED）。
-        """
-        try:
-            client = docker.from_env()
-            live = set()
-            gpu_runtime_by_index = _nvidia_gpu_runtime_by_index()
-            for c in client.containers.list(all=True):
-                live.add(c.name)
-                self._apply_container(c, gpu_runtime_by_index)
-            # 消失检测（幽灵容器感知）：只有缓存里出现过的容器才算“已产生过”。
-            # build/pending 是过渡读面，不是 Docker 容器对象存在的证据，不能触发 delete。
-            with self._lock:
-                known = set(self._cache)
-            vanished = known - live
-            for name in sorted(vanished):
-                with self._lock:
-                    self._cache.pop(name, None)
-                    self._pending.pop(name, None)
-                    self._deleted.append(name)
-                logger.warning("status-cache reconcile: container %r vanished (delete queued)", name)
-            with self._lock:
-                self._collect_error = None
-        except Exception as e:
-            with self._lock:
-                self._collect_error = COLLECT_ERROR_MARKER
-            logger.warning("status-cache reconcile failed (collect_error set): %s", e)
-
-    def _reconcile_loop(self):  # 兜底：定时全量对账（poll）
+    def _reconcile_loop(self):
         while True:
             time.sleep(RECONCILE_INTERVAL)
             self._reconcile_once()
+
+    def start(self):
+        self._reconcile_once()
+        threading.Thread(target=self._events_loop, daemon=True, name="status-cache-events").start()
+        threading.Thread(target=self._reconcile_loop, daemon=True, name="status-cache-reconcile").start()
+        threading.Thread(target=self._probe_loop, daemon=True, name="status-cache-probe").start()

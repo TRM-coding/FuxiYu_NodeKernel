@@ -25,6 +25,35 @@ CollaboratorRole = Literal["admin", "collaborator"]
 UpdatedRole = Literal["admin", "collaborator", "root"]
 PauseAction = Literal["pause", "unpause"]
 
+ActionName = Literal["create", "start", "stop", "restart", "pause", "unpause"]
+ActionPhase = Literal[
+    "accepted",
+    "confirmed",
+    "idempotent_confirmed",
+    "failed",
+    "unconfirmed",
+    "superseded",
+    "timed_out",
+]
+MountPathStatus = Literal["resolved", "unresolved", "not_running", "no_bind"]
+
+
+class ActionRef(BaseModel):
+    """Node 本进程内的动作引用，不是 Q70 跨进程删除身份。"""
+
+    node_epoch: str
+    generation: int = Field(ge=0)
+    seq: int = Field(ge=0)
+
+
+class LastAction(BaseModel):
+    """最新本地动作的只读诊断投影；失败不改变运行态。"""
+
+    ref: ActionRef
+    action: ActionName
+    phase: ActionPhase
+    error_reason: str | None = None
+
 
 class ContainerConfig(BaseModel):
     gpu_list: list[int] = Field(default_factory=list, description="GPU device ids. Empty means CPU only.")
@@ -52,6 +81,7 @@ class ContainerNameConfig(BaseModel):
 class ContainerOperationAcceptedResponse(SuccessResponse):
     container_status: ContainerStatus
     container_name: str
+    action_ref: ActionRef | None = None
 
 
 class RestoreAccountConfig(BaseModel):
@@ -75,6 +105,7 @@ class CreateContainerMessage(BaseModel):
 class CreateContainerResponse(SuccessResponse):
     container_status: Literal["building", "creating"]
     container_name: str
+    action_ref: ActionRef | None = None
 
 
 #####################
@@ -92,6 +123,9 @@ class ContainerStatusResponse(ContainerOperationAcceptedResponse):
     failed_reason: str | None = None
     failed_detail: str | None = None
     runtime_metrics: dict[str, Any] | None = None
+    last_action: LastAction | None = None
+    status_source: str | None = None
+    unknown_since: str | None = None
 
 
 #####################
@@ -243,13 +277,22 @@ class MachineDiskUsage(BaseModel):
 
 
 class ContainerDiskUsage(BaseModel):
+    """磁盘用量 wire 模型（HTTP/WSS 共用）。
+
+    ``bind_mount_path`` 是业务路径；``mount_path_status`` 只表达路径核对结果，
+    不是业务门禁。目录 dev/inode/PID 不进入本模型；`measured_at` 只表示本次
+    overlay/bind 组合中较早的真实完成时间。
+    """
+
     container_name: str | None = None
     overlay_rw_bytes: int | None = None
     bind_mount_bytes: int | None = None
     bind_mount_path: str | None = None
+    mount_path_status: MountPathStatus | None = "unresolved"
     bind_mount_source: str | None = None
     total_bytes: int | None = None
     error: str | None = None
+    measured_at: str | None = None
 
 
 class CheckDiskUsageResponse(SuccessResponse):

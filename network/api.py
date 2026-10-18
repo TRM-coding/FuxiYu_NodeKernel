@@ -1,6 +1,5 @@
 import logging
 import subprocess
-import threading
 
 from fastapi import APIRouter
 from fastapi.responses import JSONResponse
@@ -43,17 +42,15 @@ from ..services.container_service import (
     clean_mount,
     container_exists,
     create_container,
+    execute_container_action,
     list_container_status,
     list_disk_usage,
     list_last_ssh,
-    pause_container,
     remove_collaborator,
     remove_container,
-    restart_container,
-    start_container,
-    stop_container,
     update_role,
 )
+from ..docker_operates.status_cache import ActionOutcome
 from ..utils.Container import Container
 
 logger = logging.getLogger(__name__)
@@ -129,28 +126,20 @@ def create_container_api(message: CreateContainerMessage):
 
     initial_status = ContainerStatus.BUILDING.value if message.image_build is not None else ContainerStatus.CREATING.value
 
-    def _bg_create(owner_name: str, cfg_obj):
+    def _bg_create(ref: dict):
+        name = ref["name"]
         try:
-            logger.info("create_container background started: name=%s owner=%s", cfg_obj.name, owner_name)
+            logger.info("create_container background started: name=%s owner=%s", name, message.owner_name)
             if message.image_build is not None:
-                extensions.status_cache.begin_build(cfg_obj.name)
                 try:
                     image_tag = build_image(message.image_build)
                 except Exception as e:
-                    logger.warning("create_container image build failed: name=%s error=%s", cfg_obj.name, e)
-                    extensions.status_cache.finish_build_failed(
-                        cfg_obj.name,
-                        failed_reason="build_failed",
-                        failed_detail=str(e),
-                    )
-                    return
-                cfg_obj.image = image_tag
-                extensions.status_cache.begin_action(cfg_obj.name, "create", ContainerStatus.CREATING.value)
-            else:
-                extensions.status_cache.begin_action(cfg_obj.name, "create", ContainerStatus.CREATING.value)
+                    logger.warning("create_container image build failed: name=%s error=%s", name, e)
+                    return ActionOutcome("failed", "build_failed")
+                cfg.image = image_tag
             result = create_container(
-                owner_name,
-                cfg_obj,
+                message.owner_name,
+                cfg,
                 public_key=message.public_key,
                 restore_mount_path=message.restore_mount_path,
             )
@@ -163,33 +152,48 @@ def create_container_api(message: CreateContainerMessage):
                 result.container_name,
                 result.container_id,
             )
-            # 端口映射（docker 实际绑定的结果）回填 status_cache，随快照推 Ctrl 落库。
-            # 号由 Node 在创建时分配并显式绑定，这里仍以 docker 回读为准。
+            # 旧 create 晚回不得写新对象：端口/refresh 都固定受理 ref 的代际与序号。
             extensions.status_cache.set_port_info(
-                cfg_obj.name,
+                name,
                 getattr(result, "port", None),
                 getattr(result, "port_mappings", None),
+                ref=ref,
             )
-            extensions.status_cache.mark_ready_check(cfg_obj.name, status=ContainerStatus.CREATING.value)
-            logger.info("create_container marked ready_check: name=%s", cfg_obj.name)
+            # create 自身确认首次 docker_id 绑定：不推进代际、不取消本 create。
+            extensions.status_cache.refresh_from_docker(
+                name,
+                source="create",
+                action_ref=ref,
+                from_create_confirmation=True,
+            )
+            return ActionOutcome("confirmed")
         except Exception as e:
             logger.warning("create_container error: %s", e)
-            extensions.status_cache.finish_action(
-                cfg_obj.name,
-                ContainerStatus.FAILED.value,
-                failed_reason="create_failed",
-                failed_detail=str(e),
+            # 有 Docker 对象时按真实实态分类（created 半成品会成为硬阻塞）；
+            # 没有对象时 finish 会落 unknown，不把动作失败永久写成运行态 failed。
+            extensions.status_cache.refresh_from_docker(
+                name,
+                source="create_error",
+                action_ref=ref,
+                from_create_confirmation=True,
             )
+            return ActionOutcome("failed", "create_failed")
 
     try:
-        threading.Thread(target=_bg_create, args=(message.owner_name, cfg), daemon=True).start()
+        action_ref = extensions.status_cache.submit_action(
+            cfg.name,
+            "create",
+            initial_status,
+            _bg_create,
+            create=True,
+        )
     except Exception as e:
         return JSONResponse(
             status_code=500,
             content={"success": 0, "error": str(e), "error_reason": "background_thread_failed"},
         )
 
-    return {"success": 1, "container_status": initial_status, "container_name": cfg.name}
+    return {"success": 1, "container_status": initial_status, "container_name": cfg.name, "action_ref": action_ref}
 
 
 @router.post("/container_status", response_model=ContainerStatusResponse)
@@ -206,7 +210,13 @@ def container_status_api(message: ContainerStatusMessage):
     try:
         state = list_container_status().get(container_name)
         if state is None:
-            return {"success": 1, "container_status": ContainerStatus.UNKNOWN.value, "container_name": container_name}
+            return {
+                "success": 1,
+                "container_status": ContainerStatus.UNKNOWN.value,
+                "container_name": container_name,
+                "last_action": None,
+            }
+        last_action = state.get("last_action")
         if state["status"] == ContainerStatus.FAILED.value:
             return {
                 "success": 0,
@@ -218,6 +228,7 @@ def container_status_api(message: ContainerStatusMessage):
                 "failed_detail": state.get("failed_detail"),
                 "runtime_metrics": state.get("runtime_metrics"),
                 "cache_updated_at": state.get("cache_updated_at"),
+                "last_action": last_action,
             }
         if state["source"] in {"pending", "build"}:
             return {
@@ -225,14 +236,21 @@ def container_status_api(message: ContainerStatusMessage):
                 "container_status": state["status"],
                 "container_name": container_name,
                 "runtime_metrics": state.get("runtime_metrics"),
+                "last_action": last_action,
             }
-        return {
+        body = {
             "success": 1,
             "container_status": state["status"],
             "container_name": container_name,
             "runtime_metrics": state.get("runtime_metrics"),
             "cache_updated_at": state.get("cache_updated_at"),
+            "last_action": last_action,
         }
+        if state.get("status_source"):
+            body["status_source"] = state["status_source"]
+        if state.get("unknown_since"):
+            body["unknown_since"] = state["unknown_since"]
+        return body
     except Exception as e:
         return JSONResponse(status_code=500, content={"success": 0, "error": str(e), "error_reason": "internal_error"})
 
@@ -314,94 +332,72 @@ def add_collaborator_api(message: AddCollaboratorMessage):
     return {"success": success, "decrypted_message": _model_data(message)}
 
 
+def _submit_container_action(name: str, action: str, transition: str) -> dict | JSONResponse:
+    def _runner(ref: dict):
+        return execute_container_action(name, action, ref)
+
+    try:
+        return extensions.status_cache.submit_action(name, action, transition, _runner)
+    except Exception as e:
+        logger.warning("submit action failed: name=%s action=%s err=%s", name, action, e)
+        return JSONResponse(
+            status_code=500,
+            content={"success": 0, "error": str(e), "error_reason": "background_thread_failed"},
+        )
+
+
 @router.post("/start_container", response_model=StartContainerResponse)
 def start_container_api(message: StartContainerMessage):
-    """启动容器；实际启动动作放入后台线程，接口立即返回 starting。"""
+    """启动容器；受理即返回 starting，最终结果由新鲜 Docker 实态与就绪门禁确认。"""
 
     container_name = _container_name(message.config)
     if not container_name:
         return _bad_request("missing container_name", "missing_container_name")
-
-    def _bg_start(name: str):
-        try:
-            extensions.status_cache.begin_action(name, "start", ContainerStatus.STARTING.value)
-            ok = start_container(name)
-            if ok:
-                # 与 restart 同构：docker running ≠ sshd 就绪——进入 ready_check 确认门禁，
-                # 由 probe 循环验 :22 通过后才 ONLINE（无 init 容器 sshd 不自启的兜底）。
-                extensions.status_cache.mark_ready_check(name, status=ContainerStatus.STARTING.value)
-            else:
-                extensions.status_cache.finish_action(name, ContainerStatus.FAILED.value, failed_reason="start_failed")
-        except Exception as e:
-            logger.warning("bg start error: %s", e)
-            extensions.status_cache.finish_action(
-                name,
-                ContainerStatus.FAILED.value,
-                failed_reason="start_failed",
-                failed_detail=str(e),
-            )
-
-    threading.Thread(target=_bg_start, args=(container_name,), daemon=True).start()
-    return {"success": 1, "container_status": ContainerStatus.STARTING.value, "container_name": container_name}
+    action_ref = _submit_container_action(container_name, "start", ContainerStatus.STARTING.value)
+    if isinstance(action_ref, JSONResponse):
+        return action_ref
+    return {
+        "success": 1,
+        "container_status": ContainerStatus.STARTING.value,
+        "container_name": container_name,
+        "action_ref": action_ref,
+    }
 
 
 @router.post("/stop_container", response_model=StopContainerResponse)
 def stop_container_api(message: StopContainerMessage):
-    """停止容器；实际停止动作放入后台线程，接口立即返回 stopping。"""
+    """停止容器；受理即返回 stopping，最终结果由新鲜 Docker 实态确认。"""
 
     container_name = _container_name(message.config)
     if not container_name:
         return _bad_request("missing container_name", "missing_container_name")
-
-    def _bg_stop(name: str):
-        try:
-            extensions.status_cache.begin_action(name, "stop", ContainerStatus.STOPPING.value)
-            ok = stop_container(name)
-            extensions.status_cache.finish_action(
-                name,
-                ContainerStatus.OFFLINE.value if ok else ContainerStatus.FAILED.value,
-                failed_reason=None if ok else "stop_failed",
-            )
-        except Exception as e:
-            logger.warning("bg stop error: %s", e)
-            extensions.status_cache.finish_action(
-                name,
-                ContainerStatus.FAILED.value,
-                failed_reason="stop_failed",
-                failed_detail=str(e),
-            )
-
-    threading.Thread(target=_bg_stop, args=(container_name,), daemon=True).start()
-    return {"success": 1, "container_status": ContainerStatus.STOPPING.value, "container_name": container_name}
+    action_ref = _submit_container_action(container_name, "stop", ContainerStatus.STOPPING.value)
+    if isinstance(action_ref, JSONResponse):
+        return action_ref
+    return {
+        "success": 1,
+        "container_status": ContainerStatus.STOPPING.value,
+        "container_name": container_name,
+        "action_ref": action_ref,
+    }
 
 
 @router.post("/restart_container", response_model=RestartContainerResponse)
 def restart_container_api(message: RestartContainerMessage):
-    """重启容器；实际重启动作放入后台线程，接口立即返回 restarting。"""
+    """重启容器；受理即清除旧 ready 证明并返回 restarting。"""
 
     container_name = _container_name(message.config)
     if not container_name:
         return _bad_request("missing container_name", "missing_container_name")
-
-    def _bg_restart(name: str):
-        try:
-            extensions.status_cache.begin_action(name, "restart", ContainerStatus.RESTARTING.value)
-            ok = restart_container(name)
-            if ok:
-                extensions.status_cache.mark_ready_check(name, status=ContainerStatus.RESTARTING.value)
-            else:
-                extensions.status_cache.finish_action(name, ContainerStatus.FAILED.value, failed_reason="restart_failed")
-        except Exception as e:
-            logger.warning("bg restart error: %s", e)
-            extensions.status_cache.finish_action(
-                name,
-                ContainerStatus.FAILED.value,
-                failed_reason="restart_failed",
-                failed_detail=str(e),
-            )
-
-    threading.Thread(target=_bg_restart, args=(container_name,), daemon=True).start()
-    return {"success": 1, "container_status": ContainerStatus.RESTARTING.value, "container_name": container_name}
+    action_ref = _submit_container_action(container_name, "restart", ContainerStatus.RESTARTING.value)
+    if isinstance(action_ref, JSONResponse):
+        return action_ref
+    return {
+        "success": 1,
+        "container_status": ContainerStatus.RESTARTING.value,
+        "container_name": container_name,
+        "action_ref": action_ref,
+    }
 
 
 @router.post("/remove_collaborator", response_model=RemoveCollaboratorResponse)
@@ -458,45 +454,32 @@ def check_disk_usage_api(message: CheckDiskUsageMessage):
             "overlay_rw_bytes": None,
             "bind_mount_bytes": None,
             "bind_mount_path": None,
+            "mount_path_status": "unresolved",
             "bind_mount_source": "none",
-            "total_bytes": 0,
+            "total_bytes": None,
             "error": "not_collected",
+            "measured_at": None,
         }
     return {"success": 1, "machine_disk": snapshot.get("machine_disk", {}), "container": container_usage}
 
 
 @router.post("/pause_container", response_model=PauseContainerResponse)
 def pause_container_api(message: PauseContainerMessage):
-    """暂停或恢复容器；实际动作放入后台线程，接口立即返回转换态。"""
+    """暂停或恢复容器；受理只表示 accepted，结果以新鲜实态和幂等表确认。"""
 
     container_name = message.config.container_name
+    if not container_name:
+        return _bad_request("missing container_name", "missing_container_name")
     action = message.config.action
-
-    def _bg_pause(name: str, act: str):
-        try:
-            extensions.status_cache.begin_action(name, act, "pausing" if act == "pause" else "unpausing")
-            ok = pause_container(name, act)
-            if ok:
-                extensions.status_cache.finish_action(
-                    name,
-                    ContainerStatus.PAUSED.value if act == "pause" else ContainerStatus.ONLINE.value,
-                )
-            else:
-                extensions.status_cache.finish_action(name, ContainerStatus.FAILED.value, failed_reason=f"{act}_failed")
-        except Exception as e:
-            logger.warning("bg pause error for %s: %s", name, e)
-            extensions.status_cache.finish_action(
-                name,
-                ContainerStatus.FAILED.value,
-                failed_reason=f"{act}_failed",
-                failed_detail=str(e),
-            )
-
-    threading.Thread(target=_bg_pause, args=(container_name, action), daemon=True).start()
+    transition = "pausing" if action == "pause" else "unpausing"
+    action_ref = _submit_container_action(container_name, action, transition)
+    if isinstance(action_ref, JSONResponse):
+        return action_ref
     return {
         "success": 1,
-        "container_status": "pausing" if action == "pause" else "unpausing",
+        "container_status": transition,
         "container_name": container_name,
+        "action_ref": action_ref,
     }
 
 

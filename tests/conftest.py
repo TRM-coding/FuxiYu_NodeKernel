@@ -126,3 +126,23 @@ def encrypted_body(payload: dict) -> dict:
 def key_paths(monkeypatch):
     """check_keys 已退役：空 fixture 占位（保留签名，避免调用方改动）。"""
     pass
+
+
+def _local_docker_available() -> bool:
+    try:
+        client = docker_pkg.from_env()
+        client.ping()
+        return True
+    except Exception:
+        return False
+
+
+def pytest_collection_modifyitems(config, items):
+    """本机无 Docker daemon 时把 docker 标记用例显式 skip，绝不伪造通过。"""
+
+    docker_items = [item for item in items if item.get_closest_marker("docker")]
+    if not docker_items or _local_docker_available():
+        return
+    skip = pytest.mark.skip(reason="local Docker daemon unavailable")
+    for item in docker_items:
+        item.add_marker(skip)

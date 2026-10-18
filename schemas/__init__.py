@@ -5,6 +5,9 @@ from .common import (
     SuccessResponse,
 )
 from .container import (
+    ActionName,
+    ActionPhase,
+    ActionRef,
     AddCollaboratorConfig,
     AddCollaboratorMessage,
     AddCollaboratorResponse,
@@ -28,8 +31,10 @@ from .container import (
     CreateContainerMessage,
     CreateContainerResponse,
     DiskUsageResponse,
+    LastAction,
     LastSshTimeResponse,
     MachineDiskUsage,
+    MountPathStatus,
     MachineStatusMessage,
     MachineStatusResponse,
     PauseAction,
@@ -54,6 +59,9 @@ from .container import (
 )
 
 __all__ = [
+    "ActionName",
+    "ActionPhase",
+    "ActionRef",
     "AddCollaboratorConfig",
     "AddCollaboratorMessage",
     "AddCollaboratorResponse",
@@ -80,8 +88,10 @@ __all__ = [
     "DiskUsageResponse",
     "EmptyConfig",
     "ErrorResponses",
+    "LastAction",
     "LastSshTimeResponse",
     "MachineDiskUsage",
+    "MountPathStatus",
     "MachineStatusMessage",
     "MachineStatusResponse",
     "PauseAction",

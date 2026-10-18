@@ -9,7 +9,7 @@ from fastapi.testclient import TestClient
 from FuxiYu_NodeKernel import create_app, extensions
 from FuxiYu_NodeKernel.network import api as api_module
 from FuxiYu_NodeKernel.network import wss as wss_module
-from FuxiYu_NodeKernel.services.container_service import CreateContainerReturn
+from FuxiYu_NodeKernel.services.container_service import ActionExecutionResult, CreateContainerReturn
 
 from .conftest import FakeDockerClient
 
@@ -240,10 +240,10 @@ def test_create_container_build_failed_is_visible_without_delete(client, monkeyp
         json={"config": {"container_name": cfg["name"]}},
     )
     body = status_resp.json()
-    assert body["success"] == 0
-    assert body["container_status"] == "failed"
-    assert body["failed_reason"] == "build_failed"
-    assert body["failed_detail"] == "docker build failed"
+    # 构建失败是动作诊断，不是运行态 failed；没有 Docker 对象时读面为 unknown。
+    assert body["container_status"] == "unknown"
+    assert body["last_action"]["phase"] == "failed"
+    assert body["last_action"]["error_reason"] == "build_failed"
 
     class _NoContainerClient:
         class _Containers:
@@ -376,85 +376,76 @@ def test_update_role_invalid_role_422(client):
     assert resp.status_code == 422
 
 
-def test_start_container_success(client, monkeypatch):
-    # 与 restart 同构：start 成功后进入 ready_check 确认门禁（docker running ≠ sshd 就绪），
-    # 由 probe 循环验 :22 通过后才 ONLINE
-    _patched_service(monkeypatch, "start_container", lambda name: True)
+def _wait_action(name, phase, timeout=2.0):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        last = extensions.status_cache.get_state(name).get("last_action") or {}
+        if last.get("phase") == phase:
+            return True
+        time.sleep(0.01)
+    return False
+
+
+def _action_stub(phase="confirmed"):
+    return lambda name, action, ref: ActionExecutionResult(phase)
+
+
+def test_start_container_success_accepts_with_action_ref(client, monkeypatch):
+    extensions.status_cache.forget_container_generation("c1")
+    _patched_service(monkeypatch, "execute_container_action", _action_stub())
     resp = client.post("/api/start_container", json={"config": {"container_name": "c1"}})
     assert resp.status_code == 200
-    assert resp.json()["container_status"] == "starting"
-    time.sleep(0.1)
-    state = extensions.status_cache.get_state("c1")
-    assert state["status"] == "starting"
-    assert extensions.status_cache.get("c1")["ready_check"] is True
+    body = resp.json()
+    assert body["container_status"] == "starting"
+    assert body["action_ref"]["node_epoch"] == extensions.status_cache.node_epoch
+    assert body["action_ref"]["seq"] >= 1
+    assert _wait_action("c1", "confirmed")
 
 
-def test_start_container_waits_for_sshd_probe_before_online(client, monkeypatch):
-    _patched_service(monkeypatch, "start_container", lambda name: True)
-    monkeypatch.setattr(extensions.status_cache, "_probe_sshd", lambda name: True)
-
-    resp = client.post("/api/start_container", json={"config": {"container_name": "c_start_probe"}})
-
-    assert resp.status_code == 200
-    time.sleep(0.1)
-    for name, entry in list(extensions.status_cache.snapshot().items()):
-        if entry.get("ready_check") and extensions.status_cache._probe_sshd(name):
-            extensions.status_cache.update(name, "online")
-    assert extensions.status_cache.get_state("c_start_probe")["status"] == "online"
-
-
-def test_stop_container_success(client, monkeypatch):
-    _patched_service(monkeypatch, "stop_container", lambda name: True)
+def test_stop_container_success_accepts_with_action_ref(client, monkeypatch):
+    extensions.status_cache.forget_container_generation("c1")
+    _patched_service(monkeypatch, "execute_container_action", _action_stub())
     resp = client.post("/api/stop_container", json={"config": {"container_name": "c1"}})
     assert resp.status_code == 200
-    assert resp.json()["container_status"] == "stopping"
-    time.sleep(0.1)
-    assert extensions.status_cache.get_state("c1")["status"] == "offline"
+    body = resp.json()
+    assert body["container_status"] == "stopping"
+    assert body["action_ref"]["seq"] >= 1
+    assert _wait_action("c1", "confirmed")
 
 
-def test_restart_container_success(client, monkeypatch):
-    _patched_service(monkeypatch, "restart_container", lambda name: True)
+def test_restart_container_success_accepts_with_action_ref(client, monkeypatch):
+    extensions.status_cache.forget_container_generation("c_restart")
+    _patched_service(monkeypatch, "execute_container_action", _action_stub())
     resp = client.post("/api/restart_container", json={"config": {"container_name": "c_restart"}})
     assert resp.status_code == 200
-    assert resp.json()["container_status"] == "restarting"
-    time.sleep(0.1)
-    state = extensions.status_cache.get_state("c_restart")
-    assert state["status"] == "restarting"
-    assert extensions.status_cache.get("c_restart")["ready_check"] is True
+    body = resp.json()
+    assert body["container_status"] == "restarting"
+    assert body["action_ref"]["node_epoch"] == extensions.status_cache.node_epoch
+    assert _wait_action("c_restart", "confirmed")
 
 
-def test_restart_container_waits_for_sshd_probe_before_online(client, monkeypatch):
-    _patched_service(monkeypatch, "restart_container", lambda name: True)
-    monkeypatch.setattr(extensions.status_cache, "_probe_sshd", lambda name: True)
-
-    resp = client.post("/api/restart_container", json={"config": {"container_name": "c_restart_probe"}})
-
-    assert resp.status_code == 200
-    time.sleep(0.1)
-    for name, entry in list(extensions.status_cache.snapshot().items()):
-        if entry.get("ready_check") and extensions.status_cache._probe_sshd(name):
-            extensions.status_cache.update(name, "online")
-    assert extensions.status_cache.get_state("c_restart_probe")["status"] == "online"
-
-
-def test_pause_container_success(client, monkeypatch):
-    _patched_service(monkeypatch, "pause_container", lambda name, action: True)
+def test_pause_container_success_accepts_with_action_ref(client, monkeypatch):
+    extensions.status_cache.forget_container_generation("c1")
+    _patched_service(monkeypatch, "execute_container_action", _action_stub())
     payload = {"config": {"container_name": "c1", "action": "pause"}}
     resp = client.post("/api/pause_container", json=payload)
     assert resp.status_code == 200
-    assert resp.json()["container_status"] == "pausing"
-    time.sleep(0.1)
-    assert extensions.status_cache.get_state("c1")["status"] == "paused"
+    body = resp.json()
+    assert body["container_status"] == "pausing"
+    assert body["action_ref"]["seq"] >= 1
+    assert _wait_action("c1", "confirmed")
 
 
-def test_unpause_container_success(client, monkeypatch):
-    _patched_service(monkeypatch, "pause_container", lambda name, action: True)
+def test_unpause_container_success_accepts_with_action_ref(client, monkeypatch):
+    extensions.status_cache.forget_container_generation("c1")
+    _patched_service(monkeypatch, "execute_container_action", _action_stub("idempotent_confirmed"))
     payload = {"config": {"container_name": "c1", "action": "unpause"}}
     resp = client.post("/api/pause_container", json=payload)
     assert resp.status_code == 200
-    assert resp.json()["container_status"] == "unpausing"
-    time.sleep(0.1)
-    assert extensions.status_cache.get_state("c1")["status"] == "online"
+    body = resp.json()
+    assert body["container_status"] == "unpausing"
+    assert body["action_ref"]["seq"] >= 1
+    assert _wait_action("c1", "idempotent_confirmed")
 
 
 def test_container_last_ssh_time_success(client, monkeypatch):

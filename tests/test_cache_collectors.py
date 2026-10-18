@@ -8,14 +8,20 @@ under the explicit ``docker`` marker.
 import asyncio
 import datetime as dt
 import json
+import os
 import subprocess
+
+import pytest
 
 from FuxiYu_NodeKernel import extensions
 from FuxiYu_NodeKernel.constant import ContainerStatus
-from FuxiYu_NodeKernel.docker_operates.disk_usage_cache import BIND_DU_TIMEOUT_SEC, DiskUsageCache
+from FuxiYu_NodeKernel.docker_operates.docker_fact import fact_from_container
+from FuxiYu_NodeKernel.docker_operates.disk_usage_cache import BIND_DU_TIMEOUT_SEC, DiskUsageCache, _utc_z
 from FuxiYu_NodeKernel.docker_operates.status_cache import ContainerStatusCache
 from FuxiYu_NodeKernel.docker_operates.sys_cache import SysSnapshotCache
 from FuxiYu_NodeKernel.network import wss
+
+from .runtime_fakes import FakeRuntimeContainer, install_runtime, not_found
 
 
 class _FakeCtrlLink:
@@ -64,7 +70,18 @@ class _Container:
         self.status = status
         self.attrs = {
             "SizeRw": size_rw,
-            "State": {"Status": status},
+            "State": {
+                "Status": status,
+                "Running": status in ("running", "paused"),
+                "Paused": status == "paused",
+                "Restarting": status == "restarting",
+                "Dead": status == "dead",
+                "Pid": 4321,
+                "StartedAt": "2026-10-17T19:00:00.000000000Z",
+                "OOMKilled": False,
+                "ExitCode": 0,
+                "Error": "",
+            },
             "Mounts": [{"Type": "bind", "Destination": "/root", "Source": mount_source}],
             "HostConfig": {"DeviceRequests": device_requests or []},
         }
@@ -133,8 +150,15 @@ class _DockerClient:
 
 def test_status_cache_applies_events_pending_ready_and_deleted(monkeypatch):
     cache = ContainerStatusCache()
-    cache._apply_event({"status": "start", "Actor": {"Attributes": {"name": "c1"}}})
-    assert cache.get_state("c1")["status"] == "online"
+    c1 = FakeRuntimeContainer("c1", status="running")
+    creating = FakeRuntimeContainer("creating-c", status="running")
+    restarting = FakeRuntimeContainer("restarting-c", status="running")
+    live = FakeRuntimeContainer("live-c", status="running")
+    client = install_runtime(monkeypatch, [c1, creating, restarting, live])
+
+    cache._apply_event({"Action": "start", "Actor": {"Attributes": {"name": "c1"}}})
+    assert cache.get_state("c1")["status"] == "starting"
+    cache.update("c1", "online")
 
     cache.begin_action("c1", "restart", "stopping")
     assert cache.get_state("c1")["source"] == "pending"
@@ -150,25 +174,22 @@ def test_status_cache_applies_events_pending_ready_and_deleted(monkeypatch):
     assert cache.get("creating-c")["ready_check"] is True
 
     cache.mark_ready_check("restarting-c", status=ContainerStatus.RESTARTING.value)
-    cache._apply_event({"status": "start", "Actor": {"Attributes": {"name": "restarting-c"}}})
-    assert cache.get_state("restarting-c")["status"] == ContainerStatus.RESTARTING.value
+    cache._apply_event({"Action": "start", "Actor": {"Attributes": {"name": "restarting-c"}}})
+    # running 但就绪证明未通过 → 仍按 ready_check 门禁，不直接 online/restarting。
+    assert cache.get_state("restarting-c")["status"] == "starting"
     assert cache.get("restarting-c")["ready_check"] is True
 
-    monkeypatch.setattr(cache, "_probe_sshd", lambda name: True)
-    for name, entry in list(cache._cache.items()):
-        if entry.get("ready_check") and cache._probe_sshd(name):
-            cache.update(name, "online")
+    monkeypatch.setattr(cache, "_probe_sshd_container", lambda container: True)
+    cache._probe_ready_checks_once()
     assert cache.get_state("creating-c")["status"] == "online"
+    assert cache.get_state("restarting-c")["status"] == "online"
 
     cache.begin_action("pending-c", "create", "creating")
     cache.begin_build("building-c")
-    cache._cache["live-c"] = {
-        "status": "online",
-        "updated_at": dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S"),
-    }
+    client.containers._containers = [live]
     monkeypatch.setattr(
         "FuxiYu_NodeKernel.docker_operates.status_cache.docker.from_env",
-        lambda: _DockerClient([_Container("live-c", status="running")]),
+        lambda: client,
     )
     cache._reconcile_once()
     assert cache.take_deleted() == ["c1", "creating-c", "restarting-c"]
@@ -188,7 +209,7 @@ def test_status_cache_forgets_deleted_generation_on_sync_delete_or_new_create():
     cache.forget_container_generation("c1")
 
     assert cache.get_state("c1")["source"] == "miss"
-    assert cache.take_deleted() == ["old"]
+    assert cache._deleted == ["old"]
 
     cache._deleted = ["c2"]
     cache.begin_build("c2")
@@ -250,10 +271,10 @@ def test_status_cache_snapshot_includes_runtime_metrics(monkeypatch):
     state = cache.list_states()["metrics-c"]
 
     assert container.stats_kwargs == {"stream": False}
-    # 冷启动契约（2026-09）：docker running 但 cache 无记录 → ready_check(cold_verify)
-    # 先推 unknown + cold_start_verify，probe 通过后才转 online——不再直接暴露 starting
-    assert state["status"] == ContainerStatus.UNKNOWN.value
-    assert state["status_source"] == "cold_start_verify"
+    # 冷启动复合确认：running 先进入 ready_check/starting，probe 通过后才 online。
+    assert state["status"] == ContainerStatus.STARTING.value
+    assert state.get("ready_check") is True
+    assert state["last_action"] is None
     assert state["runtime_metrics"]["cpu_usage_percent"] == 20.0
     assert state["runtime_metrics"]["memory_usage_mb"] == 256.0
     assert state["runtime_metrics"]["memory_usage_percent"] == 25.0
@@ -361,9 +382,10 @@ def test_ensure_sshd_started_started_and_transient(monkeypatch):
 def test_probe_marks_failed_when_sshd_missing(monkeypatch):
     # 探测失败 + 拉起发现 sshd 未装 → 终态 FAILED（等人工处置），清 ready_check
     cache = ContainerStatusCache()
+    install_runtime(monkeypatch, [_Container("c1", status="running")])
     cache.mark_ready_check("c1")
-    monkeypatch.setattr(cache, "_probe_sshd", lambda name: False)
-    monkeypatch.setattr(cache, "_ensure_sshd_started", lambda name: "not_installed")
+    monkeypatch.setattr(cache, "_probe_sshd_container", lambda container: False)
+    monkeypatch.setattr(cache, "_ensure_sshd_started_container", lambda container, name: "not_installed")
 
     cache._probe_ready_checks_once()
 
@@ -375,42 +397,50 @@ def test_probe_marks_failed_when_sshd_missing(monkeypatch):
 
 def test_probe_transient_keeps_starting(monkeypatch):
     cache = ContainerStatusCache()
+    install_runtime(monkeypatch, [_Container("c1", status="running")])
     cache.mark_ready_check("c1")
-    monkeypatch.setattr(cache, "_probe_sshd", lambda name: False)
-    monkeypatch.setattr(cache, "_ensure_sshd_started", lambda name: "transient")
+    monkeypatch.setattr(cache, "_probe_sshd_container", lambda container: False)
+    monkeypatch.setattr(cache, "_ensure_sshd_started_container", lambda container, name: "transient")
 
     cache._probe_ready_checks_once()
 
     assert cache.get_state("c1")["status"] == "starting"
 
 
-def test_cold_start_created_container_marks_failed():
+def test_cold_start_created_container_marks_failed(monkeypatch):
     # 冷启动 docker "created"（从未运行）= 陈旧半成品（create 中途炸/从未启动）→ FAILED
     cache = ContainerStatusCache()
-    cache._apply_container(_Container("stale_c", status="created"))
+    container = _Container("stale_c", status="created")
+    monkeypatch.setattr(cache, "_inspect_fact", lambda name, client=None: fact_from_container(container))
+    cache._apply_container(container)
     assert cache.get_state("stale_c")["status"] == "failed"
 
 
-def test_failed_terminal_guard_not_resurrected_by_reconcile():
-    # FAILED 终态守卫：对账不从 docker running 复活（恢复路径 = 平台操作 restart/删除重建）
+def test_failed_terminal_guard_not_resurrected_by_reconcile(monkeypatch):
+    # 仅允许集合内的硬阻塞终态守卫：sshd 未安装不因 Docker running 被普通对账复活。
     cache = ContainerStatusCache()
-    cache.update("c1", "failed")
-    cache._apply_container(_Container("c1", status="running"))
+    container = _Container("c1", status="running")
+    monkeypatch.setattr(cache, "_inspect_fact", lambda name, client=None: fact_from_container(container))
+    cache.set_hard_block("c1", "sshd_not_installed", "no sshd")
+    cache._apply_container(container)
     assert cache.get_state("c1")["status"] == "failed"
+    assert cache.get_state("c1")["failed_reason"] == "sshd_not_installed"
 
 
 def test_probe_self_heals_sshd_then_online(monkeypatch):
     # 保障：ready_check 容器 probe 未就绪 → 尝试拉起 sshd；下一轮就绪 → online
     cache = ContainerStatusCache()
+    container = _Container("c1", status="running")
+    install_runtime(monkeypatch, [container])
     cache.mark_ready_check("c1")
     calls = []
 
-    def _flaky_probe(name):
+    def _flaky_probe(container):
         calls.append("probe")
         return len(calls) >= 2  # 首轮失败，之后成功
 
-    monkeypatch.setattr(cache, "_probe_sshd", _flaky_probe)
-    monkeypatch.setattr(cache, "_ensure_sshd_started", lambda name: calls.append("fix"))
+    monkeypatch.setattr(cache, "_probe_sshd_container", _flaky_probe)
+    monkeypatch.setattr(cache, "_ensure_sshd_started_container", lambda container, name: calls.append("fix"))
 
     cache._probe_ready_checks_once()
     assert calls == ["probe", "fix"]  # 未就绪 → 拉起被调用，仍 starting
@@ -441,8 +471,8 @@ def test_probe_ready_refreshes_runtime_metrics(monkeypatch):
     }
     container = _Container("c1", status="running", stats_payload=stats_payload)
     cache.mark_ready_check("c1")
-    monkeypatch.setattr(cache, "_probe_sshd", lambda name: True)
-    monkeypatch.setattr(extensions, "docker_client", _fake_docker_client(container))
+    monkeypatch.setattr(cache, "_probe_sshd_container", lambda container: True)
+    install_runtime(monkeypatch, [container])
     monkeypatch.setattr(
         "FuxiYu_NodeKernel.docker_operates.status_cache._nvidia_gpu_runtime_by_index",
         lambda: {},
@@ -457,9 +487,14 @@ def test_probe_ready_refreshes_runtime_metrics(monkeypatch):
     assert state["runtime_metrics"]["memory_usage_percent"] == 25.0
 
 
-def test_status_cache_state_events_still_update_cache():
+def test_status_cache_state_events_still_update_cache(monkeypatch):
     cache = ContainerStatusCache()
+    container = _Container("c1", status="running")
+    install_runtime(monkeypatch, [container])
     cache.update("c1", "online")
+    container.status = "exited"
+    container.attrs["State"]["Status"] = "exited"
+    container.attrs["State"]["Running"] = False
     cache._apply_event({"status": "die", "Actor": {"Attributes": {"name": "c1"}}})
     assert cache.get_state("c1")["status"] == "offline"
 
@@ -468,13 +503,13 @@ def test_status_cache_warm_up_reconcile_populates_cache(monkeypatch):
     # 数据通路对账契约 C1：启动 warm-up 对账回填缓存 → 首帧快照非空。
     # running 容器走冷启动复合确认（starting + ready_check），probe 验 :22 后才 online
     cache = ContainerStatusCache()
+    warm1 = _Container("warm_c1", status="running")
+    warm2 = _Container("warm_c2", status="exited")
+    client = _DockerClient([warm1, warm2])
     monkeypatch.setattr(
-        "FuxiYu_NodeKernel.docker_operates.status_cache.docker.from_env",
-        lambda: _DockerClient([
-            _Container("warm_c1", status="running"),
-            _Container("warm_c2", status="exited"),
-        ]),
+        "FuxiYu_NodeKernel.docker_operates.status_cache.docker.from_env", lambda: client
     )
+    monkeypatch.setattr(extensions, "docker_client", client)
     cache._reconcile_once()
     assert cache.get_state("warm_c1")["status"] == "starting"
     assert cache.get("warm_c1")["ready_check"] is True
@@ -482,7 +517,7 @@ def test_status_cache_warm_up_reconcile_populates_cache(monkeypatch):
     assert cache.get_collect_error() is None
 
     # probe 就绪 → online（复合确认完成）
-    monkeypatch.setattr(cache, "_probe_sshd", lambda name: True)
+    monkeypatch.setattr(cache, "_probe_sshd_container", lambda container: True)
     cache._probe_ready_checks_once()
     assert cache.get_state("warm_c1")["status"] == "online"
 
@@ -491,16 +526,18 @@ def test_cold_start_running_container_waits_for_sshd_probe(monkeypatch):
     # 崩溃恢复复合确认：冷启动 running 容器不直接 online，probe 验 :22 后才 online；
     # 已有条目不再重挂 ready_check（无 15s 对账振荡）
     cache = ContainerStatusCache()
-    cache._apply_container(_Container("cold_c1", status="running"))
+    container = _Container("cold_c1", status="running")
+    install_runtime(monkeypatch, [container])
+    cache._apply_container(container)
     assert cache.get_state("cold_c1")["status"] == "starting"
     assert cache.get("cold_c1")["ready_check"] is True
 
-    monkeypatch.setattr(cache, "_probe_sshd", lambda name: True)
+    monkeypatch.setattr(cache, "_probe_sshd_container", lambda container: True)
     cache._probe_ready_checks_once()
     assert cache.get_state("cold_c1")["status"] == "online"
 
     # 对账再跑：已有 online 条目 → 不重挂 ready_check（振荡防护）
-    cache._apply_container(_Container("cold_c1", status="running"))
+    cache._apply_container(container)
     assert cache.get_state("cold_c1")["status"] == "online"
     assert cache.get("cold_c1").get("ready_check") is not True
 
@@ -544,16 +581,23 @@ def test_wss_status_snapshot_sends_collect_error_shape(monkeypatch):
 
 
 def test_disk_usage_cache_collects_overlay_bind_and_snapshot(monkeypatch, tmp_path):
-    bind_dir = tmp_path / "root"
-    bind_dir.mkdir()
+    base = tmp_path / "home"
+    bind_dir = base / "admin" / "containers" / "c1"
+    bind_dir.mkdir(parents=True)
+    monkeypatch.setenv("NODE_CONTAINERS_BASE", str(base))
     container = _Container("c1", status="running", size_rw=4096, mount_source=str(bind_dir))
     monkeypatch.setattr(extensions, "docker_client", _DockerClient([container]))
 
     cache = DiskUsageCache()
-    monkeypatch.setattr(cache, "get_bind", lambda path, container_name=None: {
+    stat = os.stat(bind_dir)
+    cache._dir_identity = lambda path: (stat.st_dev, stat.st_ino)
+    cache._ensure_bind_measure = lambda *a, **k: None
+    monkeypatch.setattr(cache, "_measurement_for_path", lambda name, path, trigger=True: {
         "bind_mount_bytes": 8192,
         "bind_mount_source": "fresh",
         "bind_mount_path": path,
+        "measured_at": _utc_z(),
+        "error": None,
     })
     monkeypatch.setattr(cache, "collect_machine_disk", lambda: {
         "total_gb": 100,
@@ -567,10 +611,14 @@ def test_disk_usage_cache_collects_overlay_bind_and_snapshot(monkeypatch, tmp_pa
 
     usage = snap["containers"]["c1"]
     assert usage["overlay_rw_bytes"] == 4096
-    assert usage["overlay_rw_source"] == "attrs"
     assert usage["bind_mount_bytes"] == 8192
     assert usage["bind_mount_source"] == "fresh"
+    assert usage["bind_mount_path"].endswith("c1")
+    assert usage["mount_path_status"] == "resolved"
     assert usage["total_bytes"] == 12288
+    assert usage["measured_at"].endswith("Z")
+    assert "overlay_rw_source" not in usage
+    assert "measurement_mount_path" not in usage
     assert snap["machine_disk"]["total_gb"] == 100
 
 
@@ -588,43 +636,65 @@ def test_disk_usage_cache_collects_overlay_from_single_container_inspect_when_at
     assert client.df_called is False
 
 
-def test_disk_usage_cache_overlay_failure_keeps_total_pending(monkeypatch):
-    container = _Container("c1", status="running", size_rw=4096)
+def test_disk_usage_cache_overlay_failure_keeps_total_pending(monkeypatch, tmp_path):
+    base = tmp_path / "home"
+    bind_dir = base / "admin" / "containers" / "c1"
+    bind_dir.mkdir(parents=True)
+    monkeypatch.setenv("NODE_CONTAINERS_BASE", str(base))
+    container = _Container("c1", status="running", size_rw=4096, mount_source=str(bind_dir))
+    del container.attrs["SizeRw"]
     monkeypatch.setattr(extensions, "docker_client", _DockerClient([container]))
 
     cache = DiskUsageCache()
+    stat = os.stat(bind_dir)
+    cache._dir_identity = lambda path: (stat.st_dev, stat.st_ino)
+    cache._ensure_bind_measure = lambda *a, **k: None
     monkeypatch.setattr(cache, "collect_overlay_rw", lambda name: {
         "overlay_rw_bytes": None,
         "overlay_rw_source": "error",
         "overlay_rw_error": "inspect_size_failed",
     })
-    monkeypatch.setattr(cache, "get_bind", lambda path, container_name=None: {
+    monkeypatch.setattr(cache, "_measurement_for_path", lambda name, path, trigger=True: {
         "bind_mount_bytes": 8192,
         "bind_mount_source": "fresh",
         "bind_mount_path": path,
+        "measured_at": _utc_z(),
+        "error": None,
     })
 
     cache.collect_container("c1")
     usage = cache.snapshot()["containers"]["c1"]
 
     assert usage["overlay_rw_bytes"] is None
-    assert usage["overlay_rw_source"] == "error"
-    assert usage["overlay_rw_error"] == "inspect_size_failed"
-    assert usage["bind_mount_bytes"] == 8192
+    assert usage["bind_mount_bytes"] is None
     assert usage["total_bytes"] is None
+    assert usage["measured_at"] is None
+    assert usage["error"] == "inspect_size_failed"
+    assert "overlay_rw_source" not in usage
+    assert "measurement_status" not in usage
 
 
-def test_disk_usage_cache_bind_cache_sources(tmp_path):
+def test_disk_usage_cache_bind_cache_sources(tmp_path, monkeypatch):
     bind_dir = tmp_path / "bind"
     bind_dir.mkdir()
     (bind_dir / "data.txt").write_text("hello", encoding="utf-8")
+    monkeypatch.setattr(
+        "FuxiYu_NodeKernel.docker_operates.disk_usage_cache.subprocess.run",
+        lambda *a, **k: subprocess.CompletedProcess(a[0], 0, stdout="5\t/path\n", stderr=""),
+    )
 
     cache = DiskUsageCache()
     first = cache.get_bind(str(bind_dir))
     assert first["bind_mount_source"] == "measuring"
 
     cache.collect_bind(str(bind_dir))
+    deadline = dt.datetime.now() + dt.timedelta(seconds=2)
     fresh = cache.get_bind(str(bind_dir))
+    while fresh["bind_mount_source"] != "fresh" and dt.datetime.now() < deadline:
+        import time
+
+        time.sleep(0.01)
+        fresh = cache.get_bind(str(bind_dir))
     assert fresh["bind_mount_source"] == "fresh"
     assert fresh["bind_mount_bytes"] > 0
 
@@ -736,7 +806,7 @@ def test_ctrl_link_sends_deleted_frames_before_snapshot(monkeypatch):
     monkeypatch.setattr(wss, "list_last_ssh", lambda: {})
     monkeypatch.setattr(wss, "list_disk_usage", lambda: {"containers": {}})
     monkeypatch.setattr(wss, "list_sys_snapshot", lambda: {})
-    monkeypatch.setattr(extensions.status_cache, "take_deleted", lambda: ["ghost-1"])
+    monkeypatch.setattr(extensions.status_cache, "take_confirmed_deleted", lambda: ["ghost-1"])
 
     asyncio.run(wss.handle_ctrl_ws(ws))
 
@@ -863,7 +933,7 @@ def test_extract_port_info_tolerates_missing_and_junk():
     assert extract_port_info(junk) == (None, [])
 
 
-def test_status_cache_refreshes_port_info_from_attrs_every_round():
+def test_status_cache_refreshes_port_info_from_attrs_every_round(monkeypatch):
     """每轮快照都从 attrs 重算端口：不再把创建那一刻的旧值一直推给 Ctrl。
 
     回归锁（2026-09 实测）：库里按 docker 事实手改的值，刷新一次就被 Node 上报的旧值
@@ -881,6 +951,9 @@ def test_status_cache_refreshes_port_info_from_attrs_every_round():
     container.attrs["NetworkSettings"] = {"Ports": {
         "22/tcp": [{"HostIp": "0.0.0.0", "HostPort": "2222"}],
     }}
+    ticket = cache.issue_observation("c1", "seed")
+    cache.publish_observed("c1", ticket, fact_from_container(container), mark_ready=True)
+    monkeypatch.setattr(cache, "_inspect_fact", lambda name, client=None: fact_from_container(container))
     cache._apply_container(container)
 
     state = cache.get_state("c1")

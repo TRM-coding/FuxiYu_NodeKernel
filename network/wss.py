@@ -342,8 +342,9 @@ def issue_uid_api(message: IssueNodeUidRequest) -> dict[str, Any]:
 def build_status_snapshot() -> dict[str, Any]:
     """构造容器状态快照帧。
 
-    采集异常（docker 卡死，collect_error 置位）→ 发显式 collect_error 形状，
-    Ctrl 侧将该机器全部容器置 FAILED（数据通路对账契约 C1）；正常 → 全量列表。
+    采集异常（docker 卡死，collect_error 置位）→ 发显式 collect_error 形状；
+    Ctrl 应按 unknown/collect_error 语义收敛并保留最后已知，不把采集失败当作
+    容器消失或运行态 failed，也不得据此删除容器。正常 → 全量列表。
     """
 
     from .. import extensions
@@ -411,6 +412,8 @@ def _snapshot_push_interval() -> float:
     return float(os.getenv("NODE_WSS_PUSH_INTERVAL", "5"))
 
 
+# 本文件不维护连接代际/观测序号协议；每次发送仍由 status_cache 做候选代际
+# 复核和 Docker 单容器存在性确认，旧连接不会获得额外排序资格。
 def _resolve_link_uid(websocket) -> str | None:
     """读取 Ctrl 在连接查询参数里出示的 uid。"""
 
@@ -444,8 +447,8 @@ async def _push_snapshot_frames(websocket, identity: NodeIdentity) -> None:
 
     interval = _snapshot_push_interval()
     while True:
-        # 幽灵容器感知：先发消失 delete 帧，再发快照
-        for name in extensions.status_cache.take_deleted():
+        # 幽灵容器感知：发送前复核候选代际与 Docker 存在性，先发 delete 帧，再发快照。
+        for name in extensions.status_cache.take_confirmed_deleted():
             await websocket.send_text(json.dumps({"type": "delete", "container_name": name}, ensure_ascii=True))
         await websocket.send_text(json.dumps(build_snapshot_batch(identity), ensure_ascii=True))
         if await _wait_for_next_tick(websocket, interval):
