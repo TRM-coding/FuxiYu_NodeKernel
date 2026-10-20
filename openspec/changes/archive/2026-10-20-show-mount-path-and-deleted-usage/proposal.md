@@ -15,7 +15,7 @@ Node 不负责详情字段、`deleted_id`、用户权限、清理决定或数据
 - **只读与兼容**：不新增 WSS topic/字段、不改变 `check_disk_usage`、`ContainerDiskUsage`、周期快照或 `clean_mount`；不新增数据库列/表/JSON 迁移，不写已删容器 `disk_*`、恢复快照或清理记录。旧 Ctrl 不调用新端点即可保持原行为；旧 Node 的 404/405 由 Ctrl 映射为 `node_unsupported`，不由 Node 伪造成功。
 - **详情展示无 Node 修改**：详情 `bind_mount_path` 的追加可空字段、完整路径复制与空值“未记录”展示由 Ctrl/Web 配套变更完成，Node 不新增详情接口或字段。
 
-配套变更：[Ctrl](../../../../FuxiYu_CtrKernel/openspec/changes/show-mount-path-and-deleted-usage/proposal.md) · [Web](../../../../FuxiYu_Web/openspec/changes/show-mount-path-and-deleted-usage/proposal.md)。本仓规格不依赖这些链接即可实现。
+配套变更：[Ctrl](../../../../../FuxiYu_CtrKernel/openspec/changes/archive/2026-10-20-show-mount-path-and-deleted-usage/proposal.md) · [Web](../../../../../FuxiYu_Web/openspec/changes/archive/2026-10-20-show-mount-path-and-deleted-usage/proposal.md)。本仓规格不依赖这些链接即可实现。
 
 ## Capabilities
 

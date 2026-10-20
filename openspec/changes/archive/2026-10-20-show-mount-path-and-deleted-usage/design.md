@@ -2,7 +2,7 @@
 
 ## Context
 
-动机见 [proposal.md](proposal.md)，可验收行为见 [backend--storage-and-mounts delta](specs/backend--storage-and-mounts/spec.md)。配套变更：[Ctrl](../../../../FuxiYu_CtrKernel/openspec/changes/show-mount-path-and-deleted-usage/proposal.md) · [Web](../../../../FuxiYu_Web/openspec/changes/show-mount-path-and-deleted-usage/proposal.md)；本文件与 delta 自足描述 Node 契约，不依赖跳转阅读。Node 当前只有一个按容器名读取的 `/api/check_disk_usage`，内部 `DiskUsageCache.get_bind()` 能按任意路径触发后台 `du`，但该方法不是安全外部入口：没有路径范围、存在性和 symlink 校验，也没有按批次的 singleflight、并发和失败冷却。WSS 的 `disk_usage` 是周期全量快照，不适合按已删除记录按需查询，也不应因此扩周期负载。
+动机见 [proposal.md](proposal.md)，可验收行为见 [backend--storage-and-mounts delta](specs/backend--storage-and-mounts/spec.md)。配套变更：[Ctrl](../../../../../FuxiYu_CtrKernel/openspec/changes/archive/2026-10-20-show-mount-path-and-deleted-usage/proposal.md) · [Web](../../../../../FuxiYu_Web/openspec/changes/archive/2026-10-20-show-mount-path-and-deleted-usage/proposal.md)；本文件与 delta 自足描述 Node 契约，不依赖跳转阅读。Node 当前只有一个按容器名读取的 `/api/check_disk_usage`，内部 `DiskUsageCache.get_bind()` 能按任意路径触发后台 `du`，但该方法不是安全外部入口：没有路径范围、存在性和 symlink 校验，也没有按批次的 singleflight、并发和失败冷却。WSS 的 `disk_usage` 是周期全量快照，不适合按已删除记录按需查询，也不应因此扩周期负载。
 
 现有可复用的基础：
 
@@ -196,10 +196,10 @@ class CheckMountUsageResponse(SuccessResponse):
 
 ## Source references
 
-- [network/api.py](../../../network/api.py)：既有 `/check_disk_usage` 434-463、`/clean_mount` 486-498。
-- [schemas/container.py](../../../schemas/container.py)：`CheckDiskUsageMessage` 272-304、`CleanMount*` 329-339。
-- [schemas/__init__.py](../../../schemas/__init__.py)：模型导出 7-59、`__all__` 61-117。
-- [docker_operates/disk_usage_cache.py](../../../docker_operates/disk_usage_cache.py)：base/allowlist 94-110、缓存条目 454-497、`collect_bind` 499-588、`_measurement_for_path` 590-661、`get_bind` 959-968。
-- [services/container_service.py](../../../services/container_service.py)：`clean_mount` 872-901、`list_disk_usage` 1340-1347。
-- [run.py](../../../run.py)：Ctrl 客户端证书/mTLS 25-30。
-- [tests/test_clean_mount.py](../../../tests/test_clean_mount.py)、[tests/test_cache_collectors.py](../../../tests/test_cache_collectors.py)、[tests/test_blueprint_api.py](../../../tests/test_blueprint_api.py)：既有清理、缓存与端点测试基线。
+- [network/api.py](../../../../network/api.py)：既有 `/check_disk_usage` 434-463、`/clean_mount` 486-498。
+- [schemas/container.py](../../../../schemas/container.py)：`CheckDiskUsageMessage` 272-304、`CleanMount*` 329-339。
+- [schemas/__init__.py](../../../../schemas/__init__.py)：模型导出 7-59、`__all__` 61-117。
+- [docker_operates/disk_usage_cache.py](../../../../docker_operates/disk_usage_cache.py)：base/allowlist 94-110、缓存条目 454-497、`collect_bind` 499-588、`_measurement_for_path` 590-661、`get_bind` 959-968。
+- [services/container_service.py](../../../../services/container_service.py)：`clean_mount` 872-901、`list_disk_usage` 1340-1347。
+- [run.py](../../../../run.py)：Ctrl 客户端证书/mTLS 25-30。
+- [tests/test_clean_mount.py](../../../../tests/test_clean_mount.py)、[tests/test_cache_collectors.py](../../../../tests/test_cache_collectors.py)、[tests/test_blueprint_api.py](../../../../tests/test_blueprint_api.py)：既有清理、缓存与端点测试基线。
