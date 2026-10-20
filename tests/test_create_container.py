@@ -3,10 +3,8 @@
 - 错误路径（默认集）：FakeDockerClient，挂载根固定到 pytest tmp_path
 - happy path（-m docker）：真实 docker daemon，验证资源参数与 ssh 配置
 """
-import importlib.util
-import linecache
 import os
-import traceback
+import stat
 import uuid
 
 import docker
@@ -690,42 +688,21 @@ def _run_and_capture(monkeypatch):
     return run_calls[0]
 
 
-def test_create_container_mount_setup_keeps_failure_reporting_usable(tmp_path, monkeypatch):
-    """Q30 回归：挂载准备不得用不完整替身替换全局 os.stat。
+def test_create_container_mount_setup_keeps_global_os_stat_real(monkeypatch):
+    """Q30 回归：挂载准备不得替换进程全局 ``os.stat``。
 
-    旧 ``_patch_fs`` 返回的假 stat 只有 ``st_uid``/``st_gid``。失败用例在 pytest
-    生成 traceback 时，linecache 会读取 ``st_size``/``st_mtime``；假对象让真正的
-    断言错误消失，进程以 INTERNALERROR 崩溃。这里先让 linecache 缓存一个真实源
-    文件，再跑一次真实挂载准备，最后格式化一个异常：若全局 os.stat 又被换成
-    不完整替身，traceback 会直接抛 AttributeError。
+    旧 ``_patch_fs`` 用只有 ``st_uid``/``st_gid`` 的对象替换全局 ``os.stat``；
+    用例失败后 pytest 读取源码时缺 ``st_size``/``st_mode``，真实断言被内部错误
+    掩盖。现在挂载准备使用真实 ``tmp_path``，这里锁住“全局 stat 保持真实且
+    结构完整”这一不变量，不依赖 linecache 私有缓存结构。
     """
-    module_path = tmp_path / "q30_boom_module.py"
-    module_path.write_text(
-        "def boom():\n    raise AssertionError('q30 boom')\n",
-        encoding="utf-8",
-    )
-    spec = importlib.util.spec_from_file_location("q30_boom_module", module_path)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-
-    linecache.clearcache()
-    assert len(linecache.getlines(str(module_path))) == 2
-    cached = linecache.cache[str(module_path)]
-    assert len(cached) == 4 and cached[1] is not None, "需要真实的 size/mtime 缓存"
-
     real_stat = os.stat
     _run_and_capture(monkeypatch)
 
-    try:
-        module.boom()
-    except AssertionError:
-        rendered = traceback.format_exc()
-    else:
-        pytest.fail("boom() 未抛出 AssertionError")
-
     assert os.stat is real_stat, "挂载准备不得替换全局 os.stat"
-    assert "q30 boom" in rendered
-    assert "q30_boom_module.py" in rendered
+    source_stat = os.stat(__file__)
+    assert source_stat.st_size > 0
+    assert stat.S_ISREG(source_stat.st_mode)
 
 
 def test_create_container_passes_no_command_and_does_not_touch_entrypoint(monkeypatch):
