@@ -11,6 +11,8 @@ from ..schemas import (
     AddCollaboratorResponse,
     CheckDiskUsageMessage,
     CheckDiskUsageResponse,
+    CheckMountUsageMessage,
+    CheckMountUsageResponse,
     CleanMountMessage,
     CleanMountResponse,
     ContainerLastSshTimeMessage,
@@ -39,6 +41,7 @@ from ..schemas import (
 from ..services.container_service import (
     add_collaborator,
     build_image,
+    check_mount_usage,
     clean_mount,
     container_exists,
     create_container,
@@ -461,6 +464,25 @@ def check_disk_usage_api(message: CheckDiskUsageMessage):
             "measured_at": None,
         }
     return {"success": 1, "machine_disk": snapshot.get("machine_disk", {}), "container": container_usage}
+
+
+@router.post("/check_mount_usage", response_model=CheckMountUsageResponse)
+def check_mount_usage_api(message: CheckMountUsageMessage):
+    """按路径批量查询已删除容器遗留挂载目录的逻辑用量。
+
+    只读端点：路径校验、缓存读取与后台 du 都由 DiskUsageCache 承担。HTTP 立即
+    返回 pending，不等待测量；逐项错误不升级为批次错误。
+    """
+
+    try:
+        mounts = check_mount_usage(list(message.config.mount_paths))
+    except Exception as e:
+        logger.warning("check_mount_usage failed: %s", e)
+        return JSONResponse(
+            status_code=500,
+            content={"success": 0, "error": "internal error", "error_reason": "internal_error"},
+        )
+    return {"success": 1, "mounts": mounts}
 
 
 @router.post("/pause_container", response_model=PauseContainerResponse)

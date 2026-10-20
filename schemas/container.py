@@ -1,6 +1,6 @@
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from .common import EmptyConfig, SuccessResponse
 
@@ -302,6 +302,38 @@ class ContainerDiskUsage(BaseModel):
 class CheckDiskUsageResponse(SuccessResponse):
     machine_disk: MachineDiskUsage | dict[str, Any]
     container: ContainerDiskUsage | dict[str, Any]
+
+
+#####################
+# 查询挂载路径用量（已删除容器遗留目录）
+
+
+class CheckMountUsageConfig(BaseModel):
+    # 请求只允许路径；deleted_id/machine_id/container_name/角色等身份字段一律 422。
+    model_config = ConfigDict(extra="forbid")
+
+    # 单条路径非法只影响该项；批次形状错误在进入缓存前整体拒绝。
+    mount_paths: list[str] = Field(min_length=1, max_length=100)
+
+
+class CheckMountUsageMessage(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    config: CheckMountUsageConfig
+
+
+class MountUsageItem(BaseModel):
+    """逐路径结果；bytes 只在真实测量成功时为非负整数。"""
+
+    path: str
+    bytes: int | None = Field(default=None, ge=0)
+    measured_at: str | None = None
+    pending: bool = False
+    error: str | None = None
+
+
+class CheckMountUsageResponse(SuccessResponse):
+    mounts: list[MountUsageItem]
 
 
 #####################

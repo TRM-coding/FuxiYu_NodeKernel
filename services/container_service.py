@@ -1347,6 +1347,15 @@ def list_disk_usage() -> dict:
     return extensions.disk_usage_cache.snapshot()
 
 
+def check_mount_usage(mount_paths: list[str]) -> list[dict]:
+    """按路径批量读取/触发用量（只读，不碰 Docker/数据库/clean_mount）。
+
+    桥接：校验、singleflight、有界后台 du 与失败冷却都在
+    docker_operates.disk_usage_cache.DiskUsageCache.read_mount_usage；本函数只转发。
+    """
+    return extensions.disk_usage_cache.read_mount_usage(list(mount_paths))
+
+
 def list_sys_snapshot() -> dict | None:
     """全量系统快照（读侧 list）：静态硬件 + 动态指标。
 

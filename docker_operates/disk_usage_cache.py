@@ -8,12 +8,16 @@
 
 线路只保留两个新增字段：``mount_path_status`` 与真实 ``measured_at``。
 旧版的 Source/核对时间、测量状态/测量路径、epoch/seq 等协议不在这里出现。
-读取侧只读缓存，不执行 du，也不刷新 ``measured_at``。
+快照/详情读取侧只读缓存，不执行 du，也不刷新 ``measured_at``；按路径批量查询
+端点只做路径门禁与锁内状态投影，测量投递到固定 worker 后台执行并立即返回。
 """
 import datetime
+import itertools
 import logging
 import os
+import queue
 import shutil
+import stat
 import subprocess
 import threading
 import time
@@ -31,6 +35,10 @@ DISK_SWEEP_TTL_SEC = 900
 DISK_SWEEP_STEP_SLEEP = 2
 MOUNT_PATH_INTERVAL = 60
 CLOCK_SKEW_SEC = 120
+# 按路径查询端点（check_mount_usage）的读侧调度参数。
+MOUNT_USAGE_MAX_CONCURRENCY = 4
+MOUNT_USAGE_QUEUE_SIZE = 100
+MOUNT_USAGE_FAILURE_COOLDOWN_SEC = 60
 
 SOURCE_FRESH = "fresh"
 SOURCE_CACHED = "cached"
@@ -87,6 +95,11 @@ class DiskUsageCache:
         # name -> path diagnostics / verification token
         self._path_state = {}
         self._lock = threading.RLock()
+        # 端点专用：固定 4 个 worker + 有界队列，按规范化路径 singleflight。
+        # 进程内单调 request id 用于清理后丢弃旧 du 结果（跨条目重建也不复用）。
+        self._request_seq = itertools.count(1)
+        self._mount_work = queue.Queue(maxsize=MOUNT_USAGE_QUEUE_SIZE)
+        self._mount_workers: list[threading.Thread] = []
 
     # ------------------------------------------------------------------
     # 路径核对内部工具
@@ -461,6 +474,7 @@ class DiskUsageCache:
                 "measured_at": None,
                 "running": False,
                 "request_id": 0,
+                "failed_at": None,
                 "updated_at": None,
             }
             self._bind_cache[path] = entry
@@ -471,6 +485,197 @@ class DiskUsageCache:
         if measured_at is None:
             return None
         return (_utc_now() - measured_at).total_seconds()
+
+    # ------------------------------------------------------------------
+    # 按路径查询端点：路径门禁、状态投影与有界调度
+    # ------------------------------------------------------------------
+    def _next_request_id_locked(self) -> int:
+        """在 ``self._lock`` 内分配进程内单调 request id。
+
+        条目被清理后重建时也不复用旧 id，避免旧 du 晚到误命中新测量。
+        """
+
+        return next(self._request_seq)
+
+    def _validate_mount_path(self, path: str) -> tuple[str | None, str | None]:
+        """校验请求路径，返回 ``(规范化缓存键, 稳定错误原因)``。
+
+        只在读取缓存/触发测量前使用，不调用 Docker、``/proc`` 或
+        ``verify_mount_path``。``not_found``/``invalid_path``/
+        ``permission_denied`` 都不会启动 du。
+        """
+
+        if not isinstance(path, str) or not path or not os.path.isabs(path):
+            return None, "invalid_path"
+        try:
+            # 最终对象是 symlink（含悬空链接）时拒绝跟随；normpath 兜住尾随斜杠。
+            if os.path.islink(path) or os.path.islink(os.path.normpath(path)):
+                return None, "invalid_path"
+        except PermissionError:
+            return None, "permission_denied"
+        except (OSError, ValueError):
+            return None, "invalid_path"
+
+        try:
+            real = os.path.realpath(path)
+            base = self._containers_base()
+        except PermissionError:
+            return None, "permission_denied"
+        except (OSError, ValueError):
+            return None, "invalid_path"
+
+        real_n = os.path.normcase(real)
+        base_n = os.path.normcase(base)
+        if real_n == base_n or not real_n.startswith(base_n + os.sep):
+            return None, "invalid_path"
+        if "containers" not in [part.lower() for part in os.path.normpath(real).split(os.sep)]:
+            return None, "invalid_path"
+
+        normalized = _norm_path(real)
+        if not normalized:
+            return None, "invalid_path"
+        try:
+            info = os.stat(real)
+        except PermissionError:
+            return normalized, "permission_denied"
+        except (FileNotFoundError, NotADirectoryError):
+            return normalized, "not_found"
+        except (OSError, ValueError):
+            return normalized, "invalid_path"
+        if not stat.S_ISDIR(info.st_mode):
+            return normalized, "invalid_path"
+        return normalized, None
+
+    @staticmethod
+    def _mount_path_still_dir(normalized: str) -> bool:
+        """发布前复核：请求路径仍是现存、非 symlink 目录。"""
+
+        try:
+            if os.path.islink(normalized):
+                return False
+            return stat.S_ISDIR(os.stat(normalized).st_mode)
+        except (OSError, ValueError):
+            return False
+
+    def _ensure_mount_workers_locked(self) -> None:
+        """懒启动固定 4 个 worker；调用方必须持有 ``self._lock``。"""
+
+        if self._mount_workers:
+            return
+        for index in range(MOUNT_USAGE_MAX_CONCURRENCY):
+            worker = threading.Thread(
+                target=self._mount_worker_loop,
+                daemon=True,
+                name=f"mount-usage-worker-{index + 1}",
+            )
+            worker.start()
+            self._mount_workers.append(worker)
+
+    def _queued_mount_task_allowed(self, normalized: str, request_id: int) -> bool:
+        """执行 du 前复核排队任务：路径仍有效，且仍是当前请求。
+
+        排队期间目录可能被清理或替换为 symlink；此时不跑 du，直接丢弃该条目，
+        下一次查询由路径门禁投影 ``not_found``/``invalid_path`` 等稳定错误。
+        request id 不匹配说明同路径已有更新的任务，旧任务只退出，不能清掉新条目。
+        """
+
+        revalidated, error = self._validate_mount_path(normalized)
+        with self._lock:
+            entry = self._bind_cache.get(normalized)
+            if entry is None or entry.get("request_id") != request_id:
+                logger.info("queued mount task dropped (superseded): path=%s", normalized)
+                return False
+            if error is not None or revalidated != normalized:
+                self._bind_cache.pop(normalized, None)
+                logger.info(
+                    "queued mount task dropped (path no longer valid): path=%s error=%s",
+                    normalized,
+                    error,
+                )
+                return False
+        return True
+
+    def _mount_worker_loop(self) -> None:
+        while True:
+            normalized, request_id = self._mount_work.get()
+            try:
+                if not self._queued_mount_task_allowed(normalized, request_id):
+                    continue
+                self.collect_bind(normalized, None, request_id, guard_missing=True)
+            except Exception as e:
+                logger.warning("mount usage worker failed: path=%s err=%s", normalized, e)
+                with self._lock:
+                    entry = self._bind_cache.get(normalized)
+                    if entry is not None and entry.get("request_id") == request_id:
+                        entry["running"] = False
+                        entry["status"] = "error"
+                        entry["reason"] = "du_failed"
+                        entry["failed_at"] = _utc_z()
+            finally:
+                self._mount_work.task_done()
+
+    def _start_mount_measure_locked(self, normalized: str) -> bool:
+        """把去重后的路径投递到有界执行器；调用方必须持有 ``self._lock``。"""
+
+        entry = self._bind_entry_locked(normalized)
+        if entry.get("running"):
+            return False
+        prior = {
+            key: entry.get(key)
+            for key in ("request_id", "running", "status", "reason", "failed_at")
+        }
+        request_id = self._next_request_id_locked()
+        entry["request_id"] = request_id
+        entry["running"] = True
+        entry["status"] = "measuring"
+        entry["reason"] = None
+        try:
+            self._ensure_mount_workers_locked()
+            self._mount_work.put_nowait((normalized, request_id))
+        except queue.Full:
+            # 有界队列满时不阻塞 HTTP；保持 pending，下一次轮询再尝试。
+            entry.update(prior)
+            logger.warning("mount usage queue full, keep pending: path=%s", normalized)
+            return False
+        return True
+
+    def _mount_usage_state_locked(self, normalized: str) -> dict:
+        """读取单个规范化路径的当前可公开状态；调用方必须持有 ``self._lock``。"""
+
+        entry = self._bind_entry_locked(normalized)
+        if entry.get("running"):
+            return {"bytes": None, "measured_at": None, "pending": True, "error": None}
+        status = entry.get("status") or "unverified"
+        if status == "ok":
+            age = self._measurement_age(entry)
+            stored_bytes = entry.get("bytes")
+            measured_at = entry.get("measured_at")
+            if (
+                stored_bytes is not None
+                and measured_at
+                and age is not None
+                and age < BIND_CACHE_TTL_SEC
+            ):
+                return {
+                    "bytes": int(stored_bytes),
+                    "measured_at": measured_at,
+                    "pending": False,
+                    "error": None,
+                }
+        elif status == "error":
+            failed_at = _parse_utc(entry.get("failed_at"))
+            if failed_at is not None:
+                age = (_utc_now() - failed_at).total_seconds()
+                if age < MOUNT_USAGE_FAILURE_COOLDOWN_SEC:
+                    return {
+                        "bytes": None,
+                        "measured_at": None,
+                        "pending": False,
+                        "error": entry.get("reason") or "du_failed",
+                    }
+        # 无样本、成功样本过期、失败冷却结束或上次异常状态：启动一次后台测量。
+        self._start_mount_measure_locked(normalized)
+        return {"bytes": None, "measured_at": None, "pending": True, "error": None}
 
     def _ensure_bind_measure(self, path: str, container_name: str | None = None, *, force: bool = False) -> None:
         normalized = _norm_path(path)
@@ -484,7 +689,7 @@ class DiskUsageCache:
                 age = self._measurement_age(entry)
                 if age is not None and age < BIND_CACHE_TTL_SEC:
                     return
-            entry["request_id"] = int(entry.get("request_id") or 0) + 1
+            entry["request_id"] = self._next_request_id_locked()
             request_id = entry["request_id"]
             entry["running"] = True
             entry["status"] = "measuring"
@@ -496,8 +701,19 @@ class DiskUsageCache:
             name=f"disk-bind-{container_name or 'unknown'}",
         ).start()
 
-    def collect_bind(self, bind_path: str, container_name: str | None = None, request_id: int | None = None) -> None:
-        """后台线程体：跑 du -sb，完成后按请求序号回填。失败不当 0。"""
+    def collect_bind(
+        self,
+        bind_path: str,
+        container_name: str | None = None,
+        request_id: int | None = None,
+        *,
+        guard_missing: bool = False,
+    ) -> None:
+        """后台线程体：跑 du -sb，完成后按请求序号回填。失败不当 0。
+
+        ``guard_missing`` 只由按路径查询端点的 worker 使用：发布前复核目录仍存在，
+        清理期间晚到的 du 结果直接丢弃，不写入旧成功值。
+        """
         who = container_name or "-"
         normalized = _norm_path(bind_path)
         if not normalized:
@@ -506,7 +722,7 @@ class DiskUsageCache:
             with self._lock:
                 entry = self._bind_entry_locked(normalized)
                 if not entry.get("running"):
-                    entry["request_id"] = int(entry.get("request_id") or 0) + 1
+                    entry["request_id"] = self._next_request_id_locked()
                     entry["running"] = True
                     entry["status"] = "measuring"
                 request_id = entry["request_id"]
@@ -526,7 +742,11 @@ class DiskUsageCache:
             )
             out = (r.stdout or "").strip()
             if r.returncode != 0:
-                result["reason"] = "non_zero_exit"
+                # du 自己的权限失败仍是非零退出；只用于稳定归类，不回传 stderr。
+                if "permission denied" in (r.stderr or "").lower():
+                    result["reason"] = "permission_denied"
+                else:
+                    result["reason"] = "non_zero_exit"
                 logger.warning(
                     "bind du non-zero: container=%s path=%s rc=%s stderr=%r",
                     who,
@@ -540,6 +760,8 @@ class DiskUsageCache:
             else:
                 try:
                     size = int(out.split()[0])
+                    if size < 0:
+                        raise ValueError("negative size")
                 except (ValueError, IndexError):
                     result["reason"] = "parse_error"
                     logger.warning("bind du unparsable output: container=%s path=%s out=%r", who, normalized, out[:120])
@@ -575,6 +797,11 @@ class DiskUsageCache:
             if entry.get("request_id") != request_id:
                 logger.info("bind du result dropped (superseded request): path=%s", normalized)
                 return
+            if guard_missing and not self._mount_path_still_dir(normalized):
+                # 目录已清理/被替换：连错误状态都不发布，下次查询走存在性门禁。
+                self._bind_cache.pop(normalized, None)
+                logger.info("bind du result dropped (path no longer measurable): path=%s", normalized)
+                return
             entry["running"] = False
             entry["updated_at"] = _utc_now()
             if result["status"] == "ok":
@@ -582,10 +809,12 @@ class DiskUsageCache:
                 entry["status"] = "ok"
                 entry["reason"] = None
                 entry["measured_at"] = result["measured_at"]
+                entry["failed_at"] = None
             else:
                 # 失败不更新成功 bytes/measured_at；最后成功值只在内部留作诊断。
                 entry["status"] = "error"
                 entry["reason"] = result["reason"]
+                entry["failed_at"] = _utc_z()
 
     def _measurement_for_path(self, name: str, path: str, *, trigger: bool = True) -> dict:
         """读取/按需触发某业务路径的 du；只返回当前成功样本。"""
@@ -966,6 +1195,46 @@ class DiskUsageCache:
             "measured_at": result["measured_at"],
             "error": result["error"],
         }
+
+    def read_mount_usage(self, paths: list[str]) -> list[dict]:
+        """批量读取路径用量，供 ``POST /api/check_mount_usage`` 使用。
+
+        每条请求路径都先过独立门禁；线路按原请求顺序、原字符串回显（重复项不少），
+        内部按校验后的规范化路径去重并共享同一缓存/测量。成功样本只在 900 秒 TTL
+        内返回原始 ``measured_at``；过期/无样本/冷却结束均返回 pending 并投递后台
+        du，不返回旧成功值。失败后 60 秒冷却内返回稳定错误，不重复起 du。
+        """
+
+        validated: list[tuple[str, str | None, str | None]] = []
+        unique_keys: list[str] = []
+        seen: set[str] = set()
+        for raw in paths:
+            normalized, error = self._validate_mount_path(raw)
+            validated.append((raw, normalized, error))
+            if error is None and normalized is not None and normalized not in seen:
+                seen.add(normalized)
+                unique_keys.append(normalized)
+
+        # 不存在/已清理/非法/权限失败都不得返回旧成功样本：能确定规范化键时清掉缓存。
+        dropped_keys = {normalized for _, normalized, error in validated if error and normalized}
+        if dropped_keys:
+            with self._lock:
+                for key in dropped_keys:
+                    self._bind_cache.pop(key, None)
+
+        projections: dict[str, dict] = {}
+        for key in unique_keys:
+            with self._lock:
+                projections[key] = self._mount_usage_state_locked(key)
+
+        results = []
+        for raw, normalized, error in validated:
+            if error is not None:
+                item = {"bytes": None, "measured_at": None, "pending": False, "error": error}
+            else:
+                item = projections[normalized]
+            results.append({"path": raw, **item})
+        return results
 
 
 def _docker_client():
