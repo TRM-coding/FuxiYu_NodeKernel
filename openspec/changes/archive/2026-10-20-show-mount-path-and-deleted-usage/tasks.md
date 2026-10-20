@@ -38,3 +38,4 @@
 - 真实 HTTP + 本地临时目录真实 du 回放：`tests/test_mount_usage_api.py::test_real_http_du_pending_success_cache_hit_then_not_found`；覆盖 pending → success → TTL 命中 → 删除后 `not_found`，TestClient 不触发 lifespan，不触碰 Docker/SSH。
 - 发布前 `guard_missing` 保留：`test_late_success_without_intervening_query_is_not_published`、`test_old_result_cannot_publish_after_path_recreated`。
 - 定向回归：本变更新增 74 项，连同既有 clean/cache/blueprint/verify-bind 回归共 192 passed；`openspec validate show-mount-path-and-deleted-usage --strict` 通过。
+- 主代理独立复跑同组测试 **192 passed**；[三仓接口回放](../../../../../FuxiYu_CtrKernel/test/container/test_mount_usage_cross_repo.py) 使用本仓真实 HTTP 端点与本地临时目录 du，随后由 Ctrl API 和 Web 真实纯函数消费。仅本地验收，未连接生产 Node/Docker。
