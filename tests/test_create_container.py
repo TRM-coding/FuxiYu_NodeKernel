@@ -1,9 +1,12 @@
 """create_container 服务层测试。
 
-- 错误路径（默认集）：FakeDockerClient，无 daemon 无文件系统副作用
+- 错误路径（默认集）：FakeDockerClient，挂载根固定到 pytest tmp_path
 - happy path（-m docker）：真实 docker daemon，验证资源参数与 ssh 配置
 """
+import importlib.util
+import linecache
 import os
+import traceback
 import uuid
 
 import docker
@@ -31,25 +34,18 @@ VALID_CFG = dict(
 )
 
 
-def _stat_stub():
-    class _Stat:
-        st_uid = 0
-        st_gid = 0
+@pytest.fixture(autouse=True)
+def containers_base(tmp_path, monkeypatch):
+    """Q30：每个用例使用 tmp_path 下的真实挂载根，不替换全局 os.*。
 
-    return _Stat()
-
-
-def _patch_fs(monkeypatch):
-    """把 create_container 的宿主挂载目录准备逻辑全部打掉，避免真实文件系统副作用。"""
-    monkeypatch.setattr(os, "makedirs", lambda *a, **k: None)
-    monkeypatch.setattr(os, "stat", lambda *a, **k: _stat_stub())
-    if hasattr(os, "chown"):  # POSIX-only；Windows 无此属性
-        monkeypatch.setattr(os, "chown", lambda *a, **k: None)
-    monkeypatch.setattr(os, "chmod", lambda *a, **k: None)
-    if hasattr(os, "getuid"):  # POSIX-only
-        monkeypatch.setattr(os, "getuid", lambda: 0)
-    if hasattr(os, "getgid"):  # POSIX-only
-        monkeypatch.setattr(os, "getgid", lambda: 0)
+    旧实现把 ``os.stat`` 换成只有 ``st_uid``/``st_gid`` 的假对象。用例一旦失败，
+    pytest 生成报告时也会通过 linecache/traceback 调用 ``os.stat``，于是
+    ``st_size``/``st_mode`` 缺失会把真正的断言错误替换成 INTERNALERROR。
+    真实临时目录既隔离了文件系统副作用，也不会污染测试框架自身。
+    """
+    base = tmp_path / "home"
+    monkeypatch.setenv("NODE_CONTAINERS_BASE", str(base))
+    return base
 
 
 def test_error_path_invalid_config(monkeypatch):
@@ -63,7 +59,6 @@ def test_error_path_container_exist(monkeypatch):
     """同名容器已存在 → RuntimeError，不触发真实创建。"""
     existing = FakeContainer(name=VALID_CFG["name"])
     monkeypatch.setattr(extensions, "docker_client", FakeDockerClient(FakeContainers([existing])))
-    _patch_fs(monkeypatch)
     with pytest.raises(RuntimeError, match="already exists"):
         create_container("admin", Container.Config_info(**VALID_CFG))
 
@@ -244,8 +239,6 @@ def test_create_container_writes_proxy_into_container(monkeypatch):
     _clear_proxy_env(monkeypatch)
     monkeypatch.setenv("http_proxy", "http://proxy.example:8091")
     monkeypatch.setattr(extensions, "docker_client", FakeDockerClient(_Containers()))
-    _patch_fs(monkeypatch)
-    monkeypatch.setenv("NODE_CONTAINERS_BASE", "/tmp")
 
     create_container("admin", Container.Config_info(**VALID_CFG))
 
@@ -268,8 +261,6 @@ def test_create_container_uses_prepared_image_and_only_runs_sshd_gate(monkeypatc
             return container
 
     monkeypatch.setattr(extensions, "docker_client", FakeDockerClient(_BuildAwareContainers()))
-    _patch_fs(monkeypatch)
-    monkeypatch.setenv("NODE_CONTAINERS_BASE", "/tmp")
 
     cfg_data = dict(VALID_CFG)
     cfg_data["image"] = "fuxi/image-7:20260826T000000Z"
@@ -303,8 +294,6 @@ def _create_and_capture(monkeypatch, *, exposed=None, missing_image=False, conta
     images = FakeImages(exposed=exposed, missing=missing_image)
     monkeypatch.setattr(extensions, "docker_client", FakeDockerClient(containers, images))
     monkeypatch.setattr(port_allocator, "_system_bound_ports", lambda: set())
-    _patch_fs(monkeypatch)
-    monkeypatch.setenv("NODE_CONTAINERS_BASE", "/tmp")
     create_container("admin", Container.Config_info(**VALID_CFG))
     return containers, images
 
@@ -427,8 +416,6 @@ def test_create_container_gpu_request_uses_device_ids_without_driver(monkeypatch
 
     monkeypatch.setattr(docker.types, "DeviceRequest", _device_request_stub)
     monkeypatch.setattr(extensions, "docker_client", FakeDockerClient(_Containers()))
-    _patch_fs(monkeypatch)
-    monkeypatch.setenv("NODE_CONTAINERS_BASE", "/tmp")
 
     cfg_data = dict(VALID_CFG)
     cfg_data["gpu_list"] = [0, 2]
@@ -445,8 +432,10 @@ def test_create_container_gpu_request_uses_device_ids_without_driver(monkeypatch
     assert run_calls[0][1]["device_requests"] == device_request_calls
 
 
-def test_create_container_restore_reuses_existing_mount(monkeypatch):
+def test_create_container_restore_reuses_existing_mount(containers_base, monkeypatch):
     run_calls = []
+    restore = containers_base / "admin" / "containers" / "old_c"
+    restore.mkdir(parents=True)
 
     class _Containers(FakeContainers):
         def run(self, *a, **k):
@@ -454,32 +443,28 @@ def test_create_container_restore_reuses_existing_mount(monkeypatch):
             return FakeContainer(name=k.get("name", "c1"))
 
     monkeypatch.setattr(extensions, "docker_client", FakeDockerClient(_Containers()))
-    _patch_fs(monkeypatch)
-    monkeypatch.setenv("NODE_CONTAINERS_BASE", "/tmp")
-    monkeypatch.setattr(os.path, "isdir", lambda path: path == os.path.realpath("/tmp/admin/containers/old_c"))
 
     result = create_container(
         "admin",
         Container.Config_info(**VALID_CFG),
-        restore_mount_path="/tmp/admin/containers/old_c",
+        restore_mount_path=str(restore),
     )
 
     assert isinstance(result, CreateContainerReturn)
-    assert result.bind_mount_path.replace("\\", "/").endswith("/tmp/admin/containers/old_c")
-    assert run_calls[0][1]["mounts"][0]["Source"].replace("\\", "/").endswith("/tmp/admin/containers/old_c")
+    assert os.path.samefile(result.bind_mount_path, restore)
+    assert os.path.samefile(run_calls[0][1]["mounts"][0]["Source"], restore)
 
 
-def test_create_container_restore_rejects_mount_outside_base(monkeypatch):
+def test_create_container_restore_rejects_mount_outside_base(tmp_path, monkeypatch):
+    outside = tmp_path / "elsewhere" / "etc" / "fuxi-leak"
+    outside.mkdir(parents=True)
     monkeypatch.setattr(extensions, "docker_client", FakeDockerClient())
-    _patch_fs(monkeypatch)
-    monkeypatch.setenv("NODE_CONTAINERS_BASE", "/tmp")
-    monkeypatch.setattr(os.path, "isdir", lambda path: True)
 
     with pytest.raises(RuntimeError, match="unsafe restore mount path"):
         create_container(
             "admin",
             Container.Config_info(**VALID_CFG),
-            restore_mount_path="/etc/fuxi-leak",
+            restore_mount_path=str(outside),
         )
 
 
@@ -645,8 +630,6 @@ def test_no_build_path_does_not_install_sshd_in_node(monkeypatch):
             return container
 
     monkeypatch.setattr(extensions, "docker_client", FakeDockerClient(_Containers()))
-    _patch_fs(monkeypatch)
-    monkeypatch.setenv("NODE_CONTAINERS_BASE", "/tmp")
 
     result = create_container("admin", Container.Config_info(**VALID_CFG))
 
@@ -688,8 +671,6 @@ def test_create_container_fails_when_sshd_gate_fails(monkeypatch):
             return _SshdFailContainer(name=k.get("name", "c1"))
 
     monkeypatch.setattr(extensions, "docker_client", FakeDockerClient(_Containers()))
-    _patch_fs(monkeypatch)
-    monkeypatch.setenv("NODE_CONTAINERS_BASE", "/tmp")
 
     with pytest.raises(RuntimeError, match="sshd gate failed"):
         create_container("admin", Container.Config_info(**VALID_CFG))
@@ -705,10 +686,46 @@ def _run_and_capture(monkeypatch):
             return FakeContainer(name=k.get("name", "c1"))
 
     monkeypatch.setattr(extensions, "docker_client", FakeDockerClient(_Containers()))
-    _patch_fs(monkeypatch)
-    monkeypatch.setenv("NODE_CONTAINERS_BASE", "/tmp")
     create_container("admin", Container.Config_info(**VALID_CFG))
     return run_calls[0]
+
+
+def test_create_container_mount_setup_keeps_failure_reporting_usable(tmp_path, monkeypatch):
+    """Q30 回归：挂载准备不得用不完整替身替换全局 os.stat。
+
+    旧 ``_patch_fs`` 返回的假 stat 只有 ``st_uid``/``st_gid``。失败用例在 pytest
+    生成 traceback 时，linecache 会读取 ``st_size``/``st_mtime``；假对象让真正的
+    断言错误消失，进程以 INTERNALERROR 崩溃。这里先让 linecache 缓存一个真实源
+    文件，再跑一次真实挂载准备，最后格式化一个异常：若全局 os.stat 又被换成
+    不完整替身，traceback 会直接抛 AttributeError。
+    """
+    module_path = tmp_path / "q30_boom_module.py"
+    module_path.write_text(
+        "def boom():\n    raise AssertionError('q30 boom')\n",
+        encoding="utf-8",
+    )
+    spec = importlib.util.spec_from_file_location("q30_boom_module", module_path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    linecache.clearcache()
+    assert len(linecache.getlines(str(module_path))) == 2
+    cached = linecache.cache[str(module_path)]
+    assert len(cached) == 4 and cached[1] is not None, "需要真实的 size/mtime 缓存"
+
+    real_stat = os.stat
+    _run_and_capture(monkeypatch)
+
+    try:
+        module.boom()
+    except AssertionError:
+        rendered = traceback.format_exc()
+    else:
+        pytest.fail("boom() 未抛出 AssertionError")
+
+    assert os.stat is real_stat, "挂载准备不得替换全局 os.stat"
+    assert "q30 boom" in rendered
+    assert "q30_boom_module.py" in rendered
 
 
 def test_create_container_passes_no_command_and_does_not_touch_entrypoint(monkeypatch):
@@ -751,8 +768,6 @@ def test_create_container_explains_image_that_exits_immediately(monkeypatch):
             return _ExitedContainer(name=k.get("name", "c1"))
 
     monkeypatch.setattr(extensions, "docker_client", FakeDockerClient(_Containers()))
-    _patch_fs(monkeypatch)
-    monkeypatch.setenv("NODE_CONTAINERS_BASE", "/tmp")
 
     with pytest.raises(RuntimeError, match="exited immediately"):
         create_container("admin", Container.Config_info(**VALID_CFG))

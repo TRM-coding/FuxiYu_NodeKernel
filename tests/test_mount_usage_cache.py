@@ -22,6 +22,20 @@ from FuxiYu_NodeKernel.docker_operates.disk_usage_cache import (
 )
 
 
+class _ModuleOsView:
+    """只替换单个模块看到的 ``os``，其余属性继续委托真实 os。
+
+    直接 monkeypatch ``du_module.os.stat`` 实际改到进程全局 os 模块，
+    pytest 的 linecache/traceback 也会看到替身；把作用域收回被测模块。
+    """
+
+    def __init__(self, **overrides):
+        self.__dict__.update(overrides)
+
+    def __getattr__(self, name):
+        return getattr(os, name)
+
+
 class FakeClock:
     def __init__(self, start):
         self.now = start
@@ -174,11 +188,12 @@ def test_path_gate_maps_permission_error_without_stat(base, monkeypatch):
             raise PermissionError("denied")
         return real_stat(path, *args, **kwargs)
 
-    monkeypatch.setattr(du_module.os, "stat", guarded_stat)
+    monkeypatch.setattr(du_module, "os", _ModuleOsView(stat=guarded_stat))
 
     key, error = cache._validate_mount_path(str(target))
     assert error == "permission_denied"
     assert key == _norm_path(os.path.realpath(str(target)))
+    assert os.stat is real_stat, "必须只替换 du_module 的 os 视图"
 
 
 def test_invalid_not_found_and_permission_never_start_du(base, tmp_path, monkeypatch):
@@ -199,7 +214,7 @@ def test_invalid_not_found_and_permission_never_start_du(base, tmp_path, monkeyp
             raise PermissionError("denied")
         return real_stat(path, *args, **kwargs)
 
-    monkeypatch.setattr(du_module.os, "stat", guarded_stat)
+    monkeypatch.setattr(du_module, "os", _ModuleOsView(stat=guarded_stat))
     calls = []
     monkeypatch.setattr(
         du_module.subprocess,
@@ -230,6 +245,7 @@ def test_invalid_not_found_and_permission_never_start_du(base, tmp_path, monkeyp
     assert all(item["measured_at"] is None for item in results)
     assert all(item["pending"] is False for item in results)
     assert calls == []
+    assert os.stat is real_stat, "必须只替换 du_module 的 os 视图"
 
 
 # ---------------------------------------------------------------------------
