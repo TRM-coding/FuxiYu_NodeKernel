@@ -85,14 +85,14 @@
 - Red（stdin helper）：`tests/test_password_exec.py` 首次收集失败，`ImportError: cannot import name '_exec_chpasswd_stdin'`（预期：helper 尚未实现）。
 - Green（专项）：`pytest tests/test_password_contracts.py tests/test_password_exec.py tests/test_password_services.py tests/test_password_api.py -q` → `36 passed`。
 - Green（SocketIO wrapper）：`pytest tests/test_password_exec.py -q` → `5 passed`，其中 `test_chpasswd_stdin_real_socketio` 使用真实 `socket.socketpair()` + `socket.SocketIO` 验证写入/EOF/读取/关闭。
-- Green（完整 WSL 套件）：`cd /mnt/e/AI/Fuxi/FuxiYu_NodeKernel && /home/chest/.cache/fuxi-password-tests-offline/bin/python -m pytest tests -q --no-header` → `403 passed, 1 skipped, 16 deselected`。
-- Green（针对性回归）：`pytest` 新增密码测试 + `test_blueprint_api.py` + `test_runtime_guard.py` + `test_add_collaborator.py` + `test_update_role.py` + `test_remove_collaborator.py` + `test_create_container.py` → `185 passed, 1 skipped, 4 deselected`。
-- 跳过项：`test_create_container_gpu_request_uses_device_ids_without_driver`，本机离线 docker SDK 2.7 不提供 `DeviceRequest`；这是环境限制，未伪称 GPU 路径已运行。
-- 限制：FakeDocker/FakeExecAPI 证明 Node 侧 argv/stdin/错误边界；SocketIO 测试证明 wrapper I/O；均不宣称真实 Docker daemon/远程主机验证。
+- Green（默认完整仓库套件）：`cd /mnt/e/AI/Fuxi/FuxiYu_NodeKernel && /home/chest/.cache/fuxi-password-tests-offline/bin/python -m pytest -q --no-header` → `444 passed, 16 deselected, 24 subtests passed`（docker 7.1.0，0 skipped）。
+- Green（针对性回归）：`pytest` 新增密码测试 + `test_blueprint_api.py` + `test_runtime_guard.py` + `test_add_collaborator.py` + `test_update_role.py` + `test_remove_collaborator.py` + `test_create_container.py` → `186 passed, 4 deselected`。
+- 环境备注：离线 WSL venv 已升级 docker 7.1.0，先前因 `DeviceRequest` 缺失而 skip 的 GPU 用例已实际执行；不再存在该 skip。
+- 限制：FakeDocker/FakeExecAPI 证明 Node 侧 argv/stdin/错误边界；真实 socketpair + SocketIO 测试证明 wrapper I/O；均不宣称真实 Docker daemon/远程主机验证。
 
 ## Coverage Notes
 
-- Every scenario above maps to a named pytest node (parameterized IDs where the same test function covers closely related contract cases).
-- Service tests use the repository FakeDocker/FakeExecAPI doubles; they validate socket I/O and command shape, not a real Docker daemon.
-- Cross-repo Ctrl/Web-only outcomes are asserted on the Node-side wire/response/primitive; the Ctrl/Web rendering itself is out of this repository.
-- Rows are flipped to 🟢 green only after the named test passes in the recorded run.
+- 上表每个 Scenario 都映射到具名 pytest 节点；同一测试函数覆盖紧密相关的契约用例时，以参数 ID 或同组断言说明。
+- 服务测试使用仓库现有 FakeDocker/FakeExecAPI 替身，验证 socket I/O 与命令形状，不冒充真实 Docker daemon。
+- 跨仓 Ctrl/Web 专属结果在 Node 侧 wire/响应/primitive 上断言；Ctrl/Web 渲染本身不在本仓库。
+- 只有在记录运行中通过后，行才翻为 🟢 green。

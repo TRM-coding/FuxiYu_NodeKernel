@@ -45,3 +45,9 @@
 - [x] 8.1 运行 WSL 完整安全套件与针对性回归，记录命令、pass/skip 到 test-plan/verify
 - [x] 8.2 运行 `openspec instructions verify`，写 `verify.md` 的 Evidence 与唯一 `DECISION` 行
 - [x] 8.3 `git diff --check`，全部 tasks 勾选后提交实现与测试
+
+## 9. 底层账号密码工具抽取
+
+- [x] 9.1 将 `_container_user_exists`、`_docker_exec_api`、`_exec_socket_target`、`_exec_chpasswd_stdin`、`_set_account_password` 最小抽取到 `docker_operates/account_passwords.py`；service 仅导入调用，业务函数位置与语义不变
+- [x] 9.2 测试优先直接测工具模块；补充真实 `socket.socketpair()` + `socket.SocketIO` 的写入/EOF/读取/关闭测试
+- [x] 9.3 使用默认完整仓库命令 `python -m pytest -q --no-header` 验证，更新 test-plan/verify 的真实计数，并提交单独 FIX commit
