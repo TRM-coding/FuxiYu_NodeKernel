@@ -27,6 +27,54 @@ def docker_not_found() -> docker_pkg.errors.NotFound:
     return docker_pkg.errors.NotFound("no such container", response=_Resp())
 
 
+class FakeExecSocket:
+    """Minimal socket-like object for the password stdin helper."""
+
+    def __init__(self):
+        self.sent = b""
+        self.closed = False
+        self.write_shutdown = False
+
+    def settimeout(self, _timeout):
+        pass
+
+    def sendall(self, data):
+        self.sent += data
+
+    def shutdown(self, _how):
+        self.write_shutdown = True
+
+    def recv(self, _size):
+        return b""
+
+    def close(self):
+        self.closed = True
+
+
+class FakeExecAPI:
+    """Default-success Docker exec API for tests that only need a password path."""
+
+    def __init__(self, exit_code: int = 0):
+        self.exit_code = exit_code
+        self.created = []
+        self.started = []
+        self.sockets = {}
+
+    def exec_create(self, container_id, cmd, **kwargs):
+        exec_id = f"exec-{len(self.created)}"
+        self.created.append({"container_id": container_id, "cmd": cmd, "kwargs": kwargs, "id": exec_id})
+        return {"Id": exec_id}
+
+    def exec_start(self, exec_id, **kwargs):
+        sock = FakeExecSocket()
+        self.started.append({"id": exec_id, "kwargs": kwargs, "socket": sock})
+        self.sockets[exec_id] = sock
+        return sock
+
+    def exec_inspect(self, exec_id):
+        return {"ExitCode": self.exit_code, "Running": False}
+
+
 class FakeContainer:
     """可编程的 docker container 假实现。"""
 
@@ -115,6 +163,7 @@ class FakeDockerClient:
     def __init__(self, containers=None, images=None):
         self.containers = containers or FakeContainers()
         self.images = images or FakeImages()
+        self.api = FakeExecAPI()
 
 
 def encrypted_body(payload: dict) -> dict:

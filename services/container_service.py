@@ -11,7 +11,9 @@ import base64
 import docker
 from docker.types import Mount
 import os
+import socket
 from typing import NamedTuple
+from pydantic import SecretStr
 from ..utils import sanitizer as _sanitizer
 from ..config import PortConfig
 from ..docker_operates.port_mappings import extract_port_info
@@ -29,6 +31,120 @@ from pathlib import Path
 from ..docker_operates.docker_fact import DockerFact, fact_from_container
 
 logger = logging.getLogger(__name__)
+
+
+class ContainerNotRunning(RuntimeError):
+    pass
+
+
+def _container_user_exists(container, user_name: str) -> bool:
+    result = container.exec_run(
+        ["/bin/sh", "-c", f"id -u {user_name} >/dev/null 2>&1"],
+        user="root",
+    )
+    exit_code = getattr(result, "exit_code", None)
+    if exit_code is None:
+        try:
+            exit_code = int(result[0])
+        except Exception:
+            exit_code = 1
+    return exit_code == 0
+
+
+def _docker_exec_api(container):
+    api = getattr(getattr(container, "client", None), "api", None)
+    if api is None:
+        api = getattr(extensions.docker_client, "api", None)
+    if api is None:
+        raise RuntimeError("docker exec API unavailable")
+    return api
+
+
+def _exec_socket_target(sock):
+    """Return a socket-like object with sendall/recv/shutdown.
+
+    docker-py may return a raw socket or a ``socket.SocketIO`` wrapper whose
+    underlying socket lives at ``_sock``. Keep the original wrapper alive and
+    use the underlying socket for I/O when necessary.
+    """
+
+    underlying = getattr(sock, "_sock", None)
+    for candidate in (underlying, sock):
+        if candidate is not None and all(
+            hasattr(candidate, name) for name in ("sendall", "recv", "shutdown")
+        ):
+            return candidate
+    return None
+
+
+def _exec_chpasswd_stdin(
+    container,
+    login_name: str,
+    password: SecretStr,
+    timeout_sec: int = 30,
+) -> int:
+    """Set one account password with chpasswd over Docker exec stdin.
+
+    The password is never placed in argv, shell text, environment variables,
+    temporary files, logs or exception messages. An unconfirmed write/EOF/read
+    is a failure, even if the exec inspect reports exit code 0.
+    """
+
+    _sanitizer.validate_username(login_name)
+    if not isinstance(password, SecretStr):
+        raise ValueError("password must be SecretStr")
+    payload = f"{login_name}:{password.get_secret_value()}\n".encode("utf-8")
+
+    api = _docker_exec_api(container)
+    response = api.exec_create(
+        container.id,
+        ["chpasswd"],
+        stdin=True,
+        stdout=True,
+        stderr=True,
+        tty=False,
+        user="root",
+    )
+    exec_id = response["Id"]
+    sock = api.exec_start(exec_id, socket=True)
+    target = _exec_socket_target(sock)
+    write_ok = eof_ok = read_ok = False
+    try:
+        if target is not None:
+            try:
+                target.settimeout(timeout_sec)
+            except Exception:
+                pass
+            target.sendall(payload)
+            write_ok = True
+            target.shutdown(socket.SHUT_WR)
+            eof_ok = True
+            while target.recv(4096):
+                pass
+            read_ok = True
+    except (BrokenPipeError, socket.timeout, OSError, AttributeError):
+        pass
+    finally:
+        try:
+            sock.close()
+        except Exception:
+            pass
+
+    try:
+        inspection = api.exec_inspect(exec_id) or {}
+    except Exception:
+        return 1
+    if not (write_ok and eof_ok and read_ok):
+        return 1
+    if inspection.get("Running"):
+        return 1
+    exit_code = inspection.get("ExitCode")
+    return int(exit_code) if isinstance(exit_code, int) else 1
+
+
+def _set_account_password(container, login_name: str, password: SecretStr) -> None:
+    if _exec_chpasswd_stdin(container, login_name, password) != 0:
+        raise RuntimeError("chpasswd failed")
 
 
 
@@ -326,6 +442,8 @@ def _remove_leftover_container(name: str) -> None:
 def create_container(
     owner_name: str,
     config: Container.Config_info,
+    *,
+    root_password: SecretStr,
     public_key: str | None = None,
     restore_mount_path: str | None = None,
 ) -> CreateContainerReturn:
@@ -558,12 +676,11 @@ def create_container(
         except Exception as e:
             logger.warning("create_container proxy inject failed: name=%s error=%s", name, e)
 
-    # 初始密码为 owner_name + "123"，用户可以登录后再改密码（也可以直接提供公钥登录）
-    _run(container, f"echo 'root:{owner_name}123' | chpasswd")
+    # Ctrl 生成的一次性 root 密码；失败绝不回退到 owner_name+123。
     try:
-        _sanitizer.validate_username(owner_name)
+        _set_account_password(container, "root", root_password)
     except Exception as e:
-        raise RuntimeError(f"unsafe owner_name: {e}")
+        raise RuntimeError("failed to set root password") from e
     # 使得公钥可选（如果提供了公钥则写入，否则只用密码登录）。
     # 密码/公钥先就位，sshd 启动与 :22 探活作为最后一道守门；
     # sshd 安装责任已前移到镜像构建注入片段。
@@ -651,11 +768,17 @@ def remove_container(container_name: str) -> int:
         return RemoveContinaerReturn.FAILED
 
 #将container_id对应的容器新增user_id作为collaborator,其权限为role
-def add_collaborator(container_name: str, user_name: str, role: ROLE) -> bool:
+def add_collaborator(
+    container_name: str,
+    user_name: str,
+    role: ROLE,
+    *,
+    password: SecretStr,
+) -> bool:
     try:
         if extensions.docker_client is None:
             extensions.init_docker()
-        
+
         container=extensions.docker_client.containers.get(container_name)
         print(f"Adding collaborator {user_name} with role {role} to container {container_name}")
         # validate inputs to reduce injection risk
@@ -665,17 +788,26 @@ def add_collaborator(container_name: str, user_name: str, role: ROLE) -> bool:
             f"mkdir -p /root/.collaborators && "
             f"mkdir -p /root/.collaborators/{user_name} && "
             f"useradd -M -d /root/.collaborators/{user_name} -s /bin/bash {user_name} && "
-            f"echo '{user_name}:{user_name}123' | chpasswd && "
             f"ln -s /root/.collaborators/{user_name} /home/{user_name} && "
             f"chown -R {user_name}:{user_name} /root/.collaborators/{user_name}"
         )
-        if role == ROLE.ADMIN:
-            cmd += f" && (usermod -aG sudo {user_name} || usermod -aG wheel {user_name})"
         result = container.exec_run(["/bin/sh", "-c", cmd], user="root")
         print(f"Executed command to add collaborator: {cmd}\nExit code: {result.exit_code}\nOutput: {result.output.decode('utf-8', errors='ignore')}")
-        return result.exit_code == 0
+        if result.exit_code != 0:
+            return False
+        try:
+            _set_account_password(container, user_name, password)
+        except Exception:
+            print(f"failed to set collaborator password: container={container_name} user={user_name}")
+            return False
+        if role == ROLE.ADMIN:
+            group_cmd = f"(usermod -aG sudo {user_name} || usermod -aG wheel {user_name})"
+            group_result = container.exec_run(["/bin/sh", "-c", group_cmd], user="root")
+            print(f"Executed command to add collaborator group: {group_cmd}\nExit code: {group_result.exit_code}")
+            return group_result.exit_code == 0
+        return True
     except Exception as e:
-        print(f"failed to add collaborator:{e}")
+        print(f"failed to add collaborator: {type(e).__name__}")
         return False
 
 
@@ -713,30 +845,46 @@ def remove_collaborator(container_name: str, user_name: str) -> bool:
         return False
 
 
-def update_role(container_name: str, user_name: str, updated_role: ROLE) -> bool:
+def update_role(
+    container_name: str,
+    user_name: str,
+    updated_role: ROLE,
+    *,
+    root_password: SecretStr | None = None,
+    password: SecretStr | None = None,
+) -> bool:
     try:
         if extensions.docker_client is None:
             extensions.init_docker()
         container = extensions.docker_client.containers.get(container_name)
 
         if updated_role == ROLE.ADMIN:
-            #先验证用户存在（如果不存在就创建），再添加到sudo组
+            # 旧 ROOT 降 ADMIN 可带 Ctrl 密码创建/设置独立账号；普通 ADMIN
+            # 切换不带密码时只调整既有账号组，绝不用默认密码补建。
             _sanitizer.validate_username(container_name)
             _sanitizer.validate_username(user_name)
-            # 新建账号必须与 add_collaborator 保持同一家目录模式：
-            # 家目录放 /root/.collaborators/用户名（宿主机持久化挂载内），/home 下只放软链。
-            # 若用 useradd -m，家目录会落在容器 overlay2 可写层，容器删除即丢数据，
-            # 且后续移除时 mv 归档找不到目录、rm 删不掉真实目录（操作报错且数据不归档）。
-            cmd = (
-                f"id -u {user_name} || ("
-                f"mkdir -p /root/.collaborators/{user_name} && "
-                f"useradd -M -d /root/.collaborators/{user_name} -s /bin/bash {user_name} && "
-                f"echo '{user_name}:{user_name}123' | chpasswd && "
-                f"ln -s /root/.collaborators/{user_name} /home/{user_name} && "
-                f"chown -R {user_name}:{user_name} /root/.collaborators/{user_name}"
-                f")"
-            )
-            cmd += f" && (usermod -aG sudo {user_name} || usermod -aG wheel {user_name})"
+            exists = _container_user_exists(container, user_name)
+            if password is not None:
+                if not exists:
+                    create_cmd = (
+                        f"mkdir -p /root/.collaborators/{user_name} && "
+                        f"useradd -M -d /root/.collaborators/{user_name} -s /bin/bash {user_name} && "
+                        f"ln -s /root/.collaborators/{user_name} /home/{user_name} && "
+                        f"chown -R {user_name}:{user_name} /root/.collaborators/{user_name}"
+                    )
+                    create_result = container.exec_run(["/bin/sh", "-c", create_cmd], user="root")
+                    print(f"Executed command to create demoted admin account: {create_cmd}\nExit code: {create_result.exit_code}")
+                    if create_result.exit_code != 0:
+                        return False
+                try:
+                    _set_account_password(container, user_name, password)
+                except Exception:
+                    print(f"failed to set demoted admin password: container={container_name} user={user_name}")
+                    return False
+            elif not exists:
+                print(f"admin account missing and no password: container={container_name} user={user_name}")
+                return False
+            cmd = f"(usermod -aG sudo {user_name} || usermod -aG wheel {user_name})"
         elif updated_role == ROLE.COLLABORATOR: # 直接从sudo组里删除用户（如果存在的话），但不删除用户账号
             _sanitizer.validate_username(container_name)
             _sanitizer.validate_username(user_name)
@@ -750,18 +898,27 @@ def update_role(container_name: str, user_name: str, updated_role: ROLE) -> bool
                 f"exit $rc"
             )
         elif updated_role == ROLE.ROOT:
-            # 直接让root的密码为user_name123
             _sanitizer.validate_username(container_name)
             _sanitizer.validate_username(user_name)
+            if root_password is None:
+                raise ValueError("root_password is required for root role")
+            if user_name == "root":
+                raise ValueError("cannot transfer root to root")
+            try:
+                _set_account_password(container, "root", root_password)
+            except Exception as e:
+                raise RuntimeError("failed to set root password") from e
+            # 目标最终不属于 sudo/wheel；组本就不存在时不算失败。归档/删除规则不变。
             cmd = (
-                f"echo 'root:{user_name}123' | chpasswd && "
-                f"(rc=1; deluser {user_name} sudo && rc=0; deluser {user_name} wheel && rc=0; exit $rc) && "
+                f"for g in sudo wheel; do "
+                f"if id -nG {user_name} 2>/dev/null | tr ' ' '\\n' | grep -qx \"$g\"; then "
+                f"deluser {user_name} \"$g\" || exit 1; fi; "
+                f"done; "
                 f"ts=$(date +%Y%m%d%H%M%S); "
                 f"mv /root/.collaborators/{user_name} /root/.collaborators/.legacy_{user_name}_$ts 2>/dev/null || true; "
                 f"userdel {user_name} || deluser {user_name}; "
                 f"rm -f /home/{user_name}"
             )
-
         else:
             raise ValueError(f"Unknown role: {updated_role}")
 
@@ -770,8 +927,27 @@ def update_role(container_name: str, user_name: str, updated_role: ROLE) -> bool
         return result.exit_code == 0
 
     except Exception as e:
-        print(f"Failed to update role: {e}")
+        print(f"Failed to update role: {type(e).__name__}")
         raise e
+
+
+def reset_container_password(container_name: str, user_name: str, password: SecretStr) -> bool:
+    """Synchronously reset one existing account password inside a running container."""
+
+    if extensions.docker_client is None:
+        extensions.init_docker()
+    _sanitizer.validate_username(container_name)
+    _sanitizer.validate_username(user_name)
+    container = extensions.docker_client.containers.get(container_name)
+    try:
+        container.reload()
+    except Exception:
+        pass
+    status = str(getattr(container, "status", "") or "").lower()
+    if status not in ("running", "online"):
+        raise ContainerNotRunning("container is not running")
+    _set_account_password(container, user_name, password)
+    return True
 
 
 def start_container(container_name: str) -> bool:

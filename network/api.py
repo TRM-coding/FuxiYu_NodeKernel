@@ -1,8 +1,11 @@
 import logging
 import subprocess
+import docker
 
 from fastapi import APIRouter
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+from fastapi.routing import APIRoute
 
 from .. import extensions
 from ..constant import ContainerStatus, MachineStatus, ROLE
@@ -29,6 +32,8 @@ from ..schemas import (
     RemoveCollaboratorResponse,
     RemoveContainerMessage,
     RemoveContainerResponse,
+    ResetContainerPasswordMessage,
+    ResetContainerPasswordResponse,
     RestartContainerMessage,
     RestartContainerResponse,
     StartContainerMessage,
@@ -39,6 +44,7 @@ from ..schemas import (
     UpdateRoleResponse,
 )
 from ..services.container_service import (
+    ContainerNotRunning,
     add_collaborator,
     build_image,
     check_mount_usage,
@@ -51,6 +57,7 @@ from ..services.container_service import (
     list_last_ssh,
     remove_collaborator,
     remove_container,
+    reset_container_password,
     update_role,
 )
 from ..docker_operates.status_cache import ActionOutcome
@@ -58,12 +65,66 @@ from ..utils.Container import Container
 
 logger = logging.getLogger(__name__)
 
+
+def _sanitized_validation_details(exc: RequestValidationError) -> list[dict]:
+    details = []
+    for error in exc.errors():
+        details.append(
+            {
+                "type": str(error.get("type", "value_error")),
+                "loc": list(error.get("loc", ())),
+                "msg": str(error.get("msg", "invalid value")),
+            }
+        )
+    return details
+
+
+class PasswordValidationRoute(APIRoute):
+    """Route-local 422 redaction and no-store for password-bearing endpoints."""
+
+    def get_route_handler(self):
+        original = super().get_route_handler()
+
+        async def custom_route_handler(request):
+            try:
+                response = await original(request)
+            except RequestValidationError as exc:
+                response = JSONResponse(
+                    status_code=422,
+                    content={
+                        "success": 0,
+                        "error": "invalid request",
+                        "error_reason": "invalid_request",
+                        "detail": _sanitized_validation_details(exc),
+                    },
+                )
+            response.headers["Cache-Control"] = "no-store"
+            return response
+
+        return custom_route_handler
+
 router = APIRouter(prefix="/api", tags=["container"])
 """Node HTTP 操作通道。
 
 这里承载 Ctrl -> Node 的命令型接口，例如创建、删除、启停容器。
 状态类快照接口仍保留为查询面，但长期主同步通道是 WSS。
 """
+
+
+def _password_post(path: str, **kwargs):
+    """Register one password-bearing route with route-local 422/no-store."""
+
+    def decorator(func):
+        router.add_api_route(
+            path,
+            func,
+            methods=["POST"],
+            route_class_override=PasswordValidationRoute,
+            **kwargs,
+        )
+        return func
+
+    return decorator
 
 
 def _bad_request(error: str, error_reason: str) -> JSONResponse:
@@ -96,7 +157,10 @@ def _model_data(model) -> dict:
     return model.dict()
 
 
-@router.post("/create_container", response_model=CreateContainerResponse)
+@_password_post(
+    "/create_container",
+    response_model=CreateContainerResponse,
+)
 def create_container_api(message: CreateContainerMessage):
     """创建容器请求。
 
@@ -143,11 +207,17 @@ def create_container_api(message: CreateContainerMessage):
             result = create_container(
                 message.owner_name,
                 cfg,
+                root_password=message.root_password,
                 public_key=message.public_key,
                 restore_mount_path=message.restore_mount_path,
             )
             for account in message.restore_accounts or []:
-                ok = add_collaborator(result.container_name, account.user_name, _role_value(account.role))
+                ok = add_collaborator(
+                    result.container_name,
+                    account.user_name,
+                    _role_value(account.role),
+                    password=account.password,
+                )
                 if not ok:
                     raise RuntimeError(f"failed to restore collaborator {account.user_name}")
             logger.info(
@@ -324,15 +394,31 @@ def remove_container_api(message: RemoveContainerMessage):
     return JSONResponse(status_code=500, content={"success": 0, "error": "failed to remove container", "error_reason": "remove_failed"})
 
 
-@router.post("/add_collaborator", response_model=AddCollaboratorResponse)
+@_password_post(
+    "/add_collaborator",
+    response_model=AddCollaboratorResponse,
+)
 def add_collaborator_api(message: AddCollaboratorMessage):
     """向容器内添加协作者账号。"""
 
     try:
-        success = add_collaborator(message.config.container_name, message.config.user_name, _role_value(message.config.role))
-    except Exception as e:
-        return JSONResponse(status_code=500, content={"success": 0, "error": str(e), "error_reason": "internal_error"})
-    return {"success": success, "decrypted_message": _model_data(message)}
+        success = add_collaborator(
+            message.config.container_name,
+            message.config.user_name,
+            _role_value(message.config.role),
+            password=message.config.password,
+        )
+    except Exception:
+        return JSONResponse(
+            status_code=500,
+            content={"success": 0, "error": "failed to add collaborator", "error_reason": "add_failed"},
+        )
+    public_config = {
+        "container_name": message.config.container_name,
+        "user_name": message.config.user_name,
+        "role": message.config.role,
+    }
+    return {"success": success, "decrypted_message": public_config}
 
 
 def _submit_container_action(name: str, action: str, transition: str) -> dict | JSONResponse:
@@ -423,15 +509,68 @@ def remove_collaborator_api(message: RemoveCollaboratorMessage):
     return {"success": 1}
 
 
-@router.post("/update_role", response_model=UpdateRoleResponse)
+@_password_post(
+    "/update_role",
+    response_model=UpdateRoleResponse,
+)
 def update_role_api(message: UpdateRoleMessage):
     """更新协作者角色。"""
 
     try:
-        success = update_role(message.config.container_name, message.config.user_name, _role_value(message.config.updated_role))
-    except Exception as e:
-        return JSONResponse(status_code=500, content={"success": 0, "error": str(e), "error_reason": "internal_error"})
-    return {"success": success, "decrypted_message": _model_data(message)}
+        success = update_role(
+            message.config.container_name,
+            message.config.user_name,
+            _role_value(message.config.updated_role),
+            root_password=message.config.root_password,
+            password=message.config.password,
+        )
+    except Exception:
+        return JSONResponse(
+            status_code=500,
+            content={"success": 0, "error": "failed to update role", "error_reason": "internal_error"},
+        )
+    public_config = {
+        "container_name": message.config.container_name,
+        "user_name": message.config.user_name,
+        "updated_role": message.config.updated_role,
+    }
+    return {"success": success, "decrypted_message": public_config}
+
+
+@_password_post(
+    "/reset_container_password",
+    response_model=ResetContainerPasswordResponse,
+)
+def reset_container_password_api(message: ResetContainerPasswordMessage):
+    """Synchronously reset one bound account password inside a running container."""
+
+    try:
+        reset_container_password(
+            message.config.container_name,
+            message.config.user_name,
+            message.config.password,
+        )
+    except docker.errors.NotFound:
+        return JSONResponse(
+            status_code=404,
+            content={"success": 0, "error": "container not found", "error_reason": "not_found"},
+        )
+    except ContainerNotRunning:
+        return JSONResponse(
+            status_code=409,
+            content={"success": 0, "error": "container is not running", "error_reason": "container_not_running"},
+        )
+    except ValueError:
+        return JSONResponse(
+            status_code=400,
+            content={"success": 0, "error": "invalid login name", "error_reason": "invalid_user_name"},
+        )
+    except Exception:
+        return JSONResponse(
+            status_code=500,
+            content={"success": 0, "error": "failed to reset password", "error_reason": "reset_failed"},
+        )
+    return {"success": 1}
 
 
 @router.post("/check_disk_usage", response_model=CheckDiskUsageResponse)

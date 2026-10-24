@@ -1,8 +1,26 @@
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator, model_validator
 
 from .common import EmptyConfig, SuccessResponse
+
+
+_PASSWORD_FORBIDDEN = (":", "\r", "\n", "\x00")
+
+
+def _validate_password_secret(value: SecretStr) -> SecretStr:
+    raw = value.get_secret_value()
+    if not raw.strip() or not (8 <= len(raw) <= 128) or any(ch in raw for ch in _PASSWORD_FORBIDDEN):
+        raise ValueError(
+            "password must be 8-128 characters, not blank, and must not contain ':', CR, LF, or NUL"
+        )
+    return value
+
+
+def _validate_optional_password(value: SecretStr | None) -> SecretStr | None:
+    if value is None:
+        return None
+    return _validate_password_secret(value)
 
 
 ContainerStatus = Literal[
@@ -87,6 +105,12 @@ class ContainerOperationAcceptedResponse(SuccessResponse):
 class RestoreAccountConfig(BaseModel):
     user_name: str
     role: CollaboratorRole = "collaborator"
+    password: SecretStr
+
+    @field_validator("password")
+    @classmethod
+    def _password_valid(cls, value: SecretStr) -> SecretStr:
+        return _validate_password_secret(value)
 
 
 #####################
@@ -96,10 +120,16 @@ class RestoreAccountConfig(BaseModel):
 class CreateContainerMessage(BaseModel):
     owner_name: str
     config: ContainerConfig
+    root_password: SecretStr
     public_key: str | None = Field(default=None, description="Optional SSH public key installed into root authorized_keys")
     image_build: ImageBuildConfig | None = None
     restore_mount_path: str | None = Field(default=None, description="Existing host mount path reused during container resurrection")
     restore_accounts: list[RestoreAccountConfig] = Field(default_factory=list)
+
+    @field_validator("root_password")
+    @classmethod
+    def _root_password_valid(cls, value: SecretStr) -> SecretStr:
+        return _validate_password_secret(value)
 
 
 class CreateContainerResponse(SuccessResponse):
@@ -178,6 +208,12 @@ class AddCollaboratorConfig(BaseModel):
     container_name: str
     user_name: str
     role: CollaboratorRole
+    password: SecretStr
+
+    @field_validator("password")
+    @classmethod
+    def _password_valid(cls, value: SecretStr) -> SecretStr:
+        return _validate_password_secret(value)
 
 
 class AddCollaboratorMessage(BaseModel):
@@ -254,6 +290,28 @@ class UpdateRoleConfig(BaseModel):
     container_name: str
     user_name: str
     updated_role: UpdatedRole
+    root_password: SecretStr | None = None
+    password: SecretStr | None = None
+
+    @field_validator("root_password", "password")
+    @classmethod
+    def _optional_password_valid(cls, value: SecretStr | None) -> SecretStr | None:
+        return _validate_optional_password(value)
+
+    @model_validator(mode="after")
+    def _role_password_fields(self):
+        if self.updated_role == "root":
+            if self.root_password is None:
+                raise ValueError("root_password is required for root role")
+            if self.password is not None:
+                raise ValueError("password is only allowed for admin role")
+        elif self.updated_role == "admin":
+            if self.root_password is not None:
+                raise ValueError("root_password is only allowed for root role")
+        else:
+            if self.root_password is not None or self.password is not None:
+                raise ValueError("passwords are not allowed for collaborator role")
+        return self
 
 
 class UpdateRoleMessage(BaseModel):
@@ -263,6 +321,30 @@ class UpdateRoleMessage(BaseModel):
 class UpdateRoleResponse(SuccessResponse):
     # Success JSON: {"success": true|false, "decrypted_message": {...}}.
     decrypted_message: dict[str, Any]
+
+
+#####################
+# 重置容器账号密码
+
+
+class ResetContainerPasswordConfig(BaseModel):
+    container_name: str = Field(pattern=r"^[A-Za-z0-9_-]+$")
+    user_name: str = Field(pattern=r"^[A-Za-z0-9_-]+$")
+    password: SecretStr
+
+    @field_validator("password")
+    @classmethod
+    def _password_valid(cls, value: SecretStr) -> SecretStr:
+        return _validate_password_secret(value)
+
+
+class ResetContainerPasswordMessage(BaseModel):
+    config: ResetContainerPasswordConfig
+
+
+class ResetContainerPasswordResponse(SuccessResponse):
+    # Success JSON: {"success": 1}.
+    pass
 
 
 #####################

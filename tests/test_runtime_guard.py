@@ -736,7 +736,7 @@ def test_api_create_visible_before_background_thread_finishes(api_client, monkey
     started = threading.Event()
     release = threading.Event()
 
-    def _slow_create(owner_name, cfg, public_key=None, restore_mount_path=None):
+    def _slow_create(owner_name, cfg, *, root_password, public_key=None, restore_mount_path=None):
         started.set()
         assert release.wait(3)
         return container_service.CreateContainerReturn("cid", cfg.name)
@@ -747,6 +747,7 @@ def test_api_create_visible_before_background_thread_finishes(api_client, monkey
         "/api/create_container",
         json={
             "owner_name": "admin",
+            "root_password": "Root#Password9",
             "config": {
                 "gpu_list": [],
                 "cpu_number": 2,
@@ -783,6 +784,7 @@ def test_api_create_leaves_created_object_as_hard_block(api_client, monkeypatch)
         "/api/create_container",
         json={
             "owner_name": "admin",
+            "root_password": "Root#Password9",
             "config": {
                 "gpu_list": [],
                 "cpu_number": 2,
@@ -814,6 +816,7 @@ def test_api_create_failure_without_object_is_unknown_not_failed(api_client, mon
         "/api/create_container",
         json={
             "owner_name": "admin",
+            "root_password": "Root#Password9",
             "config": {
                 "gpu_list": [],
                 "cpu_number": 2,

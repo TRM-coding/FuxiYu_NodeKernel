@@ -9,6 +9,7 @@ import uuid
 
 import docker
 import pytest
+from pydantic import SecretStr
 
 from FuxiYu_NodeKernel.config import PortConfig
 from FuxiYu_NodeKernel.docker_operates import port_allocator
@@ -16,7 +17,7 @@ from FuxiYu_NodeKernel.services.container_service import build_image, create_con
 from FuxiYu_NodeKernel.utils.Container import Container
 from FuxiYu_NodeKernel import extensions
 
-from .conftest import FakeContainer, FakeContainers, FakeDockerClient, FakeImages
+from .conftest import FakeContainer, FakeContainers, FakeDockerClient, FakeExecAPI, FakeImages
 
 # 与本进程代理相关的环境变量（大小写都认）
 _PROXY_KEYS = ("http_proxy", "HTTP_PROXY", "https_proxy", "HTTPS_PROXY", "no_proxy", "NO_PROXY")
@@ -30,6 +31,7 @@ VALID_CFG = dict(
     port=2233,
     image="ubuntu:22.04",
 )
+ROOT_PW = SecretStr("Root#Password9")
 
 
 @pytest.fixture(autouse=True)
@@ -50,7 +52,7 @@ def test_error_path_invalid_config(monkeypatch):
     """unsafe owner_name → RuntimeError，发生在触碰 docker 之前。"""
     monkeypatch.setattr(extensions, "docker_client", FakeDockerClient())
     with pytest.raises(RuntimeError, match="unsafe owner_name"):
-        create_container("bad;name", Container.Config_info(**VALID_CFG))
+        create_container("bad;name", Container.Config_info(**VALID_CFG), root_password=ROOT_PW)
 
 
 def test_error_path_container_exist(monkeypatch):
@@ -58,7 +60,7 @@ def test_error_path_container_exist(monkeypatch):
     existing = FakeContainer(name=VALID_CFG["name"])
     monkeypatch.setattr(extensions, "docker_client", FakeDockerClient(FakeContainers([existing])))
     with pytest.raises(RuntimeError, match="already exists"):
-        create_container("admin", Container.Config_info(**VALID_CFG))
+        create_container("admin", Container.Config_info(**VALID_CFG), root_password=ROOT_PW)
 
 
 def test_build_image_builds_missing_tag(monkeypatch):
@@ -227,23 +229,36 @@ def test_create_container_writes_proxy_into_container(monkeypatch):
     "容器内网络不通"——平台侧什么都看不出来。锁住"有人再删它"这件事。
     """
     created = []
+    events = []
+
+    class _OrderContainer(FakeContainer):
+        def exec_run(self, cmd, **kw):
+            events.append(("exec", str(cmd)))
+            return super().exec_run(cmd, **kw)
 
     class _Containers(FakeContainers):
         def run(self, *a, **k):
-            c = FakeContainer(name=k.get("name", "c1"))
+            c = _OrderContainer(name=k.get("name", "c1"))
             created.append(c)
             return c
 
+    class _OrderAPI(FakeExecAPI):
+        def exec_create(self, container_id, cmd, **kwargs):
+            events.append(("chpasswd", str(cmd)))
+            return super().exec_create(container_id, cmd, **kwargs)
+
     _clear_proxy_env(monkeypatch)
     monkeypatch.setenv("http_proxy", "http://proxy.example:8091")
-    monkeypatch.setattr(extensions, "docker_client", FakeDockerClient(_Containers()))
+    client = FakeDockerClient(_Containers())
+    client.api = _OrderAPI()
+    monkeypatch.setattr(extensions, "docker_client", client)
 
-    create_container("admin", Container.Config_info(**VALID_CFG))
+    create_container("admin", Container.Config_info(**VALID_CFG), root_password=ROOT_PW)
 
-    cmds = [str(call[0]) for call in created[0].exec_calls]
-    proxy_idx = next(i for i, c in enumerate(cmds) if "/etc/environment" in c)
-    chpasswd_idx = next(i for i, c in enumerate(cmds) if "chpasswd" in c)
+    proxy_idx = next(i for i, (kind, text) in enumerate(events) if kind == "exec" and "/etc/environment" in text)
+    chpasswd_idx = next(i for i, (kind, text) in enumerate(events) if kind == "chpasswd")
     assert proxy_idx < chpasswd_idx
+    assert client.api.created[0]["cmd"] == ["chpasswd"]
 
 
 def test_create_container_uses_prepared_image_and_only_runs_sshd_gate(monkeypatch):
@@ -262,7 +277,7 @@ def test_create_container_uses_prepared_image_and_only_runs_sshd_gate(monkeypatc
 
     cfg_data = dict(VALID_CFG)
     cfg_data["image"] = "fuxi/image-7:20260826T000000Z"
-    result = create_container("admin", Container.Config_info(**cfg_data))
+    result = create_container("admin", Container.Config_info(**cfg_data), root_password=ROOT_PW)
 
     assert isinstance(result, CreateContainerReturn)
     assert run_calls and run_calls[0][0][0] == cfg_data["image"]
@@ -292,7 +307,7 @@ def _create_and_capture(monkeypatch, *, exposed=None, missing_image=False, conta
     images = FakeImages(exposed=exposed, missing=missing_image)
     monkeypatch.setattr(extensions, "docker_client", FakeDockerClient(containers, images))
     monkeypatch.setattr(port_allocator, "_system_bound_ports", lambda: set())
-    create_container("admin", Container.Config_info(**VALID_CFG))
+    create_container("admin", Container.Config_info(**VALID_CFG), root_password=ROOT_PW)
     return containers, images
 
 
@@ -400,6 +415,8 @@ def test_unrelated_run_failure_is_not_retried(monkeypatch):
 
 def test_create_container_gpu_request_uses_device_ids_without_driver(monkeypatch):
     """GPU 容器请求只指定设备 ID 和能力，保持旧部署链路的 Docker runtime 适配面。"""
+    if not hasattr(docker.types, "DeviceRequest"):
+        pytest.skip("docker SDK in this test env lacks DeviceRequest; GPU request path unavailable")
     device_request_calls = []
     run_calls = []
 
@@ -418,7 +435,7 @@ def test_create_container_gpu_request_uses_device_ids_without_driver(monkeypatch
     cfg_data = dict(VALID_CFG)
     cfg_data["gpu_list"] = [0, 2]
 
-    result = create_container("admin", Container.Config_info(**cfg_data))
+    result = create_container("admin", Container.Config_info(**cfg_data), root_password=ROOT_PW)
 
     assert isinstance(result, CreateContainerReturn)
     assert device_request_calls == [
@@ -445,6 +462,7 @@ def test_create_container_restore_reuses_existing_mount(containers_base, monkeyp
     result = create_container(
         "admin",
         Container.Config_info(**VALID_CFG),
+        root_password=ROOT_PW,
         restore_mount_path=str(restore),
     )
 
@@ -462,6 +480,7 @@ def test_create_container_restore_rejects_mount_outside_base(tmp_path, monkeypat
         create_container(
             "admin",
             Container.Config_info(**VALID_CFG),
+            root_password=ROOT_PW,
             restore_mount_path=str(outside),
         )
 
@@ -477,15 +496,18 @@ def test_build_image_surfaces_the_raw_build_output(monkeypatch):
             raise docker.errors.ImageNotFound("not found")
 
         def build(self, **kwargs):
-            raise docker.errors.BuildError(
+            build_log = [
+                {"stream": "Step 3/5 : RUN set -eu; apt-get update ...\n"},
+                {"stream": "Err:1 http://archive.ubuntu.com/ubuntu noble InRelease\n"},
+                {"stream": "  Clearsigned file isn't valid, got 'NOSPLIT'\n"},
+                {"stream": "E: The repository is not signed.\n"},
+            ]
+            error = docker.errors.BuildError(
                 "The command '/bin/sh -c apt-get update ...' returned a non-zero code: 100",
-                build_log=[
-                    {"stream": "Step 3/5 : RUN set -eu; apt-get update ...\n"},
-                    {"stream": "Err:1 http://archive.ubuntu.com/ubuntu noble InRelease\n"},
-                    {"stream": "  Clearsigned file isn't valid, got 'NOSPLIT'\n"},
-                    {"stream": "E: The repository is not signed.\n"},
-                ],
+                build_log,
             )
+            error.build_log = build_log
+            raise error
 
     class _Client:
         def __init__(self):
@@ -629,7 +651,7 @@ def test_no_build_path_does_not_install_sshd_in_node(monkeypatch):
 
     monkeypatch.setattr(extensions, "docker_client", FakeDockerClient(_Containers()))
 
-    result = create_container("admin", Container.Config_info(**VALID_CFG))
+    result = create_container("admin", Container.Config_info(**VALID_CFG), root_password=ROOT_PW)
 
     assert isinstance(result, CreateContainerReturn)
     exec_commands = [
@@ -671,7 +693,7 @@ def test_create_container_fails_when_sshd_gate_fails(monkeypatch):
     monkeypatch.setattr(extensions, "docker_client", FakeDockerClient(_Containers()))
 
     with pytest.raises(RuntimeError, match="sshd gate failed"):
-        create_container("admin", Container.Config_info(**VALID_CFG))
+        create_container("admin", Container.Config_info(**VALID_CFG), root_password=ROOT_PW)
 
 
 def _run_and_capture(monkeypatch):
@@ -684,7 +706,7 @@ def _run_and_capture(monkeypatch):
             return FakeContainer(name=k.get("name", "c1"))
 
     monkeypatch.setattr(extensions, "docker_client", FakeDockerClient(_Containers()))
-    create_container("admin", Container.Config_info(**VALID_CFG))
+    create_container("admin", Container.Config_info(**VALID_CFG), root_password=ROOT_PW)
     return run_calls[0]
 
 
@@ -747,7 +769,7 @@ def test_create_container_explains_image_that_exits_immediately(monkeypatch):
     monkeypatch.setattr(extensions, "docker_client", FakeDockerClient(_Containers()))
 
     with pytest.raises(RuntimeError, match="exited immediately"):
-        create_container("admin", Container.Config_info(**VALID_CFG))
+        create_container("admin", Container.Config_info(**VALID_CFG), root_password=ROOT_PW)
 
 
 def _local_docker_available() -> bool:
@@ -802,7 +824,7 @@ def test_happy_path(monkeypatch, tmp_path):
     bound_port = None
     created_id = None
     try:
-        result = create_container("admin", test_config, public_key=dummy_key)
+        result = create_container("admin", test_config, root_password=ROOT_PW, public_key=dummy_key)
         created_id = result.container_id
 
         assert isinstance(result, CreateContainerReturn)

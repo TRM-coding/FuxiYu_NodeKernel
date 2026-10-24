@@ -71,6 +71,7 @@ def test_happy_path():
     """真实 docker：建容器 → 加用户再删除 → 验证用户不存在 → 清理。"""
     from FuxiYu_NodeKernel.services.container_service import add_collaborator
     from FuxiYu_NodeKernel.constant import ROLE
+    from pydantic import SecretStr
 
     if extensions.docker_client is None:
         extensions.init_docker()
@@ -86,7 +87,7 @@ def test_happy_path():
     user = f"u{uuid.uuid4().hex[:8]}"
 
     try:
-        assert add_collaborator(c.id, user, ROLE.COLLABORATOR) is True
+        assert add_collaborator(c.id, user, ROLE.COLLABORATOR, password=SecretStr("Remove#Password9")) is True
         assert remove_collaborator(c.id, user) is True
         r = c.exec_run(["/bin/sh", "-c", f"id -u {user}"], user="root")
         assert r.exit_code != 0, "用户应已被删除"

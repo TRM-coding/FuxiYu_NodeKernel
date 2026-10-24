@@ -23,6 +23,8 @@ VALID_CFG = {
     "port": 2233,
     "image": "ubuntu:22.04",
 }
+ROOT_PW = "Root#Password9"
+COLLAB_PW = "Collab#Password9"
 
 
 @pytest.fixture()
@@ -122,14 +124,14 @@ def test_node_self_signed_certificate_is_valid_pin_anchor(monkeypatch, tmp_path)
 def test_create_container_success(client, monkeypatch):
     calls = []
 
-    def _stub(owner_name, cfg, public_key=None, restore_mount_path=None):
-        calls.append((owner_name, cfg, public_key, restore_mount_path))
+    def _stub(owner_name, cfg, *, root_password, public_key=None, restore_mount_path=None):
+        calls.append((owner_name, cfg, root_password, public_key, restore_mount_path))
         return CreateContainerReturn("cid123", cfg.name)
 
     _patched_service(monkeypatch, "container_exists", lambda name: False)
     _patched_service(monkeypatch, "create_container", _stub)
 
-    payload = {"owner_name": "admin", "config": VALID_CFG}
+    payload = {"owner_name": "admin", "config": VALID_CFG, "root_password": ROOT_PW}
     resp = client.post("/api/create_container", json=payload)
 
     assert resp.status_code == 200
@@ -140,6 +142,7 @@ def test_create_container_success(client, monkeypatch):
     assert len(calls) == 1
     assert calls[0][0] == "admin"
     assert calls[0][1].name == "c1"
+    assert calls[0][2].get_secret_value() == ROOT_PW
 
 
 def test_create_container_with_image_build_reports_building(client, monkeypatch):
@@ -152,8 +155,8 @@ def test_create_container_with_image_build_reports_building(client, monkeypatch)
         build_calls.append(build)
         return build.image_tag
 
-    def _stub(owner_name, cfg, public_key=None, restore_mount_path=None):
-        calls.append((owner_name, cfg, public_key, restore_mount_path))
+    def _stub(owner_name, cfg, *, root_password, public_key=None, restore_mount_path=None):
+        calls.append((owner_name, cfg, root_password, public_key, restore_mount_path))
         return CreateContainerReturn("cid123", cfg.name)
 
     _patched_service(monkeypatch, "container_exists", lambda name: False)
@@ -163,6 +166,7 @@ def test_create_container_with_image_build_reports_building(client, monkeypatch)
     payload = {
         "owner_name": "admin",
         "config": VALID_CFG,
+        "root_password": ROOT_PW,
         "image_build": {
             "dockerfile_text": "FROM ubuntu:22.04\nRUN echo ok\n",
             "image_tag": "fuxi/image-1:20260826T000000Z",
@@ -184,12 +188,12 @@ def test_create_container_restore_payload_passes_mount_and_accounts(client, monk
     calls = []
     collaborator_calls = []
 
-    def _stub(owner_name, cfg, public_key=None, restore_mount_path=None):
-        calls.append((owner_name, cfg, public_key, restore_mount_path))
+    def _stub(owner_name, cfg, *, root_password, public_key=None, restore_mount_path=None):
+        calls.append((owner_name, cfg, root_password, public_key, restore_mount_path))
         return CreateContainerReturn("cid123", cfg.name)
 
-    def _add_collaborator(container_name, user_name, role):
-        collaborator_calls.append((container_name, user_name, role))
+    def _add_collaborator(container_name, user_name, role, *, password):
+        collaborator_calls.append((container_name, user_name, role, password.get_secret_value()))
         return True
 
     _patched_service(monkeypatch, "container_exists", lambda name: False)
@@ -199,15 +203,17 @@ def test_create_container_restore_payload_passes_mount_and_accounts(client, monk
     payload = {
         "owner_name": "admin",
         "config": VALID_CFG,
+        "root_password": ROOT_PW,
         "restore_mount_path": "/tmp/admin/containers/c1_old",
-        "restore_accounts": [{"user_name": "alice", "role": "collaborator"}],
+        "restore_accounts": [{"user_name": "alice", "role": "collaborator", "password": COLLAB_PW}],
     }
     resp = client.post("/api/create_container", json=payload)
 
     assert resp.status_code == 200
     time.sleep(0.1)
-    assert calls[0][3] == "/tmp/admin/containers/c1_old"
-    assert collaborator_calls == [("c1", "alice", api_module.ROLE.COLLABORATOR)]
+    assert calls[0][4] == "/tmp/admin/containers/c1_old"
+    assert calls[0][2].get_secret_value() == ROOT_PW
+    assert collaborator_calls == [("c1", "alice", api_module.ROLE.COLLABORATOR, COLLAB_PW)]
 
 
 def test_create_container_build_failed_is_visible_without_delete(client, monkeypatch):
@@ -224,6 +230,7 @@ def test_create_container_build_failed_is_visible_without_delete(client, monkeyp
     payload = {
         "owner_name": "admin",
         "config": cfg,
+        "root_password": ROOT_PW,
         "image_build": {
             "dockerfile_text": "FROM scratch\nRUN nope\n",
             "image_tag": "fuxi/image-1:bad",
@@ -259,7 +266,7 @@ def test_create_container_build_failed_is_visible_without_delete(client, monkeyp
 
 def test_create_container_existing_returns_409(client, monkeypatch):
     _patched_service(monkeypatch, "container_exists", lambda name: True)
-    payload = {"owner_name": "admin", "config": VALID_CFG}
+    payload = {"owner_name": "admin", "config": VALID_CFG, "root_password": ROOT_PW}
     resp = client.post("/api/create_container", json=payload)
     assert resp.status_code == 409
     assert resp.json()["error_reason"] == "container_exists"
@@ -267,7 +274,7 @@ def test_create_container_existing_returns_409(client, monkeypatch):
 
 def test_create_container_invalid_config_422(client):
     bad_cfg = {**VALID_CFG, "port": "not-a-port"}
-    payload = {"owner_name": "admin", "config": bad_cfg}
+    payload = {"owner_name": "admin", "config": bad_cfg, "root_password": ROOT_PW}
     resp = client.post("/api/create_container", json=payload)
     assert resp.status_code == 422
 
@@ -327,16 +334,35 @@ def test_machine_status_online(client):
 
 
 def test_add_collaborator_success(client, monkeypatch):
-    _patched_service(monkeypatch, "add_collaborator", lambda *a: True)
-    payload = {"config": {"container_name": "c1", "user_name": "u1", "role": "admin"}}
+    _patched_service(monkeypatch, "add_collaborator", lambda *a, **k: True)
+    payload = {
+        "config": {
+            "container_name": "c1",
+            "user_name": "u1",
+            "role": "admin",
+            "password": COLLAB_PW,
+        }
+    }
     resp = client.post("/api/add_collaborator", json=payload)
     assert resp.status_code == 200
     assert resp.json()["success"] is True
-    assert resp.json()["decrypted_message"] == payload
+    assert resp.json()["decrypted_message"] == {
+        "container_name": "c1",
+        "user_name": "u1",
+        "role": "admin",
+    }
+    assert COLLAB_PW not in resp.text
 
 
 def test_add_collaborator_invalid_role_422(client):
-    payload = {"config": {"container_name": "c1", "user_name": "u1", "role": "hacker"}}
+    payload = {
+        "config": {
+            "container_name": "c1",
+            "user_name": "u1",
+            "role": "hacker",
+            "password": COLLAB_PW,
+        }
+    }
     resp = client.post("/api/add_collaborator", json=payload)
     assert resp.status_code == 422
 
@@ -362,12 +388,24 @@ def test_remove_collaborator_failure_returns_500(client, monkeypatch):
 
 
 def test_update_role_success(client, monkeypatch):
-    _patched_service(monkeypatch, "update_role", lambda *a: True)
-    payload = {"config": {"container_name": "c1", "user_name": "u1", "updated_role": "root"}}
+    _patched_service(monkeypatch, "update_role", lambda *a, **k: True)
+    payload = {
+        "config": {
+            "container_name": "c1",
+            "user_name": "u1",
+            "updated_role": "root",
+            "root_password": ROOT_PW,
+        }
+    }
     resp = client.post("/api/update_role", json=payload)
     assert resp.status_code == 200
     assert resp.json()["success"] is True
-    assert resp.json()["decrypted_message"] == payload
+    assert resp.json()["decrypted_message"] == {
+        "container_name": "c1",
+        "user_name": "u1",
+        "updated_role": "root",
+    }
+    assert ROOT_PW not in resp.text
 
 
 def test_update_role_invalid_role_422(client):
