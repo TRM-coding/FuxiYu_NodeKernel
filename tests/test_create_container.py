@@ -102,7 +102,7 @@ def test_build_proxy_is_injected_as_arg_after_from(monkeypatch):
     构建路径不读 query，于是"手动 --build-arg 就通、走 SDK 就不通"，且两侧日志一模一样
     （2026-09 实测）。写进 Dockerfile 的 ARG 不经过那条路，谁调都一样。
     """
-    from FuxiYu_NodeKernel.services.container_service import _inject_build_proxy
+    from FuxiYu_NodeKernel.docker_operates.proxy_config import _inject_build_proxy
 
     for k in _PROXY_KEYS:
         monkeypatch.delenv(k, raising=False)
@@ -121,7 +121,7 @@ def test_build_proxy_is_injected_as_arg_after_from(monkeypatch):
 
 def test_build_proxy_absent_leaves_text_untouched(monkeypatch):
     """没配就**一字不改**——默认行为与从前完全一致。"""
-    from FuxiYu_NodeKernel.services.container_service import _inject_build_proxy
+    from FuxiYu_NodeKernel.docker_operates.proxy_config import _inject_build_proxy
 
     for k in _PROXY_KEYS:
         monkeypatch.delenv(k, raising=False)
@@ -136,7 +136,7 @@ def test_build_proxy_never_injects_no_proxy(monkeypatch):
     `10.0.0.0/8,192.168.0.0/16` → apt 绕开代理 → 被校园网拦下 → 报的却是
     `Clearsigned file isn't valid, got 'NOSPLIT'`，极难定位。
     """
-    from FuxiYu_NodeKernel.services.container_service import _inject_build_proxy
+    from FuxiYu_NodeKernel.docker_operates.proxy_config import _inject_build_proxy
 
     monkeypatch.setenv("HTTP_PROXY", "http://proxy.example:8091")
     monkeypatch.setenv("NO_PROXY", "localhost,10.0.0.0/8")
@@ -148,7 +148,7 @@ def test_build_proxy_never_injects_no_proxy(monkeypatch):
 
 def test_build_proxy_rejects_illegal_values(monkeypatch):
     """非法值（会被拼进 Dockerfile 文本）一律忽略。"""
-    from FuxiYu_NodeKernel.services.container_service import _inject_build_proxy
+    from FuxiYu_NodeKernel.docker_operates.proxy_config import _inject_build_proxy
 
     text = "FROM ubuntu:24.04\n"
     for bad in ("proxy.example", "http://a b", "http://x\nRUN evil", "http://x'$(id)"):
@@ -165,7 +165,7 @@ def _clear_proxy_env(monkeypatch):
 
 def test_runtime_proxy_env_pairs_lower_and_upper(monkeypatch):
     """运行期代理：读到什么就大小写各出一份；**no_proxy 绝不跟着进去**。"""
-    from FuxiYu_NodeKernel.services.container_service import _runtime_proxy_env
+    from FuxiYu_NodeKernel.docker_operates.proxy_config import _runtime_proxy_env
 
     _clear_proxy_env(monkeypatch)
     monkeypatch.setenv("HTTP_PROXY", "http://proxy.example:8091")   # 大写也认
@@ -178,7 +178,7 @@ def test_runtime_proxy_env_pairs_lower_and_upper(monkeypatch):
 
 
 def test_runtime_proxy_env_empty_without_proxy(monkeypatch):
-    from FuxiYu_NodeKernel.services.container_service import _runtime_proxy_env
+    from FuxiYu_NodeKernel.docker_operates.proxy_config import _runtime_proxy_env
 
     _clear_proxy_env(monkeypatch)
     assert _runtime_proxy_env() == {}
@@ -190,7 +190,7 @@ def test_runtime_proxy_setup_merges_etc_environment(monkeypatch):
     回归锁：旧实现是 `> /etc/environment`，会把镜像自带的 PATH 一起顶掉——2026-09 在学生的
     容器里实测看到该文件只剩一行 PATH（那行是镜像的），覆盖式写入会让 SSH 会话连 PATH 都没。
     """
-    from FuxiYu_NodeKernel.services.container_service import _runtime_proxy_setup_command
+    from FuxiYu_NodeKernel.docker_operates.proxy_config import _runtime_proxy_setup_command
 
     cmd = _runtime_proxy_setup_command(
         {"http_proxy": "http://p:8091", "https_proxy": "http://p:8091"}
