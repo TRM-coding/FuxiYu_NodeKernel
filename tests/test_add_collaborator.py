@@ -6,6 +6,7 @@
 import uuid
 
 import pytest
+from pydantic import SecretStr
 
 from FuxiYu_NodeKernel.services.container_service import add_collaborator
 from FuxiYu_NodeKernel.constant import ROLE
@@ -13,24 +14,26 @@ from FuxiYu_NodeKernel import extensions
 
 from .conftest import FakeContainer, FakeContainers, FakeDockerClient
 
+PW = SecretStr("Collab#Password9")
+
 
 def test_error_path_invalid_config(monkeypatch):
     """非法用户名 → sanitizer 拒绝 → False。"""
     c = FakeContainer("c1")
     monkeypatch.setattr(extensions, "docker_client", FakeDockerClient(FakeContainers([c])))
-    assert add_collaborator("c1", "bad;name", ROLE.ADMIN) is False
+    assert add_collaborator("c1", "bad;name", ROLE.ADMIN, password=PW) is False
 
 
 def test_error_path_container_not_exist(monkeypatch):
     monkeypatch.setattr(extensions, "docker_client", FakeDockerClient())
-    assert add_collaborator("ghost", "u1", ROLE.COLLABORATOR) is False
+    assert add_collaborator("ghost", "u1", ROLE.COLLABORATOR, password=PW) is False
 
 
 def test_error_path_collaborator_not_exist(monkeypatch):
     """容器内 useradd 失败（exec 退出码非 0）→ False。"""
     c = FakeContainer("c1", exec_exit_code=1)
     monkeypatch.setattr(extensions, "docker_client", FakeDockerClient(FakeContainers([c])))
-    assert add_collaborator("c1", "u1", ROLE.ADMIN) is False
+    assert add_collaborator("c1", "u1", ROLE.ADMIN, password=PW) is False
 
 
 @pytest.mark.docker
@@ -51,7 +54,7 @@ def test_happy_path():
     role = ROLE.COLLABORATOR
 
     try:
-        ok = add_collaborator(c.id, user, role)
+        ok = add_collaborator(c.id, user, role, password=PW)
         assert ok is True, "add_collaborator 返回 False"
 
         r = c.exec_run(["/bin/sh", "-c", f"id -u {user}"], user="root")

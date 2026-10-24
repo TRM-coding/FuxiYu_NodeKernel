@@ -54,11 +54,24 @@ def test_remove_archives_legacy_real_home(monkeypatch):
     assert ".legacy_u1_$ts.home" in cmd
 
 
+def test_remove_cmd_treats_absent_account_as_success(monkeypatch):
+    """幂等回归：账号在容器内不存在时（历史假成功残留 / 重复移除）应走 else exit 0
+    ——目标态已达成即成功；若让 userdel 的失败退出码判失败，漂移绑定将永远删不掉。"""
+    c = FakeContainer("c1", exec_exit_code=0)
+    monkeypatch.setattr(extensions, "docker_client", FakeDockerClient(FakeContainers([c])))
+    assert remove_collaborator("c1", "u1") is True
+    assert c.exec_calls, "预期执行过容器命令"
+    cmd = c.exec_calls[0][0][2]
+    assert "if id -u u1 >/dev/null 2>&1" in cmd
+    assert "else exit 0; fi" in cmd
+
+
 @pytest.mark.docker
 def test_happy_path():
     """真实 docker：建容器 → 加用户再删除 → 验证用户不存在 → 清理。"""
     from FuxiYu_NodeKernel.services.container_service import add_collaborator
     from FuxiYu_NodeKernel.constant import ROLE
+    from pydantic import SecretStr
 
     if extensions.docker_client is None:
         extensions.init_docker()
@@ -74,7 +87,7 @@ def test_happy_path():
     user = f"u{uuid.uuid4().hex[:8]}"
 
     try:
-        assert add_collaborator(c.id, user, ROLE.COLLABORATOR) is True
+        assert add_collaborator(c.id, user, ROLE.COLLABORATOR, password=SecretStr("Remove#Password9")) is True
         assert remove_collaborator(c.id, user) is True
         r = c.exec_run(["/bin/sh", "-c", f"id -u {user}"], user="root")
         assert r.exit_code != 0, "用户应已被删除"
