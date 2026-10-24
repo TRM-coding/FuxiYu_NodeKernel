@@ -639,6 +639,11 @@ def update_role(
     password: SecretStr | None = None,
 ) -> bool:
     try:
+        # 请求模型已校验；service 入口再防一次，确保直接调用也不会先触发 Docker lookup。
+        _sanitizer.validate_role_identity(container_name, "container_name")
+        _sanitizer.validate_role_identity(user_name, "user_name")
+        if updated_role in (ROLE.ADMIN, ROLE.COLLABORATOR) and user_name == "root":
+            raise ValueError("user_name root is only allowed for root role")
         if extensions.docker_client is None:
             extensions.init_docker()
         container = extensions.docker_client.containers.get(container_name)

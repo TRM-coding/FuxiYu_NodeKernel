@@ -21,7 +21,7 @@
 | 密码不得进入日志、错误、WSS、缓存与响应 | 响应不返回凭据 | [test_password_api.py](../../../tests/test_password_api.py)::test_responses_no_credentials | 🟢 已通过 |
 | 密码不得进入日志、错误、WSS、缓存与响应 | 凭据响应禁止缓存 | [test_password_api.py](../../../tests/test_password_api.py)::test_password_routes_no_store | 🟢 已通过 |
 | 密码不得进入日志、错误、WSS、缓存与响应 | ROOT 交接逐次调用、逐项凭据 | [test_password_services.py](../../../tests/test_password_services.py)::test_root_handover_orchestration | 🟢 已通过 |
-| 密码不得进入日志、错误、WSS、缓存与响应 | transfer_root=false 只带单项 | [test_password_services.py](../../../tests/test_password_services.py)::test_root_transfer_single_target | 🟢 已通过 |
+| 密码不得进入日志、错误、WSS、缓存与响应 | 单次 ROOT 请求只带本次密码字段 | [test_password_services.py](../../../tests/test_password_services.py)::test_root_transfer_single_target | 🟢 已通过 |
 | 密码不得进入日志、错误、WSS、缓存与响应 | 不新增重复密码审计 | [test_password_api.py](../../../tests/test_password_api.py)::test_no_duplicate_password_audit | 🟢 已通过 |
 | 密码不得进入日志、错误、WSS、缓存与响应 | 非密码路由保持默认 422 | [test_password_api.py](../../../tests/test_password_api.py)::test_non_password_route_default_422 | 🟢 已通过 |
 | 密码不得进入日志、错误、WSS、缓存与响应 | 失败响应夹带尝试不泄漏 | [test_password_api.py](../../../tests/test_password_api.py)::test_failure_response_no_secret | 🟢 已通过 |
@@ -45,3 +45,12 @@
 - 命令与环境：`cd /mnt/e/AI/Fuxi/FuxiYu_NodeKernel && /home/chest/.cache/fuxi-password-tests-offline/bin/python -m pytest -q --no-header`；WSL Linux 隔离 venv，docker 7.1.0
 - 结果：`444 passed, 16 deselected, 24 subtests passed`，0 skipped；SocketIO wrapper 专项 `5 passed`；密码专项 `36 passed`。
 - 限制：FakeDocker/FakeExecAPI 证明 Node argv/stdin/错误边界；真实 `socket.socketpair()` + `SocketIO` 测试证明 wrapper I/O；未连接真实 Docker daemon 或远程主机，不宣称生产环境验证。
+
+## ROOT 交接纠正复验（2026-10-24）
+
+- 当前主 spec SHA256：221BF1560286E804840CBEB5DA3FB1F35B9E0F5AF983EBFE810C8F5399FC8F75
+
+- 仅纠正规格边界：所有外部 ROOT 交接由 Ctrl 编排，Node 保留单账号执行方法；不改 Node 运行代码、数据结构或历史归档。
+- Node 密码相关三个测试文件复验：31 passed，0 failed；日志位于外部 root-handover-2026-10-24/node-password-regression.log。
+- 隔离的本地真实 Docker 复验：先为原所有者创建/重置独立 ADMIN 账号，再由目标接管永久 root；两个密码均与实际系统哈希一致，目标旧账号已删除。临时容器已清理，未使用用户容器。报告位于外部 root-handover-2026-10-24/docker-account-probe.json。
+- Node 的单次执行测试不单独证明 Ctrl 最终唯一 ROOT；该断言由 Ctrl 的交接 API/数据库回归覆盖，Web 双凭据由页面与浏览器测试覆盖。

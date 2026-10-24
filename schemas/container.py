@@ -3,6 +3,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator, model_validator
 
 from .common import EmptyConfig, SuccessResponse
+from ..utils.sanitizer import validate_role_identity
 
 
 _PASSWORD_FORBIDDEN = (":", "\r", "\n", "\x00")
@@ -293,6 +294,16 @@ class UpdateRoleConfig(BaseModel):
     root_password: SecretStr | None = None
     password: SecretStr | None = None
 
+    @field_validator("container_name")
+    @classmethod
+    def _container_name_valid(cls, value: str) -> str:
+        return validate_role_identity(value, "container_name")
+
+    @field_validator("user_name")
+    @classmethod
+    def _user_name_valid(cls, value: str) -> str:
+        return validate_role_identity(value, "user_name")
+
     @field_validator("root_password", "password")
     @classmethod
     def _optional_password_valid(cls, value: SecretStr | None) -> SecretStr | None:
@@ -300,6 +311,9 @@ class UpdateRoleConfig(BaseModel):
 
     @model_validator(mode="after")
     def _role_password_fields(self):
+        # 非 ROOT 角色不能把共享 root 当作普通协作者目标。
+        if self.updated_role != "root" and self.user_name == "root":
+            raise ValueError("user_name root is only allowed for root role")
         if self.updated_role == "root":
             if self.root_password is None:
                 raise ValueError("root_password is required for root role")

@@ -31,6 +31,19 @@ def is_valid_name(value: str) -> bool:
     return bool(re.fullmatch(r"[A-Za-z0-9_\-]+", value))
 
 
+def validate_role_identity(value: str, field: str = "identity") -> str:
+    """Validate container/user identifiers accepted by update_role.
+
+    Reuses the strict name charset and additionally rejects empty values and
+    leading ``-`` so an identifier can never be interpreted as a command
+    option. Shell metacharacters and path separators are already outside the
+    charset. The rejected value is never echoed in the error.
+    """
+    if not isinstance(value, str) or not value or value.startswith("-") or not is_valid_name(value):
+        raise ValueError(f"invalid {field}")
+    return value
+
+
 def is_valid_image_name(value: str) -> bool:
     """Return True if value looks like a container image name (allow dots, slashes, colon tags)."""
     if not isinstance(value, str):

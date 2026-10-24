@@ -373,25 +373,25 @@ Node SHALL 在 `/api/add_collaborator` 流程中使用 `AddCollaboratorConfig.pa
 
 来源：[services/container_service.py](../../../services/container_service.py)。
 
-### Requirement: ROOT 提升/交接由 Ctrl 的 transfer_root 编排，Node 只处理单目标 [services/container_service.py]
+### Requirement: ROOT 交接由 Ctrl 统一编排，Node 只处理单目标 [services/container_service.py]
 
-ROOT 提升/交接的既有角色规则 SHALL 由 Ctrl API 的纯布尔 `transfer_root:false` 选择，Node 无该字段，只处理单目标 primitive。`transfer_root=false`（ContainerDetailPage 默认）只提升/重置目标 root 并返回 1 条，MUST NOT 降旧 ROOT；`transfer_root=true`（Home/EditUserModal）Ctrl 才按原顺序对每个旧 ROOT 调 ADMIN、再目标调 ROOT。内部删除用户 ROOT 移交保持单目标同步 primitive。Node MUST NOT 自动扫描或修改其他账号；旧 ROOT ADMIN 用 `password` 建/设独立账号，目标 ROOT 用 `root_password` 设共享 root、按既有预期组状态清理、归档/删除目标原账号。Node MUST NOT 更新绑定；失败不回滚、不伪装成功。
+外部 ROOT 上位 SHALL 由 Ctrl 统一编排：先对该容器其他旧 ROOT 逐个调用 ADMIN，全部成功后再对目标调用 ROOT，使目标成为唯一 ROOT。Web 不选择单目标旁路；Ctrl 对旧客户端的 `transfer_root` 兼容输入 SHALL 忽略其值，Node 无该字段。Node 每次只处理单目标账号操作。内部删除用户 ROOT 移交保持既有同步步骤。Node MUST NOT 自动扫描或修改其他账号；旧 ROOT ADMIN 用 `password` 建/设独立账号，目标 ROOT 用 `root_password` 设共享 root、按既有预期组状态清理、归档/删除目标原账号。Node MUST NOT 更新绑定；失败不回滚、不伪装成功。正常交接由 Ctrl 返回 root 与原所有者独立账号的两项凭据，Node 响应不回传密码。
 
 #### Scenario: 按旧 ROOT 再目标的顺序执行
 
-- **GIVEN** Ctrl 的 `transfer_root=true`，先调用旧 ROOT 的 ADMIN 请求，再调用目标的 ROOT 请求
+- **GIVEN** Ctrl 统一交接先调用旧 ROOT 的 ADMIN 请求，成功后再调用目标的 ROOT 请求
 - **WHEN** Node 分别处理两次请求
 - **THEN** ADMIN 请求只创建/设置旧 owner 独立账号，ROOT 请求只设置共享 root 密码并处理目标原独立账号；两次调用不共享绑定状态
 
-#### Scenario: transfer_root=false 只处理目标
+#### Scenario: 单次 Node 请求只处理指定账号
 
-- **GIVEN** ContainerDetailPage 默认 `transfer_root=false`，只请求目标 ROOT
-- **WHEN** Node 处理该单目标请求
-- **THEN** 只重置共享 root 密码并处理目标原独立账号，不降任何旧 ROOT；Ctrl/Web 只得到 1 条凭据；Node 请求体中没有 `transfer_root` 字段
+- **GIVEN** Ctrl 已完成旧 ROOT 降级，发出目标 ROOT 请求
+- **WHEN** Node 处理该次请求
+- **THEN** 只重置共享 root 密码并处理目标原独立账号，不再次扫描或修改旧 ROOT；Node 请求体中没有 `transfer_root` 字段，此单次执行不代表 Ctrl 可以省略完整交接
 
 #### Scenario: 历史多 ROOT 逐次处理
 
-- **GIVEN** `transfer_root=true` 且容器历史上有多个 ROOT，Ctrl 按既有遍历对每个旧 ROOT 各调用一次 ADMIN，再调用目标 ROOT
+- **GIVEN** 容器历史上有多个 ROOT，Ctrl 按既有遍历对每个旧 ROOT 各调用一次 ADMIN，全部成功后再调用目标 ROOT
 - **WHEN** Node 分别处理 N+1 次请求
 - **THEN** Node 每次只处理该次指定的旧 owner 或目标，不丢人、不合并、不篡改角色；Ctrl 返回所有涉及旧账号 + root 的凭据，数量可大于 2
 
@@ -403,7 +403,7 @@ ROOT 提升/交接的既有角色规则 SHALL 由 Ctrl API 的纯布尔 `transfe
 
 #### Scenario: 删除用户触发的 ROOT 转移同样带密码
 
-- **GIVEN** Ctrl 的删除用户路径选择新 ROOT 并调用 Node，且不使用 `transfer_root` 编排
+- **GIVEN** Ctrl 的删除用户路径按既有同步步骤选择新 ROOT 并调用 Node
 - **WHEN** 请求未携带 `root_password`
 - **THEN** Node 返回脱敏 422，不执行 ROOT 分支，不回退 `<user_name>123`；Ctrl 必须为该内部单目标同步 primitive 生成并传入密码
 
@@ -556,3 +556,9 @@ Node SHALL 提供 `POST /api/reset_container_password`，请求体为 `{config:{
 - [services/container_service.py](../../../services/container_service.py)
 - [network/api.py](../../../network/api.py)
 - [tests/](../../../tests/)：默认套件 331 passed, 1 skipped, 16 deselected, 24 subtests passed；Docker 分项：旧用例 10 passed + 1 skipped、本变更专项 4 passed + 1 skipped；未合并重跑全量 `-m docker`。
+
+## 安全标识收敛记录（2026-10-24）
+
+- `UpdateRoleConfig` 的 `container_name`/`user_name` 复用安全标识校验：仅允许 ASCII 字母、数字、下划线、连字符，禁止空值、前导 `-`、shell 元字符与路径穿越；非法值在请求校验阶段返回脱敏 422，不触发 Docker lookup 或容器命令。
+- 非 ROOT `updated_role` 且 `user_name="root"` 在请求校验阶段拒绝；`updated_role="root"` 指定 `user_name="root"` 仍由服务层既有校验拒绝。`update_role` 服务入口在 Docker lookup 前重复同一标识/root 目标约束，直接调用亦不留 Docker 副作用。
+- 不改变角色业务、单账号 primitive、密码字段规则或其他账号扫描范围。2026-10-24 复验：对抗 60 passed；相关 80 passed；Node 默认安全全量 508 passed, 16 deselected, 24 subtests passed。

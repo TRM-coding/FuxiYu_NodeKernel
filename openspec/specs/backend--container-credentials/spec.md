@@ -104,15 +104,15 @@ Node MUST NOT 将任何密码或含密码的请求体写入 Docker environment/c
 
 #### Scenario: ROOT 交接逐次调用、逐项凭据
 
-- **GIVEN** `transfer_root=true` 且为普通单个旧 ROOT，或历史多个旧 ROOT
+- **GIVEN** Ctrl 受理任一外部 ROOT 上位请求，且存在一个或多个旧 ROOT
 - **WHEN** Ctrl 按既有顺序对每个旧 ROOT 调 `update_role(ADMIN)` 并携带 `password`，再对目标调 `update_role(ROOT)` 并携带 `root_password`
 - **THEN** Node 每次只出现本次目标所需的一个密码字段，响应均不含密码；Ctrl 返回所有涉及旧账号 + `root` 的凭据，单旧 ROOT 为 2 项、历史多 ROOT 可大于 2，不丢人、不为凑 2 篡改角色
 
-#### Scenario: transfer_root=false 只带单项
+#### Scenario: 单次 ROOT 请求只带本次密码字段
 
-- **GIVEN** ContainerDetailPage 默认 `transfer_root=false`，只请求目标 ROOT
-- **WHEN** Ctrl/Node 处理该请求
-- **THEN** 只出现 `root_password` 一项密码字段，不出现旧 ROOT 的 `password`；Ctrl/Web 只得到 1 条 `root` 凭据，Node 请求体无 `transfer_root` 字段
+- **GIVEN** Ctrl 已先为旧 ROOT 调用 ADMIN 并传入其独立账号密码，随后为目标调用 ROOT
+- **WHEN** 检查目标的单次 Node 请求
+- **THEN** 该次只出现 `root_password`，不混入旧 ROOT 的 `password`，Node 请求体无 `transfer_root`；完整交接的 Ctrl 响应仍包含 root 与所有旧所有者独立账号凭据
 
 #### Scenario: 不新增重复密码审计
 
