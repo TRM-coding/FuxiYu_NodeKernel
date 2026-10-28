@@ -12,7 +12,7 @@
 
 ### Requirement: 提交信息采用真实变更条目 [githooks/commit-msg]
 
-提交信息 SHALL 每行采用 `- NEW 中文短句`、`- AMEND 中文短句` 或 `- FIX 中文短句`，一行一项。关键字 SHALL 仅取 `NEW`、`AMEND`、`FIX` 三者之一，不可自造。连字符后 SHALL 有空格。
+提交信息 SHALL 每行采用 `- NEW 中文短句`、`- AMEND 中文短句`、`- FIX 中文短句`、`- SPEC 中文短句` 或 `- TEST 中文短句`，一行一项。关键字 SHALL 仅取 `NEW`、`AMEND`、`FIX`、`SPEC`、`TEST` 五者之一，不可自造；`SPEC` 用于规格与文档，`TEST` 用于测试。连字符后 SHALL 有空格。
 
 每条 SHALL 说明实际变更，使读者脱离对话也能读懂。空行与 Git 插入的以 `#` 开头的注释行 SHALL NOT 计入条目；非合并提交 SHALL 至少存在一条条目。
 
@@ -25,7 +25,7 @@
 
 #### Scenario: 自造关键字或缺空格被拒绝
 
-- **WHEN** 使用 DOCS、SPEC、DEBUG 等自造关键字，或写成 `-NEW` 形式
+- **WHEN** 使用 DOCS、DEBUG 等自造关键字，或写成 `-NEW` 形式
 - **THEN** commit-msg 拒绝该提交并列出允许格式
 
 #### Scenario: 没有真实条目被拒绝
@@ -247,7 +247,7 @@ PR 标题 SHALL 概括本次主要变更，沿用自然描述，MUST NOT 强制 
 
 ### Requirement: PR 栏目与提交关键字相互独立 [scripts/ci/check_pr.py]
 
-PR 的四类栏目 SHALL 与提交信息的 `NEW` / `AMEND` / `FIX` 规则相互独立。commit 的 `AMEND` SHALL NOT 被改写成 PR 的栏目关键字；PR 只说明本次实际交付。
+PR 的四类栏目 SHALL 与提交信息的 `NEW` / `AMEND` / `FIX` / `SPEC` / `TEST` 规则相互独立。commit 的 `AMEND` SHALL NOT 被改写成 PR 的栏目关键字；PR 只说明本次实际交付。
 
 旧版 `NEW | 新增内容` / `FIX | 修复漏洞` 栏目在接入过渡期内 SHALL 继续被接受。
 
