@@ -290,6 +290,10 @@ def create_container(
             mount_real = os.path.realpath(restore_mount_path)
             base_norm = base_real.replace("\\", "/").rstrip("/")
             mount_norm = mount_real.replace("\\", "/").rstrip("/")
+            if mount_norm == base_norm:
+                raise RuntimeError(
+                    f"restore mount path equals containers base: {restore_mount_path}"
+                )
             if not (mount_norm == base_norm or mount_norm.startswith(base_norm + "/")):
                 raise RuntimeError(f"unsafe restore mount path outside containers base: {restore_mount_path}")
             parts = set(mount_norm.split("/"))

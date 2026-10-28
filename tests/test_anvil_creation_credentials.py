@@ -1,10 +1,9 @@
 """Independent regression coverage for the creation/credential mapping change.
 
 The tests use real FastAPI/Pydantic/service paths and fake Docker boundaries only.
-The deliberately deferred ``test_restore_mount_base_itself_is_rejected`` is not
-defined here: the current implementation allows the base directory itself, the
-spec says "below" it, and the user chose to record that defect without applying
-the one-line production fix in this batch.
+``test_restore_mount_base_itself_is_rejected`` covers the restore-source equality
+gate, while ``test_restore_valid_historical_subdir_still_recovers`` proves a
+normal historical child mount still reuses its original directory.
 """
 
 from __future__ import annotations
@@ -846,6 +845,87 @@ def test_restore_mount_source_independent_of_image_and_name(monkeypatch, tmp_pat
     assert os.path.samefile(second.bind_mount_path, restore)
     assert os.path.samefile(containers.run_calls[0][1]["mounts"][0]["Source"], restore)
     assert os.path.samefile(containers.run_calls[1][1]["mounts"][0]["Source"], restore)
+
+
+@pytest.mark.parametrize(
+    ("kind", "new_name"),
+    [
+        ("exact", "root_exact_c"),
+        ("dot", "root_dot_c"),
+        ("trailing", "root_trailing_c"),
+        ("symlink", "root_symlink_c"),
+        ("legacy", "root_legacy_c"),
+    ],
+)
+def test_restore_mount_base_itself_is_rejected(monkeypatch, tmp_path, kind, new_name):
+    base = _prepare_base(monkeypatch, tmp_path)
+    mount_root = base / "shared" / "containers"
+    mount_root.mkdir(parents=True)
+
+    if kind == "legacy":
+        current_root = mount_root / "admin" / "containers" / "old_data"
+        current_root.mkdir(parents=True)
+        restore_path = str(current_root)
+    else:
+        current_root = mount_root
+        if kind == "exact":
+            restore_path = str(current_root)
+        elif kind == "dot":
+            restore_path = str(current_root) + os.sep + "."
+        elif kind == "trailing":
+            restore_path = str(current_root) + os.sep
+        else:
+            alias = tmp_path / "containers_root_alias"
+            os.symlink(current_root, alias, target_is_directory=True)
+            restore_path = str(alias)
+
+    monkeypatch.setenv("NODE_CONTAINERS_BASE", str(current_root))
+    containers = FakeContainers()
+    monkeypatch.setattr(
+        extensions, "docker_client", FakeDockerClient(containers, FakeImages())
+    )
+
+    with pytest.raises(
+        RuntimeError, match="restore mount path equals containers base"
+    ):
+        create_container(
+            "admin",
+            Container.Config_info(**_cfg(new_name)),
+            root_password=ROOT_PW,
+            restore_mount_path=restore_path,
+        )
+
+    assert containers.run_calls == []
+    assert not (
+        current_root / "admin" / "containers" / new_name
+    ).exists()
+
+
+def test_restore_valid_historical_subdir_still_recovers(monkeypatch, tmp_path):
+    base = _prepare_base(monkeypatch, tmp_path)
+    mount_root = base / "shared" / "containers"
+    historical = mount_root / "admin" / "containers" / "old_data"
+    historical.mkdir(parents=True)
+    monkeypatch.setenv("NODE_CONTAINERS_BASE", str(mount_root))
+    new_name = "recovered_new_c"
+    containers = FakeContainers()
+    monkeypatch.setattr(
+        extensions, "docker_client", FakeDockerClient(containers, FakeImages())
+    )
+
+    result = create_container(
+        "admin",
+        Container.Config_info(**_cfg(new_name)),
+        root_password=ROOT_PW,
+        restore_mount_path=str(historical),
+    )
+
+    assert len(containers.run_calls) == 1
+    assert os.path.samefile(result.bind_mount_path, historical)
+    assert os.path.samefile(
+        containers.run_calls[0][1]["mounts"][0]["Source"], historical
+    )
+    assert not (mount_root / "admin" / "containers" / new_name).exists()
 
 
 def test_restore_mount_path_requires_containers_segment_and_existing_dir(
