@@ -200,31 +200,36 @@ Spec: [spec.md](spec.md)
 - Test/check:
   - [X] tests/test_create_container.py::test_create_container_restore_reuses_existing_mount
   - [X] tests/test_anvil_creation_credentials.py::test_restore_mount_source_independent_of_image_and_name
-- Assertion scope: 既有：携带 `restore_mount_path=<base>/admin/containers/old_c` 时，返回值 `bind_mount_path` 与 `containers.run` 的 `mounts[0]["Source"]` 都 `os.path.samefile` 该目录。补测：用不同 `config.name`/`config.image` 两次调用同一 restore 目录，两个 `mounts[0]["Source"]` 仍都指向该目录，证明来源不由新名称或运行镜像推导。
-- Coverage note: 既有只覆盖一个名称/镜像；正文“MUST NOT 因运行镜像来源不同而改变”由补测覆盖。
+  - [X] tests/test_anvil_creation_credentials.py::test_restore_valid_historical_subdir_still_recovers
+- Assertion scope: 既有用例断言恢复结果和 Docker `mounts[0]["Source"]` 都与历史目录 `samefile`；补测在 base 自身含 `containers` 段时使用一个已存在的历史子目录，断言只调用一次 Docker create、挂载来源仍是该子目录，且不创建按新容器名推导的目录。
 
 #### Scenario: 改名不改变数据位置
 
 - Test/check:
   - [X] tests/test_create_container.py::test_create_container_restore_reuses_existing_mount
-- Assertion scope: 同一用例中 `config.name == "pytest_create_c"` 而挂载来源仍是 `old_c` 目录，证明挂载来源取 `restore_mount_path` 而非按新容器名推导。
+  - [X] tests/test_anvil_creation_credentials.py::test_restore_mount_source_independent_of_image_and_name
+  - [X] tests/test_anvil_creation_credentials.py::test_restore_valid_historical_subdir_still_recovers
+- Assertion scope: 同一历史目录配不同 `config.name` 和镜像时，两次挂载来源都为该目录；补测的新名称与历史目录名不同，断言没有按新名建立目录。
 
 #### Scenario: 越界或缺失的挂载入参被拒绝
 
 - Test/check:
   - [X] tests/test_create_container.py::test_create_container_restore_rejects_mount_outside_base
   - [X] tests/test_anvil_creation_credentials.py::test_restore_mount_path_requires_containers_segment_and_existing_dir
-  - [ ] tests/test_anvil_creation_credentials.py::test_restore_mount_base_itself_is_rejected
-- Assertion scope: 既有：容器挂载根之外的目录抛 `RuntimeError`，消息匹配 `unsafe restore mount path`。本轮独立补测：根内但缺 `containers` 段的路径、根内 `containers` 段但目录不存在的路径、经 symlink realpath 后逃出挂载根的路径分别被拒绝，消息分别含 `without containers segment` / `does not exist` / `outside containers base`，且 fake `containers.run_calls == []`；有效子目录仍允许，调用 `containers.run` 一次且 mount source 指向该目录。暂缓定位 `test_restore_mount_base_itself_is_rejected` 的预期是：自定义根自身含 `containers` 路径段且 `restore_mount_path=str(base)` 时拒绝、无 run 调用。
-- Coverage note: 当前实现放行 base 自身，违反 spec 的“之下”约束。用户决定本轮只记录该缺陷，暂缓 `test_restore_mount_base_itself_is_rejected` 及其业务修复；该定位保留 `[ ]`、未创建、未执行，不加 skip/xfail，不宣称覆盖。其余校验补测不依赖此修复；主规格不变。
+- Assertion scope: 越界、缺 `containers` 段、目录不存在和 symlink 逃逸均抛 `RuntimeError`，且 fake `containers.run_calls == []`；有效子目录仍允许。
+
+#### Scenario: 恢复源等于当前公共根被拒绝
+
+- Test/check:
+  - [X] tests/test_anvil_creation_credentials.py::test_restore_mount_base_itself_is_rejected
+- Assertion scope: 将 `NODE_CONTAINERS_BASE` 设为自身路径含 `containers` 段的目录，参数化或表驱动覆盖真实根路径、带 `.`/尾随分隔符的 realpath 别名、同根 symlink 别名，以及“旧单容器目录后来被设为当前公共根”的路径；每次都抛 `RuntimeError`，消息含稳定子串 `restore mount path equals containers base`，`containers.run_calls == []`，并且没有创建按新名推导的目录。同根 symlink 参数在 WSL 必跑，Windows 是否运行不作强制，不加 skip。
 
 #### Scenario: 名字被占用即拒绝
 
 - Test/check:
   - [X] tests/test_create_container.py::test_error_path_container_exist
   - [X] tests/test_anvil_creation_credentials.py::test_occupied_name_rejected_without_run_or_mount_change
-- Assertion scope: 既有：同名容器已存在时 `create_container` 抛 `RuntimeError`，消息匹配 `already exists`。补测：该次调用 `containers.run_calls == []`（未创建容器），异常消息里的容器名恰为请求名（未加随机后缀改名），且同时携带合法 `restore_mount_path` 仍直接拒绝；`run_calls == []` 表明没有改用任何挂载来源启动。
-- Coverage note: 既有断言只到异常文案，未断言“不自行改名、不替换挂载来源”与无 run 副作用。
+- Assertion scope: 同名容器已存在时直接报错，容器名不被追加随机后缀，`run_calls == []`，不替换挂载来源。
 
 ### Requirement: 创建时由 Ctrl 下发的密码设置 root 账号 [services/container_service.py]
 
