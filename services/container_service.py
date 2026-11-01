@@ -181,6 +181,10 @@ class RemoveContinaerReturn:
 # 不该让一次创建退化成上万次 docker 调用——两者在报错里分开（2026-09 决策）。
 _MAX_PORT_BIND_ATTEMPTS = 10
 
+# 普通新建容器的挂载目录固定在本地秒级时间戳；同一秒内的同名创建（以及历史
+# 遗留的同名目录）靠追加短后缀避让。重试必须有界，避免异常时无限 mkdir。
+_MAX_NEW_MOUNT_ATTEMPTS = 100
+
 
 def _image_container_ports(image_tag: str) -> list[str]:
     """镜像要发布的容器端口（含强制的 22/tcp）。
@@ -221,6 +225,31 @@ def _remove_leftover_container(name: str) -> None:
         logger.warning("removed leftover container %s after a failed bind", name)
     except Exception as e:
         logger.warning("could not remove leftover container %s: %s", name, e)
+
+
+def _create_timestamped_mount_dir(containers_base: str, owner_name: str, name: str) -> str:
+    """为普通新建容器创建一个**全新**的本地时间戳宿主挂载目录。
+
+    目录名为 ``<容器名>_<本地时间 YYYYMMDD_HHMMSS>``。创建使用
+    ``os.makedirs(..., exist_ok=False)``：叶子目录由内核原子创建，已存在的目录
+    （包括历史容器遗留目录）绝不会被复用。同名同秒碰撞时依次追加 ``_1``、
+    ``_2`` … 短后缀重试；不会回退到无时间戳目录或复用已有目录。
+    """
+    parent = os.path.join(containers_base, owner_name, "containers")
+    stem = f"{name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    for attempt in range(_MAX_NEW_MOUNT_ATTEMPTS):
+        suffix = "" if attempt == 0 else f"_{attempt}"
+        candidate = os.path.join(parent, f"{stem}{suffix}")
+        try:
+            os.makedirs(candidate, exist_ok=False)
+        except FileExistsError:
+            continue
+        return candidate
+    raise RuntimeError(
+        f"failed to allocate a unique timestamped host mount path "
+        f"for {name!r} under {parent!r} after "
+        f"{_MAX_NEW_MOUNT_ATTEMPTS} attempts"
+    )
 
 
 # 将owner_name作为root，创建port新容器
@@ -279,7 +308,8 @@ def create_container(
 
     print(f"DEBUG: cpu_list={cpu_list}, gpu_list={gpu_list}, mem_limit={mem_limit}, shm_size_bytes={shm_size_bytes}, device_requests={device_requests}")
     name = f"{config.name}" # 名字自定义
-    # 将container的/root目录挂载到宿主机的{NODE_CONTAINERS_BASE}/owner_name/containers/name目录，方便后续调试和数据持久化（虽然现在设计上容器是临时的，但以防万一）。这个路径也要确保合法和安全，避免注入攻击或路径遍历等问题。
+    # 将container的/root目录挂载到宿主机的{NODE_CONTAINERS_BASE}/owner_name/containers/name_YYYYMMDD_HHMMSS目录，方便后续调试和数据持久化（虽然现在设计上容器是临时的，但以防万一）。这个路径也要确保合法和安全，避免注入攻击或路径遍历等问题。
+    # 恢复请求只使用请求携带的旧目录；普通新建总是创建带本地时间戳的全新目录，不复用任何已有目录。
     # 挂载根目录可配置：生产默认 /home（Node 以 root 运行）；开发环境指向可写路径，避免非 root 无权建 /home 下的目录。
     containers_base = os.getenv("NODE_CONTAINERS_BASE", "/home")
     host_root_mount = os.path.join(containers_base, owner_name, "containers", name)
@@ -303,17 +333,9 @@ def create_container(
                 raise RuntimeError(f"restore mount path does not exist: {restore_mount_path}")
             host_root_mount = mount_real
         else:
-            try:
-                os.makedirs(host_root_mount, exist_ok=False)
-            except FileExistsError:
-                # 如果目录已经存在了，加上一个随机后缀避免冲突
-                import random
-                suffix = random.randint(10000, 99999)
-                host_root_mount += f"_{suffix}"
-                try:
-                    os.makedirs(host_root_mount, exist_ok=False)
-                except FileExistsError:
-                    raise RuntimeError(f"failed to create host mount path {host_root_mount}: directory already exists")
+            host_root_mount = _create_timestamped_mount_dir(
+                containers_base, owner_name, name
+            )
         # 设置权限（Node 生产运行于 Linux；本地 Windows 测试用安全默认值兜底）
         current_uid = os.getuid() if hasattr(os, "getuid") else 0
         current_gid = os.getgid() if hasattr(os, "getgid") else 0

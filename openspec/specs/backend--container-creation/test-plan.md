@@ -193,6 +193,58 @@ Spec: [spec.md](spec.md)
   - [X] tests/test_create_container.py::test_build_image_rebuilds_when_the_tag_changes
 - Assertion scope: 同一新 tag 第二次派发时 `len(build_calls)` 仍为 2 并直接返回该 tag（命中复用、不再构建），`images.remove` 从未被调用（旧制品保留）。
 
+### Requirement: 普通新建挂载目录的本地时间戳命名与序号后缀
+
+#### Scenario: 普通新建使用本地时间戳基名
+
+- Test/check:
+  - [X] tests/test_create_container.py::test_create_container_new_mount_uses_local_timestamp_name
+- Assertion scope: 固定本地时间，校验目录、Docker Source 与返回路径一致。
+
+#### Scenario: 时间戳取本地时间而非 UTC
+
+- Test/check:
+  - [X] tests/test_create_container.py::test_create_container_new_mount_uses_local_timestamp_name
+- Assertion scope: 固定 `datetime.now()` 的值，校验目录名使用该值；未单独模拟跨时区转换。
+
+#### Scenario: 历史目录保留且不参与新路径
+
+- Test/check:
+  - [X] tests/test_create_container.py::test_create_container_new_mount_collision_uses_fresh_suffix
+- Assertion scope: 预置旧目录及内容，验证新建后旧数据不变。
+
+### Requirement: 普通新建目录碰撞的原子有界避让
+
+#### Scenario: 基名碰撞追加 _1
+
+- Test/check:
+  - [X] tests/test_create_container.py::test_create_container_new_mount_same_second_gets_distinct_suffix
+- Assertion scope: 同秒两次创建取得基名和 `_1`。
+
+#### Scenario: 连续碰撞按序递增
+
+- Test/check:
+  - [X] tests/test_create_container.py::test_create_container_new_mount_collision_uses_fresh_suffix
+- Assertion scope: 基名和 `_1` 已存在时取得 `_2`，保留旧数据。
+
+#### Scenario: 并发创建只占用一个候选
+
+- Test/check:
+  - [ ] 尚无并发测试。
+- Assertion scope: 顺序碰撞测试不证明并发交错；实现使用 `exist_ok=False` 独占创建叶目录。
+
+#### Scenario: 100 个候选耗尽不降级复用
+
+- Test/check:
+  - [X] tests/test_create_container.py::test_create_container_new_mount_retry_is_bounded
+- Assertion scope: 所有候选被占用时失败，未调用 Docker 创建。
+
+#### Scenario: 非碰撞错误不当作碰撞重试
+
+- Test/check:
+  - [ ] 尚无针对目录权限错误的专门测试。
+- Assertion scope: 实现只捕获 `FileExistsError`，其他错误向上返回。
+
 ### Requirement: 恢复挂载来源只由入参决定 [services/container_service.py]
 
 #### Scenario: 恢复沿用原目录
@@ -230,6 +282,18 @@ Spec: [spec.md](spec.md)
   - [X] tests/test_create_container.py::test_error_path_container_exist
   - [X] tests/test_anvil_creation_credentials.py::test_occupied_name_rejected_without_run_or_mount_change
 - Assertion scope: 同名容器已存在时直接报错，容器名不被追加随机后缀，`run_calls == []`，不替换挂载来源。
+
+#### Scenario: 恢复不生成时间戳目录
+
+- Test/check:
+  - [X] tests/test_create_container.py::test_create_container_restore_reuses_existing_mount
+- Assertion scope: 复用原目录，未额外创建新目录。
+
+#### Scenario: 恢复与当前时刻的普通新建候选同名
+
+- Test/check:
+  - [ ] 尚无该名称形式的独立测试。
+- Assertion scope: 恢复分支直接使用给定路径；已有恢复测试覆盖历史目录。
 
 ### Requirement: 创建时由 Ctrl 下发的密码设置 root 账号 [services/container_service.py]
 

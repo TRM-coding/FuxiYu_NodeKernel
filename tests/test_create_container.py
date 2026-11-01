@@ -6,6 +6,7 @@
 import os
 import stat
 import uuid
+from datetime import datetime
 
 import docker
 import pytest
@@ -13,6 +14,7 @@ from pydantic import SecretStr
 
 from FuxiYu_NodeKernel.config import PortConfig
 from FuxiYu_NodeKernel.docker_operates import port_allocator
+from FuxiYu_NodeKernel.services import container_service
 from FuxiYu_NodeKernel.services.container_service import build_image, create_container, CreateContainerReturn
 from FuxiYu_NodeKernel.utils.Container import Container
 from FuxiYu_NodeKernel import extensions
@@ -32,6 +34,21 @@ VALID_CFG = dict(
     image="ubuntu:22.04",
 )
 ROOT_PW = SecretStr("Root#Password9")
+
+
+class _Clock:
+    """固定本地秒级时间；同时锁住不得走 UTC 取时路径。"""
+
+    def __init__(self, moment):
+        self.moment = moment
+        self.calls = 0
+
+    def now(self):
+        self.calls += 1
+        return self.moment
+
+    def utcnow(self):
+        raise AssertionError("普通新建挂载目录必须使用本地 datetime.now()")
 
 
 @pytest.fixture(autouse=True)
@@ -447,6 +464,135 @@ def test_create_container_gpu_request_uses_device_ids_without_driver(monkeypatch
     assert run_calls[0][1]["device_requests"] == device_request_calls
 
 
+def test_create_container_new_mount_uses_local_timestamp_name(containers_base, monkeypatch):
+    """普通新建统一使用 <容器名>_<本地 YYYYMMDD_HHMMSS>，并挂载本次新目录。"""
+    clock = _Clock(datetime(2026, 10, 30, 23, 59, 58))
+    monkeypatch.setattr(container_service, "datetime", clock)
+    run_calls = []
+
+    class _Containers(FakeContainers):
+        def run(self, *a, **k):
+            run_calls.append((a, k))
+            return FakeContainer(name=k.get("name", "c1"))
+
+    monkeypatch.setattr(extensions, "docker_client", FakeDockerClient(_Containers()))
+
+    result = create_container("admin", Container.Config_info(**VALID_CFG), root_password=ROOT_PW)
+
+    expected = containers_base / "admin" / "containers" / "pytest_create_c_20261030_235958"
+    assert os.path.samefile(result.bind_mount_path, expected)
+    assert expected.is_dir()
+    assert os.path.samefile(run_calls[0][1]["mounts"][0]["Source"], expected)
+    assert clock.calls == 1
+    assert not (containers_base / "admin" / "containers" / "pytest_create_c").exists()
+
+
+def test_create_container_new_mount_same_second_gets_distinct_suffix(containers_base, monkeypatch):
+    """同一本地秒内连续两次普通新建不复用第一份目录，第二次取得 _1。"""
+    clock = _Clock(datetime(2026, 10, 30, 23, 59, 58))
+    monkeypatch.setattr(container_service, "datetime", clock)
+    monkeypatch.setattr(
+        container_service.time,
+        "sleep",
+        lambda _seconds: pytest.fail("碰撞重试不应等待"),
+    )
+    run_calls = []
+
+    class _Containers(FakeContainers):
+        def run(self, *a, **k):
+            run_calls.append((a, k))
+            return FakeContainer(name=k.get("name", "c1"))
+
+    monkeypatch.setattr(extensions, "docker_client", FakeDockerClient(_Containers()))
+
+    first = create_container("admin", Container.Config_info(**VALID_CFG), root_password=ROOT_PW)
+    second = create_container("admin", Container.Config_info(**VALID_CFG), root_password=ROOT_PW)
+
+    parent = containers_base / "admin" / "containers"
+    expected_first = parent / "pytest_create_c_20261030_235958"
+    expected_second = parent / "pytest_create_c_20261030_235958_1"
+    assert os.path.samefile(first.bind_mount_path, expected_first)
+    assert os.path.samefile(second.bind_mount_path, expected_second)
+    assert os.path.samefile(run_calls[0][1]["mounts"][0]["Source"], expected_first)
+    assert os.path.samefile(run_calls[1][1]["mounts"][0]["Source"], expected_second)
+    assert clock.calls == 2
+
+
+def test_create_container_new_mount_collision_uses_fresh_suffix(containers_base, monkeypatch):
+    """同秒同名目录已存在时追加新后缀，绝不复用、等待或改写旧目录。"""
+    clock = _Clock(datetime(2026, 10, 30, 23, 59, 58))
+    monkeypatch.setattr(container_service, "datetime", clock)
+    monkeypatch.setattr(
+        container_service.time,
+        "sleep",
+        lambda _seconds: pytest.fail("碰撞重试不应等待"),
+    )
+    parent = containers_base / "admin" / "containers"
+    stem = "pytest_create_c_20261030_235958"
+    exact = parent / stem
+    exact.mkdir(parents=True)
+    (exact / "keep.txt").write_text("exact", encoding="utf-8")
+    suffix_one = parent / f"{stem}_1"
+    suffix_one.mkdir()
+    (suffix_one / "keep.txt").write_text("suffix-1", encoding="utf-8")
+    legacy = parent / "pytest_create_c"
+    legacy.mkdir()
+    (legacy / "keep.txt").write_text("legacy", encoding="utf-8")
+    random_suffix_history = parent / "pytest_create_c_12345"
+    random_suffix_history.mkdir()
+    (random_suffix_history / "keep.txt").write_text("random", encoding="utf-8")
+
+    run_calls = []
+
+    class _Containers(FakeContainers):
+        def run(self, *a, **k):
+            run_calls.append((a, k))
+            return FakeContainer(name=k.get("name", "c1"))
+
+    monkeypatch.setattr(extensions, "docker_client", FakeDockerClient(_Containers()))
+
+    result = create_container("admin", Container.Config_info(**VALID_CFG), root_password=ROOT_PW)
+
+    expected = parent / f"{stem}_2"
+    assert os.path.samefile(result.bind_mount_path, expected)
+    assert expected.is_dir()
+    assert os.path.samefile(run_calls[0][1]["mounts"][0]["Source"], expected)
+    assert clock.calls == 1
+    for old_dir, expected_text in (
+        (exact, "exact"),
+        (suffix_one, "suffix-1"),
+        (legacy, "legacy"),
+        (random_suffix_history, "random"),
+    ):
+        assert [p.name for p in old_dir.iterdir()] == ["keep.txt"]
+        assert (old_dir / "keep.txt").read_text(encoding="utf-8") == expected_text
+
+
+def test_create_container_new_mount_retry_is_bounded(containers_base, monkeypatch):
+    """所有候选名都被占用时停止重试并报错，不启动容器、不复用旧目录。"""
+    clock = _Clock(datetime(2026, 10, 30, 23, 59, 58))
+    monkeypatch.setattr(container_service, "datetime", clock)
+    monkeypatch.setattr(
+        container_service.time,
+        "sleep",
+        lambda _seconds: pytest.fail("碰撞重试不应等待"),
+    )
+    parent = containers_base / "admin" / "containers"
+    stem = "pytest_create_c_20261030_235958"
+    for attempt in range(container_service._MAX_NEW_MOUNT_ATTEMPTS):
+        candidate = stem if attempt == 0 else f"{stem}_{attempt}"
+        (parent / candidate).mkdir(parents=True)
+
+    containers = FakeContainers()
+    monkeypatch.setattr(extensions, "docker_client", FakeDockerClient(containers))
+
+    with pytest.raises(RuntimeError, match="unique timestamped host mount path"):
+        create_container("admin", Container.Config_info(**VALID_CFG), root_password=ROOT_PW)
+
+    assert clock.calls == 1
+    assert containers.run_calls == []
+
+
 def test_create_container_restore_reuses_existing_mount(containers_base, monkeypatch):
     run_calls = []
     restore = containers_base / "admin" / "containers" / "old_c"
@@ -469,6 +615,8 @@ def test_create_container_restore_reuses_existing_mount(containers_base, monkeyp
     assert isinstance(result, CreateContainerReturn)
     assert os.path.samefile(result.bind_mount_path, restore)
     assert os.path.samefile(run_calls[0][1]["mounts"][0]["Source"], restore)
+    # 恢复分支只使用请求携带的旧目录，不额外创建普通新建目录。
+    assert [p.name for p in (containers_base / "admin" / "containers").iterdir()] == ["old_c"]
 
 
 def test_create_container_restore_rejects_mount_outside_base(tmp_path, monkeypatch):
