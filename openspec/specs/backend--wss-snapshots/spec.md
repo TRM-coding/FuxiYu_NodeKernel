@@ -15,6 +15,11 @@ Node SHALL 保持以下线路形状及数据来源：`type='delete'`；`containe
 - **WHEN** 状态缓存确认某个已知代际容器在 Docker 中消失，且发送前该候选未失效
 - **THEN** 先发送该 `container_name` 的 `delete` 事件，再发送本轮快照批次
 
+#### Scenario: 未知状态参与消失核实
+
+- **WHEN** 已缓存容器状态为 `unknown`，无论是否已取得 Docker ID，且不在创建或其他动作过程中
+- **THEN** Node 将其纳入对账候选；只有 Docker 单容器核实明确返回不存在时才清除缓存并排队消失线索，存在但状态无法映射时保留 `unknown`；采集错误及同名换代不得视为消失
+
 #### Scenario: 排队后同名新建
 
 - **WHEN** 某名称的删除候选已排队，但同名新代在发送前开始创建或重新出现在 Docker 中

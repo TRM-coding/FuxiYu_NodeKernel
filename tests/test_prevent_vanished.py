@@ -67,6 +67,80 @@ def test_in_flight_create_is_not_cleared_by_empty_list(monkeypatch):
     assert cache.take_deleted() == []
 
 
+def test_failed_create_unknown_without_id_is_confirmed_absent(monkeypatch):
+    cache = ContainerStatusCache()
+    ref = cache.accept_action("lost", "create", "building", create=True)
+    assert cache.finish_action_ref({**ref, "name": "lost"}, "failed", "build_failed")
+    assert cache.get_state("lost")["status"] == "unknown"
+    client = install_runtime(monkeypatch, [])
+    _reconcile(monkeypatch, cache, client)
+    assert cache.get_state("lost")["source"] == "miss"
+    assert cache.take_confirmed_deleted() == ["lost"]
+
+
+def test_failed_create_unknown_kept_when_confirmation_fails(monkeypatch):
+    cache = ContainerStatusCache()
+    ref = cache.accept_action("uncertain", "create", "building", create=True)
+    assert cache.finish_action_ref({**ref, "name": "uncertain"}, "failed", "build_failed")
+    client = install_runtime(monkeypatch, [])
+    client.containers.get = lambda name: (_ for _ in ()).throw(RuntimeError("docker down"))
+    _reconcile(monkeypatch, cache, client)
+    assert cache.get_state("uncertain")["status"] == "unknown"
+    assert cache.get_collect_error() == "collect_failed"
+    assert cache.take_confirmed_deleted() == []
+
+
+def test_failed_create_unknown_kept_when_docker_object_exists(monkeypatch):
+    cache = ContainerStatusCache()
+    ref = cache.accept_action("present", "create", "building", create=True)
+    assert cache.finish_action_ref({**ref, "name": "present"}, "failed", "build_failed")
+    container = FakeRuntimeContainer("present", status="unrecognized")
+    client = install_runtime(monkeypatch, [container])
+    _reconcile(monkeypatch, cache, client)
+    assert cache.get_state("present")["status"] == "unknown"
+    assert cache.take_confirmed_deleted() == []
+
+
+def test_action_started_during_absence_confirmation_preserves_cache(monkeypatch):
+    cache = ContainerStatusCache()
+    ref = cache.accept_action("racing", "create", "building", create=True)
+    assert cache.finish_action_ref({**ref, "name": "racing"}, "failed", "build_failed")
+    client = install_runtime(monkeypatch, [])
+
+    def confirm_and_start_action(name, _client):
+        cache.accept_action(name, "start", "starting")
+        return True
+
+    monkeypatch.setattr(cache, "_confirm_absent", confirm_and_start_action)
+    _reconcile(monkeypatch, cache, client)
+    assert cache.get_state("racing")["status"] == "starting"
+    assert cache.take_deleted() == []
+
+
+def test_action_started_after_queue_blocks_delete_before_confirmation(monkeypatch):
+    cache = ContainerStatusCache()
+    cache._deleted = [{"name": "racing", "generation": cache._meta_for("racing")["generation"]}]
+    cache.accept_action("racing", "start", "starting")
+    install_runtime(monkeypatch, [])
+    monkeypatch.setattr(cache, "_confirm_absent", lambda *_: (_ for _ in ()).throw(AssertionError("unexpected confirmation")))
+    assert cache.take_confirmed_deleted() == []
+    assert cache.get_state("racing")["status"] == "starting"
+
+
+def test_action_started_during_delete_confirmation_is_preserved(monkeypatch):
+    cache = ContainerStatusCache()
+    cache._deleted = [{"name": "racing", "generation": cache._meta_for("racing")["generation"]}]
+    install_runtime(monkeypatch, [])
+
+    def confirm_and_start_action(name, _client):
+        cache.accept_action(name, "start", "starting")
+        return True
+
+    monkeypatch.setattr(cache, "_confirm_absent", confirm_and_start_action)
+    assert cache.take_confirmed_deleted() == []
+    assert cache.get_state("racing")["status"] == "starting"
+
+
 def test_same_name_create_during_enumeration_invalidates_old_delete_candidate(monkeypatch):
     cache = ContainerStatusCache()
     old = FakeRuntimeContainer("c1", status="running")

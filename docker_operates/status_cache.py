@@ -1614,7 +1614,6 @@ class ContainerStatusCache:
                 baseline = {}
                 for name, entry in self._cache.items():
                     if entry.get("docker_id") or entry.get("status") not in (
-                        ContainerStatus.UNKNOWN.value,
                         ContainerStatus.BUILDING.value,
                         ContainerStatus.CREATING.value,
                     ):
@@ -1672,7 +1671,7 @@ class ContainerStatusCache:
                 with self._lock:
                     meta = self._meta_for(name)
                     if meta["generation"] != baseline[name] or meta.get("create_pending") \
-                            or name in self._build_pending:
+                            or name in self._build_pending or name in self._pending:
                         logger.info("status-cache vanish candidate invalidated before queue: name=%s", name)
                         continue
                     self._cache.pop(name, None)
@@ -1765,7 +1764,7 @@ class ContainerStatusCache:
                 if candidate.get("generation") is None:
                     candidate["generation"] = meta["generation"]
                 if meta["generation"] != candidate["generation"] or meta.get("create_pending") \
-                        or name in self._build_pending:
+                        or name in self._build_pending or name in self._pending:
                     logger.info("status-cache delete candidate invalidated before send: name=%s", name)
                     continue
             try:
@@ -1780,7 +1779,7 @@ class ContainerStatusCache:
             with self._lock:
                 meta = self._meta_for(name)
                 if meta["generation"] != candidate["generation"] or meta.get("create_pending") \
-                        or name in self._build_pending:
+                        or name in self._build_pending or name in self._pending:
                     continue
                 self._cache.pop(name, None)
                 self._pending.pop(name, None)

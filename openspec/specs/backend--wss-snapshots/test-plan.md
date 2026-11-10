@@ -13,6 +13,17 @@ Spec: [spec.md](spec.md)
   - [X] `tests/test_prevent_vanished.py::test_external_delete_queues_once_and_wss_sends_delete_before_snapshot`
 - Assertion scope: 确认删除候选后先发 `{"type": "delete", "container_name": "ghost-1/old"}`，再发 `snapshot_batch`；候选只取一次。
 
+#### Scenario: 未知状态参与消失核实
+
+- Test/check:
+  - [X] `tests/test_prevent_vanished.py::test_failed_create_unknown_without_id_is_confirmed_absent`
+  - [X] `tests/test_prevent_vanished.py::test_failed_create_unknown_kept_when_confirmation_fails`
+  - [X] `tests/test_prevent_vanished.py::test_failed_create_unknown_kept_when_docker_object_exists`
+  - [X] `tests/test_prevent_vanished.py::test_in_flight_create_is_not_cleared_by_empty_list`
+  - [X] `tests/test_prevent_vanished.py::test_action_started_during_absence_confirmation_preserves_cache`
+  - [X] `tests/test_prevent_vanished.py::test_same_name_create_during_enumeration_invalidates_old_delete_candidate`
+- Assertion scope: 创建失败且无 Docker ID 的 unknown 在 NotFound 后清除并排队；确认失败时保留 unknown 并报告采集错误；存在但状态不认识时保留 unknown；创建中、新动作与同名换代均不得被消失对账清除。
+
 #### Scenario: 排队后同名新建
 
 - Test/check:
