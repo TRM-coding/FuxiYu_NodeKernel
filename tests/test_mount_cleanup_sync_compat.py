@@ -10,7 +10,7 @@ from FuxiYu_NodeKernel.services.mount_cleanup import (
     MountCleanupManager,
 )
 
-from .mount_cleanup_fakes import FakeProcessFactory, wait_until
+from .mount_cleanup_fakes import FakeProcessFactory, wait_for_process, wait_until
 
 
 def _env(tmp_path, monkeypatch, *, process_kwargs=None, **manager_kwargs):
@@ -48,10 +48,10 @@ def test_old_sync_waits_for_exit_zero(tmp_path, monkeypatch):
 
     thread = threading.Thread(target=request)
     thread.start()
-    assert wait_until(lambda: bool(factory.processes))
+    process = wait_for_process(factory)
     assert thread.is_alive(), "legacy sync endpoint must not return before rm exits"
 
-    factory.processes[0].finish(0)
+    process.finish(0)
     thread.join(timeout=3)
     assert result["response"].status_code == 200
     assert result["response"].json() == {"success": 1}
@@ -70,7 +70,7 @@ def test_old_sync_timeout_remains_500_timeout_with_30_seconds(tmp_path, monkeypa
 
     assert response.status_code == 500
     assert response.json()["error_reason"] == "timeout"
-    assert factory.processes[0].terminated is True
+    assert wait_for_process(factory).terminated is True
 
 
 def test_old_sync_invalid_and_rm_failure_shapes(tmp_path, monkeypatch):
@@ -91,13 +91,13 @@ def test_old_sync_conflicts_with_async_and_restore(tmp_path, monkeypatch):
     path, factory, manager = _env(tmp_path, monkeypatch, process_kwargs={"block": True})
     client = _client()
     task_id = manager.start_cleanup(path)
-    assert wait_until(lambda: bool(factory.processes))
+    process = wait_for_process(factory)
 
     busy = _old_clean(client, path)
     assert busy.status_code == 409
     assert busy.json()["error_reason"] == "cleanup_in_progress"
 
-    factory.processes[0].finish(0)
+    process.finish(0)
     wait_until(lambda: (manager.get_status(task_id) or {}).get("state") == "succeeded")
     reservation = manager.reserve_restore(path)
     restore_busy = _old_clean(client, path)
@@ -116,15 +116,15 @@ def test_two_old_sync_requests_only_one_rm(tmp_path, monkeypatch):
 
     first = threading.Thread(target=request)
     first.start()
-    assert wait_until(lambda: bool(factory.processes))
+    process = wait_for_process(factory)
 
     second = _old_clean(client, path)
     assert second.status_code == 409
     assert second.json()["error_reason"] == "cleanup_in_progress"
 
-    factory.processes[0].finish(0)
+    process.finish(0)
     first.join(timeout=3)
-    assert len(factory.calls) == 1
+    assert len(factory.processes) == 1
     assert any(response.status_code == 200 for response in results)
 
 
@@ -136,7 +136,7 @@ def test_old_endpoint_remains_old_client_compatible(tmp_path, monkeypatch):
     assert response.status_code == 200
     assert response.json() == {"success": 1}
     assert "task_id" not in response.json()
-    assert factory.calls
+    assert len(factory.processes) == 1
 
 
 def test_new_ctrl_three_cleanup_paths_use_async_contract(tmp_path, monkeypatch):
@@ -153,4 +153,4 @@ def test_new_ctrl_three_cleanup_paths_use_async_contract(tmp_path, monkeypatch):
     assert started.status_code == 200
     assert started.json()["task_id"]
     assert "state" not in started.json()
-    assert factory.calls
+    wait_for_process(factory)

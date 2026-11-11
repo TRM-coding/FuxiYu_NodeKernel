@@ -11,7 +11,7 @@ from FuxiYu_NodeKernel.services.mount_cleanup import (
     MountCleanupShutdown,
 )
 
-from .mount_cleanup_fakes import FakeProcessFactory, wait_until
+from .mount_cleanup_fakes import FakeProcessFactory, wait_for_process, wait_until
 
 
 def _env(tmp_path, monkeypatch, *, process_kwargs=None, factory=None):
@@ -42,7 +42,7 @@ def test_exit_zero_marks_succeeded(tmp_path, monkeypatch):
     status = _wait(manager, task_id, "succeeded")
 
     assert status["error_reason"] is None
-    assert factory.calls
+    assert factory.processes
 
 
 def test_rm_uses_argument_list_without_shell(tmp_path, monkeypatch):
@@ -73,9 +73,8 @@ def test_nonzero_exit_marks_failed_with_rm_failed(tmp_path, monkeypatch):
 def test_slow_rm_stays_running_without_fixed_timeout(tmp_path, monkeypatch):
     path, factory, manager = _env(tmp_path, monkeypatch, process_kwargs={"block": True})
     task_id = manager.start_cleanup(path)
-    assert wait_until(lambda: bool(factory.processes))
+    process = wait_for_process(factory)
 
-    process = factory.processes[0]
     assert wait_until(lambda: bool(process.communicate_timeouts))
     assert process.communicate_timeouts == [None]
     assert process.terminated is False
@@ -121,17 +120,17 @@ def test_partial_deletion_after_failure_is_not_success(tmp_path, monkeypatch):
 def test_shutdown_terminates_children_and_marks_shutdown(tmp_path, monkeypatch):
     path, factory, manager = _env(tmp_path, monkeypatch, process_kwargs={"block": True})
     task_id = manager.start_cleanup(path)
-    assert wait_until(lambda: bool(factory.processes))
+    process = wait_for_process(factory)
 
     manager.stop()
 
-    assert factory.processes[0].terminated is True
+    assert process.terminated is True
     assert manager.get_status(task_id) == {
         "task_id": task_id,
         "state": "failed",
         "error_reason": "shutdown",
     }
-    assert factory.processes[0].poll() is not None
+    assert process.poll() is not None
 
 
 def test_shutdown_rejects_new_cleanup_and_restore(tmp_path, monkeypatch):
@@ -180,9 +179,9 @@ def test_app_lifespan_shutdown_stops_running_cleanup(tmp_path, monkeypatch):
             json={"config": {"mount_path": str(path)}},
         )
         task_id = response.json()["task_id"]
-        assert wait_until(lambda: bool(factory.processes))
+        process = wait_for_process(factory)
 
     status = manager.get_status(task_id)
     assert status["state"] == "failed"
     assert status["error_reason"] == "shutdown"
-    assert factory.processes[0].terminated is True
+    assert process.terminated is True

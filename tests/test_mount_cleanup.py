@@ -15,7 +15,12 @@ from FuxiYu_NodeKernel.services.mount_cleanup import (
 )
 from FuxiYu_NodeKernel.network import wss as wss_module
 
-from .mount_cleanup_fakes import FakeProcessFactory, wait_until
+from .mount_cleanup_fakes import (
+    FakeProcessFactory,
+    wait_for_process,
+    wait_for_process_for_path,
+    wait_until,
+)
 
 
 def _make_env(tmp_path, monkeypatch, *, process_kwargs=None, **manager_kwargs):
@@ -72,8 +77,9 @@ def test_start_returns_acceptance_and_task_id(tmp_path, monkeypatch):
     assert isinstance(body["task_id"], str) and body["task_id"]
     assert "state" not in body
     assert "succeeded" not in body
-    assert factory.calls
-    factory.processes[0].finish(0)
+    process = wait_for_process(factory)
+    assert process.poll() is None, "受理响应不应等待清理进程完成"
+    process.finish(0)
 
 
 def test_status_reports_running_task(tmp_path, monkeypatch):
@@ -89,7 +95,7 @@ def test_status_reports_running_task(tmp_path, monkeypatch):
         "state": "running",
         "error_reason": None,
     }
-    factory.processes[0].finish(0)
+    wait_for_process(factory).finish(0)
 
 
 def test_status_reports_running_then_terminal_sequence(tmp_path, monkeypatch):
@@ -98,7 +104,7 @@ def test_status_reports_running_then_terminal_sequence(tmp_path, monkeypatch):
     task_id = _start(client, path).json()["task_id"]
 
     assert _status(client, task_id).json()["state"] == "running"
-    factory.processes[0].finish(0)
+    wait_for_process(factory).finish(0)
     _wait_task(manager, task_id, "succeeded")
     body = _status(client, task_id).json()
     assert body["task_id"] == task_id
@@ -160,14 +166,14 @@ def test_duplicate_cleanup_returns_409_with_one_spawn(tmp_path, monkeypatch):
     client = _client()
     first = _start(client, path)
     assert first.status_code == 200
-    assert factory.calls
+    first_process = wait_for_process(factory)
 
     second = _start(client, path)
 
     assert second.status_code == 409
     assert second.json()["error_reason"] == "cleanup_in_progress"
-    assert len(factory.calls) == 1
-    factory.processes[0].finish(0)
+    assert len(factory.processes) == 1
+    first_process.finish(0)
 
 
 def test_cleanup_conflicts_with_restore_reservation(tmp_path, monkeypatch):
@@ -210,7 +216,7 @@ def test_path_aliases_share_one_canonical_lock(tmp_path, monkeypatch):
     client = _client()
     first = _start(client, path)
     assert first.status_code == 200
-    assert factory.calls
+    first_process = wait_for_process(factory)
 
     equivalent = path.parent / "." / "c1"
     second = _start(client, equivalent)
@@ -226,8 +232,8 @@ def test_path_aliases_share_one_canonical_lock(tmp_path, monkeypatch):
         third = _start(client, alias)
         assert third.status_code == 409
         assert third.json()["error_reason"] == "cleanup_in_progress"
-    assert len(factory.calls) == 1
-    factory.processes[0].finish(0)
+    assert len(factory.processes) == 1
+    first_process.finish(0)
 
 
 def test_concurrent_start_only_one_registration(tmp_path, monkeypatch):
@@ -250,8 +256,9 @@ def test_concurrent_start_only_one_registration(tmp_path, monkeypatch):
 
     assert len([item for item in results if item[0] == "ok"]) == 1
     assert len([item for item in results if item[0] == "busy"]) == 1
-    assert len(factory.calls) == 1
-    factory.processes[0].finish(0)
+    winner_process = wait_for_process(factory)
+    assert len(factory.processes) == 1
+    winner_process.finish(0)
 
 
 def test_invalid_path_does_not_leave_reservation(tmp_path, monkeypatch):
@@ -264,7 +271,7 @@ def test_invalid_path_does_not_leave_reservation(tmp_path, monkeypatch):
     valid = _start(client, path)
     assert valid.status_code == 200
     assert manager._active
-    factory.processes[0].finish(0)
+    wait_for_process(factory).finish(0)
 
 
 def test_terminal_releases_path_for_new_task(tmp_path, monkeypatch):
@@ -300,8 +307,8 @@ def test_two_manager_instances_have_independent_locks(tmp_path, monkeypatch):
     second = manager2.start_cleanup(path)
 
     assert first != second
-    factory1.processes[0].finish(0)
-    factory2.processes[0].finish(0)
+    wait_for_process(factory1).finish(0)
+    wait_for_process(factory2).finish(0)
 
 
 def test_terminal_tasks_evict_by_count_and_age(tmp_path, monkeypatch):
@@ -348,15 +355,15 @@ def test_active_tasks_are_not_evicted(tmp_path, monkeypatch):
         path.mkdir(parents=True)
 
     done_id = manager.start_cleanup(done_path)
-    factory.processes[0].finish(0)
+    wait_for_process_for_path(factory, done_path).finish(0)
     _wait_task(manager, done_id, "succeeded")
     active_id = manager.start_cleanup(active_path)
     extra_id = manager.start_cleanup(extra_path)
 
-    factory.processes[2].finish(0)
+    wait_for_process_for_path(factory, extra_path).finish(0)
     _wait_task(manager, extra_id, "succeeded")
     assert manager.get_status(active_id)["state"] == "running"
-    factory.processes[1].finish(0)
+    wait_for_process_for_path(factory, active_path).finish(0)
 
 
 def test_terminal_state_is_not_overwritten_by_late_result(tmp_path, monkeypatch):

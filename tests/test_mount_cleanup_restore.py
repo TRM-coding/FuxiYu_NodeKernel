@@ -14,7 +14,7 @@ from FuxiYu_NodeKernel.services.mount_cleanup import (
     MountPathBusy,
 )
 
-from .mount_cleanup_fakes import FakeProcessFactory, wait_until
+from .mount_cleanup_fakes import FakeProcessFactory, wait_for_process, wait_until
 
 
 ROOT_PW = "Root#Password9"
@@ -97,7 +97,7 @@ def test_restore_reserves_path_before_accepting(tmp_path, monkeypatch):
         json={"config": {"mount_path": str(path)}},
     )
     assert accepted.status_code == 200
-    factory.processes[0].finish(0)
+    wait_for_process(factory).finish(0)
 
 
 def test_restore_rejected_when_cleanup_running(tmp_path, monkeypatch):
@@ -117,7 +117,7 @@ def test_restore_rejected_when_cleanup_running(tmp_path, monkeypatch):
     assert response.status_code == 409
     assert response.json()["error_reason"] == "cleanup_in_progress"
     assert called == []
-    factory.processes[0].finish(0)
+    wait_for_process(factory).finish(0)
 
 
 def test_two_restore_requests_only_one_reservation(tmp_path, monkeypatch):
@@ -254,7 +254,7 @@ def test_restore_cleanup_race_allows_one_winner(tmp_path, monkeypatch):
 
     assert len([item for item in results if item[0] != "busy"]) == 1
     if any(item[0] == "cleanup" for item in results):
-        factory.processes[0].finish(0)
+        wait_for_process(factory).finish(0)
     else:
         reservation = next(item[1] for item in results if item[0] == "restore")
         manager.release_restore(reservation.token)
@@ -283,7 +283,7 @@ def test_restore_reservation_released_after_success(tmp_path, monkeypatch):
         json={"config": {"mount_path": str(path)}},
     )
     assert response.status_code == 200
-    factory.processes[0].finish(0)
+    wait_for_process(factory).finish(0)
 
 
 def test_restore_reservation_released_after_failure(tmp_path, monkeypatch):

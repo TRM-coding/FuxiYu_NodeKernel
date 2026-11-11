@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import os
 import subprocess
 import threading
+import time
 
 
 class FakeProcess:
@@ -73,17 +75,18 @@ class FakeProcessFactory:
         self.default_kwargs = dict(process_kwargs)
         self.calls = []
         self.processes = []
+        self.condition = threading.Condition()
 
     def __call__(self, command, **kwargs):
-        self.calls.append({"command": list(command), "kwargs": dict(kwargs)})
         process = FakeProcess(command, **self.default_kwargs)
-        self.processes.append(process)
+        with self.condition:
+            self.calls.append({"command": list(command), "kwargs": dict(kwargs)})
+            self.processes.append(process)
+            self.condition.notify_all()
         return process
 
 
 def wait_until(predicate, timeout=3.0, interval=0.01):
-    import time
-
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         value = predicate()
@@ -91,3 +94,44 @@ def wait_until(predicate, timeout=3.0, interval=0.01):
             return value
         time.sleep(interval)
     return predicate()
+
+
+def wait_for_process(factory, index=0, timeout=3.0):
+    """Event-wait until an accepted async cleanup has spawned its fake process."""
+
+    deadline = time.monotonic() + timeout
+    with factory.condition:
+        while len(factory.processes) <= index:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            factory.condition.wait(remaining)
+        assert len(factory.processes) > index, (
+            f"cleanup process {index} was not spawned; calls={factory.calls!r}"
+        )
+        return factory.processes[index]
+
+
+def wait_for_process_for_path(factory, path, timeout=3.0):
+    """Wait for the fake process whose direct rm argv targets ``path``."""
+
+    target = os.path.realpath(str(path))
+    deadline = time.monotonic() + timeout
+    with factory.condition:
+        while True:
+            matches = [
+                process
+                for process in factory.processes
+                if process.command
+                and os.path.realpath(str(process.command[-1])) == target
+            ]
+            if len(matches) == 1:
+                return matches[0]
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            factory.condition.wait(remaining)
+        raise AssertionError(
+            f"cleanup process for {target!r} was not uniquely spawned; "
+            f"calls={factory.calls!r}"
+        )
