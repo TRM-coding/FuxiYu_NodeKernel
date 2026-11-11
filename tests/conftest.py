@@ -7,24 +7,12 @@
 WSS 迁移说明：加密/签名属于消息层协议，与传输层（HTTP / WSS）无关，
 本文件提供的辅助函数届时原样复用。
 """
-import base64
-import json
 from pathlib import Path
 
 import pytest
 import docker as docker_pkg
 
 NODE_ROOT = Path(__file__).resolve().parents[1]
-
-from FuxiYu_NodeKernel.utils import CheckKeys as node_ck  # noqa: E402
-from FuxiYu_NodeKernel.utils.CheckKeys import KeyConfig  # noqa: E402
-
-
-def configure_absolute_key_paths(monkeypatch) -> None:
-    """把 CheckKeys 的密钥路径从 CWD 相对改为仓库绝对路径。"""
-    monkeypatch.setattr(KeyConfig, "PRIVATE_KEY_PATH", str(NODE_ROOT / "private_A.pem"))
-    monkeypatch.setattr(KeyConfig, "PUBLIC_KEY_PATH", str(NODE_ROOT / "public_A.pem"))
-    monkeypatch.setattr(KeyConfig, "PUBLIC_KEY_CONTROL", str(NODE_ROOT / "public_A.pem"))
 
 
 def docker_not_found() -> docker_pkg.errors.NotFound:
@@ -39,6 +27,54 @@ def docker_not_found() -> docker_pkg.errors.NotFound:
     return docker_pkg.errors.NotFound("no such container", response=_Resp())
 
 
+class FakeExecSocket:
+    """Minimal socket-like object for the password stdin helper."""
+
+    def __init__(self):
+        self.sent = b""
+        self.closed = False
+        self.write_shutdown = False
+
+    def settimeout(self, _timeout):
+        pass
+
+    def sendall(self, data):
+        self.sent += data
+
+    def shutdown(self, _how):
+        self.write_shutdown = True
+
+    def recv(self, _size):
+        return b""
+
+    def close(self):
+        self.closed = True
+
+
+class FakeExecAPI:
+    """Default-success Docker exec API for tests that only need a password path."""
+
+    def __init__(self, exit_code: int = 0):
+        self.exit_code = exit_code
+        self.created = []
+        self.started = []
+        self.sockets = {}
+
+    def exec_create(self, container_id, cmd, **kwargs):
+        exec_id = f"exec-{len(self.created)}"
+        self.created.append({"container_id": container_id, "cmd": cmd, "kwargs": kwargs, "id": exec_id})
+        return {"Id": exec_id}
+
+    def exec_start(self, exec_id, **kwargs):
+        sock = FakeExecSocket()
+        self.started.append({"id": exec_id, "kwargs": kwargs, "socket": sock})
+        self.sockets[exec_id] = sock
+        return sock
+
+    def exec_inspect(self, exec_id):
+        return {"ExitCode": self.exit_code, "Running": False}
+
+
 class FakeContainer:
     """可编程的 docker container 假实现。"""
 
@@ -49,12 +85,13 @@ class FakeContainer:
         self.attrs = {"State": {"Status": status}}
         self._exit_code = exec_exit_code
         self.exec_calls = []
+        self.removed = False
 
     def reload(self) -> None:
         pass
 
     def remove(self, *a, **k) -> None:
-        pass
+        self.removed = True
 
     def stop(self, *a, **k) -> None:
         pass
@@ -80,6 +117,7 @@ class FakeContainer:
 class FakeContainers:
     def __init__(self, existing=None):
         self._existing = list(existing or [])
+        self.run_calls = []
 
     def get(self, name_or_id):
         for c in self._existing:
@@ -91,23 +129,69 @@ class FakeContainers:
         return list(self._existing)
 
     def run(self, *a, **k):
+        self.run_calls.append((a, k))
         return FakeContainer(name=k.get("name", "c1"))
 
 
+class FakeImage:
+    """docker image 假实现：分配器只读 `attrs.Config.ExposedPorts`。"""
+
+    def __init__(self, exposed=None, tag: str = "fake:latest"):
+        default = {"22/tcp": {}}
+        self.tag = tag
+        self.attrs = {"Config": {"ExposedPorts": dict(default if exposed is None else exposed)}}
+
+
+class FakeImages:
+    def __init__(self, exposed=None, missing: bool = False):
+        self.exposed = exposed
+        self.missing = missing
+        self.pulled = []
+
+    def get(self, tag):
+        if self.missing:
+            raise docker_pkg.errors.ImageNotFound("no such image")
+        return FakeImage(self.exposed, tag)
+
+    def pull(self, tag):
+        self.pulled.append(tag)
+        self.missing = False
+        return FakeImage(self.exposed, tag)
+
+
 class FakeDockerClient:
-    def __init__(self, containers=None):
+    def __init__(self, containers=None, images=None):
         self.containers = containers or FakeContainers()
+        self.images = images or FakeImages()
+        self.api = FakeExecAPI()
 
 
 def encrypted_body(payload: dict) -> dict:
-    """用真实密钥构造 Node 侧 wire 格式请求体 {"message": b64, "signature": b64}。"""
-    raw = json.dumps(payload)
-    return {
-        "message": base64.b64encode(node_ck.encryption(raw)).decode(),
-        "signature": base64.b64encode(node_ck.signature(raw)).decode(),
-    }
+    """check_keys 信封已退役：直接返回明文 payload（Node FastAPI 端点收 Pydantic）。"""
+    return payload
 
 
 @pytest.fixture()
 def key_paths(monkeypatch):
-    configure_absolute_key_paths(monkeypatch)
+    """check_keys 已退役：空 fixture 占位（保留签名，避免调用方改动）。"""
+    pass
+
+
+def _local_docker_available() -> bool:
+    try:
+        client = docker_pkg.from_env()
+        client.ping()
+        return True
+    except Exception:
+        return False
+
+
+def pytest_collection_modifyitems(config, items):
+    """本机无 Docker daemon 时把 docker 标记用例显式 skip，绝不伪造通过。"""
+
+    docker_items = [item for item in items if item.get_closest_marker("docker")]
+    if not docker_items or _local_docker_available():
+        return
+    skip = pytest.mark.skip(reason="local Docker daemon unavailable")
+    for item in docker_items:
+        item.add_marker(skip)

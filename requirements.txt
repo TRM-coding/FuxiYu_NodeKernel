@@ -1,5 +1,9 @@
-Flask>=2.3.0
+fastapi
+uvicorn
+websockets
+httpx2
 docker
 cryptography
 pydantic
 python-dotenv
+psutil

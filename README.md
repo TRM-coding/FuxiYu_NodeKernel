@@ -1,105 +1,93 @@
-# 伏羲-御
+# 伏羲 · Fuxi-Yu
 
-## 伏羲・御・Fuxi-Yu
+Fuxi-Yu 是面向高校与实验室算力管理场景的容器化平台。NodeKernel 是伏羲平台的节点服务，部署在算力机器上，负责镜像构建、容器生命周期、协作者账号、挂载清理与运行状态采集。
 
-面向算力平台的 Docker 化集群管理与自助使用系统。将物理服务器纳入统一 “控制面”，用户以申请到的 Docker 实例直控实体机，配套可视化的基础环境配置（网络、用户等），免去繁琐安装与踩坑，友好地面向 Linux 新手与多用户场景。
+当前版本使用 FastAPI 提供 HTTPS 操作接口，使用 Docker 执行容器操作。Ctrl 主动连接 Node 的 `/ws/ctrl` 获取状态快照，Node 无需配置 Ctrl 的地址。
 
-```
-config.py            # 配置
-extensions.py        # 第三方扩展初始化
-__init__.py          # create_app 工厂
-run.py               # 开发直接运行入口
-wsgi.py              # 生产/WSGI 入口
-models/              # 数据模型层
-repositories/        # 数据访问仓储层
-services/            # 业务服务层
-schemas/             # 序列化/反序列化层 (Marshmallow)
-blueprints/          # 路由蓝图 (接口层)
-```
+## 快速上手
 
-## 功能点
-- App 工厂模式 (`create_app`)
-- 配置分环境 (development / production / testing)
-- SQLAlchemy + Migrate 数据迁移能力
-- Caching / LoginManager 预置
-- 用户模型 + 仓储 + 服务 + Schema + API 示例
-- Marshmallow 进行序列化
+### 1. 安装依赖
 
-## 快速开始
+节点运行环境为 Linux，需要可访问的 Docker daemon。运行用户须有 Docker 操作权限及容器挂载目录的读写权限；本地开发可使用 WSL。
 
-### 1. 克隆与安装依赖
+在仓库根目录安装 Python 依赖：
+
 ```bash
 pip install -r requirements.txt
 ```
 
-### 2. 初始化数据库
+### 2. 配置环境
+
+可参考 `.env.example` 创建 `.env`。常用配置：
+
 ```bash
-# 生成迁移仓库
-flask --app compute_cluster_manage_web:create_app db init
-# 生成迁移脚本
-flask --app compute_cluster_manage_web:create_app db migrate -m "init"
-# 应用迁移
-flask --app compute_cluster_manage_web:create_app db upgrade
+NODE_PORT=5789
+NODE_CTRL_CA_FILE=certs/ctrl_ca.pem
+NODE_CONTAINERS_BASE=/home
 ```
-> 若你直接使用 sqlite，默认文件为 `app.db`。
 
-### 3. 运行开发服务器
+`NODE_CONTAINERS_BASE` 是容器数据挂载根目录。非 root 开发环境需改为可写路径。容器宿主端口默认从 20000–29999 分配，可通过 `NODE_PORT_RANGE_START` 和 `NODE_PORT_RANGE_END` 调整；防火墙应放行实际使用的范围。
+
+镜像构建需要代理时，在 `.env` 中设置 `HTTP_PROXY` / `HTTPS_PROXY`。环境配置在启动时加载，修改后需重启服务。
+
+### 3. 配置节点信任
+
+将 Ctrl 的 CA 公共证书放到 `NODE_CTRL_CA_FILE` 指定位置。该文件用于验证 Ctrl 客户端证书，启动时找到有效信任文件后会启用双向 TLS 校验。
+
+Node 默认使用 `certs/node_cert.pem` 与 `certs/node_key.pem`，启动时按实现生成或校验默认自签证书；自备证书可通过 `NODE_TLS_CERT_FILE` / `NODE_TLS_KEY_FILE` 指定。
+
+节点在 Ctrl 注册后接收持久化 uid，默认保存到 `.node_identity.json`。Ctrl 负责后续连接与重连。
+
+### 4. 启动服务
+
 ```bash
-python -m compute_cluster_manage_web.run
-# 或
-flask --app compute_cluster_manage_web:create_app run --debug
+python run.py
 ```
-访问: http://127.0.0.1:5000/api/users
 
-### 4. 示例 API
+默认监听地址：
 
-#### 创建用户
+```text
+https://0.0.0.0:5789
+```
+
+在 Ctrl 的机器管理中填写该节点的实际 IP 与端口。HTTPS 操作接口和 WSS 快照端点共用同一监听端口。
+
+Swagger 文档路径为 `/docs`；启用双向 TLS 后，访问客户端也需携带受信任的证书。
+
+### 5. 运行测试
+
+默认测试排除需要真实 Docker daemon 的集成用例：
+
 ```bash
-curl -X POST http://127.0.0.1:5000/api/users \
-  -H 'Content-Type: application/json' \
-  -d '{"username":"alice","email":"alice@example.com","password":"123456"}'
-```
-响应:
-```json
-{
-  "id": 1,
-  "username": "alice",
-  "email": "alice@example.com",
-  "created_at": "2025-01-01T00:00:00"
-}
+pip install pytest
+pytest
 ```
 
-#### 列表用户
+需要验证真实 Docker 链路时，再单独运行：
+
 ```bash
-curl http://127.0.0.1:5000/api/users
+pytest -m docker
 ```
 
-### 5. 目录/分层说明
-| 层 | 说明 | 关注点 |
-|----|------|--------|
-| model | `models/` | ORM 定义，仅包含字段和关系 |
-| repository | `repositories/` | 封装数据库 CRUD |
-| service | `services/` | 业务逻辑、组合多个仓储 |
-| schema | `schemas/` | 输入校验与输出序列化 |
-| blueprint(API) | `blueprints/` | HTTP 路由 / 参数获取 / 返回 |
+测试以 Linux 环境为准，包含 POSIX 路径与命令假设；Windows 本地验证可在 WSL 中执行。
 
-## 配置
-环境通过环境变量 `FLASK_ENV` / 自定义传入 `create_app("production")` 选择。
-可用变量:
-- `DATABASE_URL` (默认 sqlite:///app.db)
-- `SECRET_KEY`
-- `CACHE_TYPE` (默认 SimpleCache)
+## 目录结构
 
-## 部署 (Gunicorn 示例)
-```bash
-gunicorn 'compute_cluster_manage_web.wsgi:app' -b 0.0.0.0:8000 --workers 4
+```text
+network/             # FastAPI 操作接口、节点身份与 WSS 快照
+schemas/             # 请求、响应及公共类型
+services/            # 镜像、容器、账号与挂载操作
+docker_operates/      # Docker 状态采集、缓存与端口分配
+utils/               # 日志及通用工具
+tests/               # 单元测试与 Docker 集成测试
+openspec/specs/      # 按 8 个能力单元组织的行为与类型契约
+config.py            # 网络、端口及运行配置
+extensions.py        # Docker 客户端与采集缓存
+run.py               # HTTPS 启动入口
 ```
 
-## 后续可扩展建议
-- 使用 `python-dotenv` 加载 `.env`
-- 引入 Alembic 版本号命名策略 / 预置 seed 脚本
-- 集成单元测试 (pytest + factory-boy)
-- 使用真实密码哈希: `from werkzeug.security import generate_password_hash`
-- 增加 JWT 或 Session 认证流程
+## 开发约定
 
+接口层负责请求校验与响应转换，业务操作放在 services 层，Docker 采集与缓存逻辑放在 docker_operates 中。身份由 Ctrl 颁发，节点状态由 Node 采集；修改操作或快照字段时，应同时核对 Ctrl 的消费契约。
 
+当前行为与完整类型契约见 [OpenSpec](openspec/specs/)。跨仓库已知问题统一记录在 [Global QUESTIONS](../FuxiYu_Global/QUESTIONS.md)，旧文档保留在 Global 的 bak 中。
