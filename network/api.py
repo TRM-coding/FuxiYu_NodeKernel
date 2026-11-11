@@ -24,6 +24,8 @@ from ..schemas import (
     ContainerStatusResponse,
     CreateContainerMessage,
     CreateContainerResponse,
+    GetCleanMountStatusMessage,
+    GetCleanMountStatusResponse,
     MachineStatusMessage,
     MachineStatusResponse,
     PauseContainerMessage,
@@ -36,6 +38,8 @@ from ..schemas import (
     ResetContainerPasswordResponse,
     RestartContainerMessage,
     RestartContainerResponse,
+    StartCleanMountMessage,
+    StartCleanMountResponse,
     StartContainerMessage,
     StartContainerResponse,
     StopContainerMessage,
@@ -59,6 +63,12 @@ from ..services.container_service import (
     remove_container,
     reset_container_password,
     update_role,
+)
+from ..services.mount_cleanup import (
+    MountCleanupShutdown,
+    MountPathBusy,
+    MountPathError,
+    MountTaskStartError,
 )
 from ..docker_operates.status_cache import ActionOutcome
 from ..utils.Container import Container
@@ -133,6 +143,24 @@ def _bad_request(error: str, error_reason: str) -> JSONResponse:
     return JSONResponse(status_code=400, content={"success": 0, "error": error, "error_reason": error_reason})
 
 
+def _busy_response(exc: MountPathBusy) -> JSONResponse:
+    return JSONResponse(
+        status_code=409,
+        content={
+            "success": 0,
+            "error": "mount path is busy",
+            "error_reason": exc.reason,
+        },
+    )
+
+
+def _shutdown_response() -> JSONResponse:
+    return JSONResponse(
+        status_code=503,
+        content={"success": 0, "error": "server is shutting down", "error_reason": "shutting_down"},
+    )
+
+
 def _container_name(config) -> str | None:
     """兼容 container_name 与历史 name 字段。"""
 
@@ -174,8 +202,25 @@ def create_container_api(message: CreateContainerMessage):
     except Exception as e:
         return _bad_request(f"invalid config: {e}", "invalid_config")
 
+    restore_reservation = None
+    restore_path = message.restore_mount_path
+    if message.restore_mount_path:
+        try:
+            restore_reservation = extensions.mount_cleanup.reserve_restore(
+                message.restore_mount_path
+            )
+            restore_path = restore_reservation.real_path
+        except MountPathError:
+            return _bad_request("invalid mount_path", "invalid_path")
+        except MountPathBusy as e:
+            return _busy_response(e)
+        except MountCleanupShutdown:
+            return _shutdown_response()
+
     try:
         if container_exists(cfg.name):
+            if restore_reservation is not None:
+                extensions.mount_cleanup.release_restore(restore_reservation.token)
             return JSONResponse(
                 status_code=409,
                 content={
@@ -186,6 +231,8 @@ def create_container_api(message: CreateContainerMessage):
                 },
             )
     except Exception as e:
+        if restore_reservation is not None:
+            extensions.mount_cleanup.release_restore(restore_reservation.token)
         return JSONResponse(
             status_code=500,
             content={"success": 0, "error": f"docker check failed: {e}", "error_reason": "docker_check_failed"},
@@ -209,7 +256,7 @@ def create_container_api(message: CreateContainerMessage):
                 cfg,
                 root_password=message.root_password,
                 public_key=message.public_key,
-                restore_mount_path=message.restore_mount_path,
+                restore_mount_path=restore_path,
             )
             for account in message.restore_accounts or []:
                 ok = add_collaborator(
@@ -251,6 +298,9 @@ def create_container_api(message: CreateContainerMessage):
                 from_create_confirmation=True,
             )
             return ActionOutcome("failed", "create_failed")
+        finally:
+            if restore_reservation is not None:
+                extensions.mount_cleanup.release_restore(restore_reservation.token)
 
     try:
         action_ref = extensions.status_cache.submit_action(
@@ -261,6 +311,8 @@ def create_container_api(message: CreateContainerMessage):
             create=True,
         )
     except Exception as e:
+        if restore_reservation is not None:
+            extensions.mount_cleanup.release_restore(restore_reservation.token)
         return JSONResponse(
             status_code=500,
             content={"success": 0, "error": str(e), "error_reason": "background_thread_failed"},
@@ -644,16 +696,71 @@ def pause_container_api(message: PauseContainerMessage):
     }
 
 
+@router.post("/start_clean_mount", response_model=StartCleanMountResponse)
+def start_clean_mount_api(message: StartCleanMountMessage):
+    """受理异步挂载清理；success=1 只表示任务已登记。"""
+
+    try:
+        task_id = extensions.mount_cleanup.start_cleanup(message.config.mount_path)
+    except MountPathError:
+        return _bad_request("invalid mount_path", "invalid_path")
+    except MountPathBusy as e:
+        return _busy_response(e)
+    except MountCleanupShutdown:
+        return _shutdown_response()
+    except MountTaskStartError:
+        return JSONResponse(
+            status_code=500,
+            content={
+                "success": 0,
+                "error": "failed to start cleanup task",
+                "error_reason": "background_thread_failed",
+            },
+        )
+    except Exception as e:
+        logger.warning("start_clean_mount failed: %s", e)
+        return JSONResponse(
+            status_code=500,
+            content={"success": 0, "error": "internal error", "error_reason": "internal_error"},
+        )
+    return {"success": 1, "task_id": task_id}
+
+
+@router.post("/get_clean_mount_status", response_model=GetCleanMountStatusResponse)
+def get_clean_mount_status_api(message: GetCleanMountStatusMessage):
+    """查询进程内挂载清理任务；查询成功与任务成功彼此独立。"""
+
+    try:
+        status = extensions.mount_cleanup.get_status(message.config.task_id)
+    except Exception as e:
+        logger.warning("get_clean_mount_status failed: %s", e)
+        return JSONResponse(
+            status_code=500,
+            content={"success": 0, "error": "internal error", "error_reason": "internal_error"},
+        )
+    if status is None:
+        return JSONResponse(
+            status_code=404,
+            content={"success": 0, "error": "task not found", "error_reason": "not_found"},
+        )
+    return {"success": 1, **status}
+
+
 @router.post("/clean_mount", response_model=CleanMountResponse)
 def clean_mount_api(message: CleanMountMessage):
-    """清理已删除容器遗留的宿主机挂载目录。"""
+    """同步清理已删除容器遗留的宿主机挂载目录（旧客户端兼容）。"""
 
     try:
         clean_mount(message.config.mount_path)
         return {"success": 1}
+    except MountPathBusy as e:
+        return _busy_response(e)
+    except MountCleanupShutdown:
+        return _shutdown_response()
     except ValueError:
         return JSONResponse(status_code=400, content={"success": 0, "error": "invalid mount_path", "error_reason": "invalid_path"})
     except subprocess.TimeoutExpired:
         return JSONResponse(status_code=500, content={"success": 0, "error": "rm timeout", "error_reason": "timeout"})
     except Exception as e:
+        logger.warning("clean_mount failed: %s", e)
         return JSONResponse(status_code=500, content={"success": 0, "error": str(e), "error_reason": "internal_error"})

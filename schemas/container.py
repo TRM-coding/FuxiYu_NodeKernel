@@ -467,6 +467,35 @@ class CleanMountResponse(SuccessResponse):
     pass
 
 
+CleanMountTaskState = Literal["running", "succeeded", "failed"]
+
+
+class StartCleanMountConfig(BaseModel):
+    mount_path: str
+
+
+class StartCleanMountMessage(BaseModel):
+    config: StartCleanMountConfig
+
+
+class StartCleanMountResponse(SuccessResponse):
+    task_id: str
+
+
+class GetCleanMountStatusConfig(BaseModel):
+    task_id: str
+
+
+class GetCleanMountStatusMessage(BaseModel):
+    config: GetCleanMountStatusConfig
+
+
+class GetCleanMountStatusResponse(SuccessResponse):
+    task_id: str
+    state: CleanMountTaskState
+    error_reason: str | None = None
+
+
 # Backward-compatible names kept until FastAPI routers use endpoint-specific models.
 ContainerNameMessage = ContainerStatusMessage
 CreateContainerAcceptedResponse = CreateContainerResponse

@@ -349,6 +349,69 @@ Node SHALL 在既有创建后台任务中，用请求携带的 `root_password` �
 
 来源：[services/container_service.py](../../../services/container_service.py)、[network/api.py](../../../network/api.py)。
 
+### Requirement: 恢复创建的原子校验与路径预登记
+
+携带 `restore_mount_path` 的创建 SHALL 在返回受理前，按清理同一套 Node 路径规范化规则校验目录存在且为目录，并在同一路径锁内完成“检查活动清理/恢复占用 + 登记恢复预留”；校验与登记 MUST 原子完成。预检得到的规范化路径 SHALL 作为本次创建的挂载来源；失败返回 400 `invalid_path` 或 409 `cleanup_in_progress`/`restore_in_progress`，MUST NOT 受理、启动 Docker 创建或留下预留。未携带恢复路径的普通创建不受影响，仍按既有创建流程受理。
+
+#### Scenario: 合法恢复先登记后受理
+
+- **WHEN** 恢复请求携带位于允许范围内且存在的目录，且没有同路径活动任务
+- **THEN** Node 在返回创建受理前登记恢复预留，之后才进入既有后台创建流程
+
+#### Scenario: 清理进行中拒绝恢复
+
+- **WHEN** 同一规范化路径已有运行中的异步或同步清理
+- **THEN** Node 返回 409 `cleanup_in_progress`，不返回创建受理，不启动 Docker 创建，也不建立恢复预留
+
+#### Scenario: 两个恢复争用同一路径只受理一个
+
+- **WHEN** 两个恢复请求同时携带指向同一真实目录的路径
+- **THEN** 只有一个取得恢复预留并获受理，另一个返回 409 `restore_in_progress`
+
+#### Scenario: 恢复路径非法时不留状态
+
+- **WHEN** `restore_mount_path` 越界、缺少 `containers` 段、等于公共根、不存在或不是目录
+- **THEN** Node 返回 400 `invalid_path`，创建未被受理，不启动 Docker，也不留下可阻塞后续请求的预留
+
+#### Scenario: 普通新建不受路径锁影响
+
+- **WHEN** 创建请求不携带 `restore_mount_path`
+- **THEN** Node 不登记恢复预留，继续使用既有普通新建目录和创建受理流程
+
+### Requirement: 恢复关键阶段的预留持有与释放
+
+恢复预留 SHALL 持有到该创建后台流程进入终态，覆盖路径校验、Docker `/root` bind 建立和恢复账号重建等关键阶段；持有期间同规范化路径的异步或同步清理 MUST 返回 409 且不启动删除。创建成功或失败后 SHALL 在 finally 释放预留；失败释放后允许清理重试或再次恢复；Node 重启丢失全部预留，已接受的部分删除恢复风险由用户承担。
+
+#### Scenario: 恢复创建期间清理被拒绝
+
+- **WHEN** 恢复预留已登记且后台仍在建立 Docker bind 或重建恢复账号
+- **THEN** 同路径的异步和旧同步清理都返回 409，不创建删除任务、不执行 `rm`
+
+#### Scenario: 恢复与清理的并发窗口只允许一方
+
+- **WHEN** 恢复预登记与清理登记在同一路径上并发竞争
+- **THEN** 路径锁只允许其中一方成功，另一方返回 409；不允许先放行恢复后又并发删除该目录
+
+#### Scenario: 创建成功后释放预留
+
+- **WHEN** 创建后台流程进入成功终态
+- **THEN** 恢复预留在该流程结束时释放，后续清理或恢复只受既有授权和容器状态约束
+
+#### Scenario: 创建失败后释放并允许重试
+
+- **WHEN** 创建后台流程进入失败终态
+- **THEN** 恢复预留在 finally 释放，Ctrl/Web 可重新开放恢复入口，也可重新尝试清理
+
+#### Scenario: Node 重启丢失预留
+
+- **WHEN** Node 在恢复创建期间重启
+- **THEN** 进程内预留全部消失，旧创建不恢复；用户可重试恢复，并明确接受目录可能已被先前的失败清理部分删除
+
+#### Scenario: 部分删除目录在重启后可恢复
+
+- **WHEN** 先前的清理被中断后留下仍存在的部分目录，Node 已重启且没有旧任务或旧预留
+- **THEN** 恢复预检接受该现存目录并正常登记恢复预留或受理，不要求目录完整、不依赖旧 `task_id`；恢复结果可能不完整，这是用户已接受的边界
+
 ## Data model appendix
 
 ### ContainerConfig 数据契约 [schemas/container.py]

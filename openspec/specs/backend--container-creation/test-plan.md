@@ -329,3 +329,75 @@ Spec: [spec.md](spec.md)
   - [X] tests/test_anvil_creation_credentials.py::test_create_logs_carry_no_password_or_credential_entry
 - Assertion scope: 既有：`add_collaborator` 与 `reset_container_password` 各受理一次后，stdout+caplog 不含明文与 `password=`。补测：一次完整创建（fake Docker）后 caplog 中既有的 `create_container called`/后台开始/服务完成日志仍在，且不存在消息含密码明文、`root_password`、`credentials`、`chpasswd` 的新增记录。
 - Coverage note: 既有断言覆盖新增与重置路由，创建链路的日志条目不重复由补测覆盖。
+
+### Requirement: 恢复创建的原子校验与路径预登记
+
+#### Scenario: 合法恢复先登记后受理
+
+- Test/check:
+  - [X] tests/test_mount_cleanup_restore.py::test_restore_reserves_path_before_accepting
+- Assertion scope: 合法恢复请求返回受理前登记恢复预留；用阻塞后台创建证明预留已存在，同路径清理此时返回 409。请求返回 200 后才进入后台创建。
+
+#### Scenario: 清理进行中拒绝恢复
+
+- Test/check:
+  - [X] tests/test_mount_cleanup_restore.py::test_restore_rejected_when_cleanup_running
+- Assertion scope: 同路径清理任务保持 `running` 时，恢复请求返回 409 `cleanup_in_progress`；不返回创建受理，后台 create 零调用，删除子进程不启动。
+
+#### Scenario: 两个恢复争用同一路径只受理一个
+
+- Test/check:
+  - [X] tests/test_mount_cleanup_restore.py::test_two_restore_requests_only_one_reservation
+- Assertion scope: 两个恢复请求用 Barrier 同时争用同一真实目录；恰一个 200 并取得预留，另一个 409 `restore_in_progress`，后台创建只执行一次。
+
+#### Scenario: 恢复路径非法时不留状态
+
+- Test/check:
+  - [X] tests/test_mount_cleanup_restore.py::test_invalid_restore_path_rejected_before_accept
+  - [X] tests/test_anvil_creation_credentials.py::test_restore_mount_path_requires_containers_segment_and_existing_dir
+- Assertion scope: 越界、缺 `containers` 段、公共根、不存在或非目录的恢复路径返回 400 `invalid_path`；不进入后台、无 Docker 调用、无残留预留。既有服务层用例断言缺段/不存在/symlink 逃逸被拒且 `containers.run` 零调用。
+
+#### Scenario: 普通新建不受路径锁影响
+
+- Test/check:
+  - [X] tests/test_mount_cleanup_restore.py::test_normal_create_does_not_take_restore_reservation
+- Assertion scope: 不携带 `restore_mount_path` 的创建不登记恢复预留；同路径清理不会被该创建阻塞，普通新建仍进入既有后台创建流程。
+
+### Requirement: 恢复关键阶段的预留持有与释放
+
+#### Scenario: 恢复创建期间清理被拒绝
+
+- Test/check:
+  - [X] tests/test_mount_cleanup_restore.py::test_cleanup_rejected_during_restore_background
+- Assertion scope: 恢复后台仍阻塞时，同路径异步清理和旧同步清理都返回 409，删除替身零调用；恢复预留直到后台终态才释放。
+
+#### Scenario: 恢复与清理的并发窗口只允许一方
+
+- Test/check:
+  - [X] tests/test_mount_cleanup_restore.py::test_restore_cleanup_race_allows_one_winner
+- Assertion scope: 用 Barrier 同时发起恢复和清理；只有一个取得路径占用，另一个得到 409；不允许恢复受理后又并行启动删除。
+
+#### Scenario: 创建成功后释放预留
+
+- Test/check:
+  - [X] tests/test_mount_cleanup_restore.py::test_restore_reservation_released_after_success
+- Assertion scope: 恢复后台进入成功终态后预留被释放；同路径后续清理/恢复不再收到本变更的恢复占用冲突，后续仍受既有授权和容器状态约束。
+
+#### Scenario: 创建失败后释放并允许重试
+
+- Test/check:
+  - [X] tests/test_mount_cleanup_restore.py::test_restore_reservation_released_after_failure
+- Assertion scope: 恢复后台失败后 `finally` 释放预留；同路径清理或第二次恢复可重新登记，旧失败不永久占锁。
+
+#### Scenario: Node 重启丢失预留
+
+- Test/check:
+  - [X] tests/test_mount_cleanup_restore.py::test_restart_drops_restore_reservation
+- Assertion scope: 旧登记器的恢复预留存在时创建新登记器模拟重启；新登记器可为同一路径取得恢复预留，旧预留不恢复；允许恢复可能看到部分删除的数据。
+
+#### Scenario: 部分删除目录在重启后可恢复
+
+- Test/check:
+  - [X] tests/test_mount_cleanup_restore.py::test_partial_cleanup_survives_restart_and_restore_is_accepted
+- Assertion scope: 先留下部分删除但仍存在的目录，再以新登记器执行恢复预检；断言目录被接受、无需旧任务或旧预留、恢复受理不要求目录完整。
+- Coverage note: 部分目录恢复是用户明确接受的边界；测试只断言预检接受现存部分目录并登记/受理，不保证恢复出的数据完整。

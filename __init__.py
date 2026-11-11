@@ -23,10 +23,14 @@ async def lifespan(app: FastAPI):
     extensions.last_ssh_cache.start()
     extensions.disk_usage_cache.start()
     extensions.sys_cache.start()
+    extensions.mount_cleanup.start()
     try:
         yield
     finally:
-        extensions.sys_cache.stop()
+        try:
+            extensions.mount_cleanup.stop()
+        finally:
+            extensions.sys_cache.stop()
 
 
 def create_app(config: str | None = None) -> FastAPI:
@@ -39,6 +43,7 @@ def create_app(config: str | None = None) -> FastAPI:
     app.state.config = get_config(config)
     app.logger = logging.getLogger("FuxiYu_NodeKernel")
     configure_daily_logging(app)
+    extensions.mount_cleanup.start()
     app.include_router(api_router)
     app.include_router(node_identity_router)
     app.include_router(ctrl_link_router)

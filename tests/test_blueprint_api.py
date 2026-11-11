@@ -1,5 +1,6 @@
 import time
 import ipaddress
+import os
 
 import pytest
 from cryptography import x509
@@ -184,7 +185,9 @@ def test_create_container_with_image_build_reports_building(client, monkeypatch)
     assert calls[0][1].image == payload["image_build"]["image_tag"]
 
 
-def test_create_container_restore_payload_passes_mount_and_accounts(client, monkeypatch):
+def test_create_container_restore_payload_passes_mount_and_accounts(
+    client, monkeypatch, tmp_path
+):
     calls = []
     collaborator_calls = []
 
@@ -200,18 +203,22 @@ def test_create_container_restore_payload_passes_mount_and_accounts(client, monk
     _patched_service(monkeypatch, "create_container", _stub)
     _patched_service(monkeypatch, "add_collaborator", _add_collaborator)
 
+    base = tmp_path / "restore-base"
+    restore = base / "admin" / "containers" / "c1_old"
+    restore.mkdir(parents=True)
+    monkeypatch.setenv("NODE_CONTAINERS_BASE", str(base))
     payload = {
         "owner_name": "admin",
         "config": VALID_CFG,
         "root_password": ROOT_PW,
-        "restore_mount_path": "/tmp/admin/containers/c1_old",
+        "restore_mount_path": str(restore),
         "restore_accounts": [{"user_name": "alice", "role": "collaborator", "password": COLLAB_PW}],
     }
     resp = client.post("/api/create_container", json=payload)
 
     assert resp.status_code == 200
     time.sleep(0.1)
-    assert calls[0][4] == "/tmp/admin/containers/c1_old"
+    assert calls[0][4] == os.path.realpath(str(restore))
     assert calls[0][2].get_secret_value() == ROOT_PW
     assert collaborator_calls == [("c1", "alice", api_module.ROLE.COLLABORATOR, COLLAB_PW)]
 
